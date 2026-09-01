@@ -1,0 +1,18 @@
+{
+  "exchanges": [
+    {
+      "method": "POST",
+      "path": "/api/v4/projects/acme%2Fwidgets/merge_requests/42/notes",
+      "status": 201,
+      "body": {
+        "id": 9002
+      },
+      "request_body_contains": [
+        "factoryd:audit:v1",
+        "reverted the guard",
+        "CLEARED",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ]
+    }
+  ]
+}

@@ -1,0 +1,59 @@
+{
+  "exchanges": [
+    {
+      "method": "GET",
+      "path": "/repos/acme/widgets/pulls/42",
+      "status": 200,
+      "body": {
+        "node_id": "PR_kwDO42",
+        "number": 42,
+        "title": "gate: match command position, not the mention",
+        "user": {
+          "login": "producer-bot",
+          "id": 1001,
+          "name": "Producer Bot"
+        },
+        "head": {
+          "ref": "producer/fix-thing",
+          "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        },
+        "base": {
+          "ref": "main",
+          "sha": "1111111111111111111111111111111111111111"
+        },
+        "draft": false,
+        "state": "open",
+        "merged_at": null,
+        "html_url": "https://github.com/acme/widgets/pull/42",
+        "labels": [
+          {
+            "name": "factory"
+          }
+        ],
+        "updated_at": "2026-09-01T10:00:00Z"
+      }
+    },
+    {
+      "method": "PUT",
+      "path": "/repos/acme/widgets/pulls/42/merge",
+      "status": 200,
+      "body": {
+        "sha": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+        "merged": true,
+        "message": "Pull Request successfully merged"
+      },
+      "request_body_contains": [
+        "\"sha\":\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\"",
+        "\"merge_method\""
+      ]
+    },
+    {
+      "method": "GET",
+      "path": "/repos/acme/widgets/compare/main...bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+      "status": 200,
+      "body": {
+        "status": "behind"
+      }
+    }
+  ]
+}

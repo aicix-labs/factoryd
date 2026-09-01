@@ -1,0 +1,42 @@
+{
+  "exchanges": [
+    {
+      "method": "GET",
+      "path": "/api/v4/projects/acme%2Fwidgets/merge_requests/42",
+      "status": 200,
+      "body": {
+        "iid": 42,
+        "title": "gate: match command position, not the mention",
+        "author": {
+          "id": 1001,
+          "username": "producer-bot",
+          "name": "Producer Bot"
+        },
+        "source_branch": "producer/fix-thing",
+        "target_branch": "main",
+        "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "draft": false,
+        "work_in_progress": false,
+        "state": "opened",
+        "web_url": "https://gitlab.example.com/acme/widgets/-/merge_requests/42",
+        "labels": [
+          "factory"
+        ],
+        "updated_at": "2026-09-01T10:00:00Z"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/v4/projects/acme%2Fwidgets/merge_requests/42/pipelines?per_page=100",
+      "status": 200,
+      "body": [
+        {
+          "id": 7,
+          "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "status": "failed",
+          "web_url": "https://gitlab.example.com/acme/widgets/-/pipelines/7"
+        }
+      ]
+    }
+  ]
+}

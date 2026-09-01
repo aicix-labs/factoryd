@@ -1,0 +1,15 @@
+{
+  "exchanges": [
+    {
+      "method": "POST",
+      "path": "/api/v4/projects/acme%2Fwidgets/merge_requests/42/notes",
+      "status": 201,
+      "body": {
+        "id": 9001
+      },
+      "request_body_contains": [
+        "changes-requested: the guard matches the mention"
+      ]
+    }
+  ]
+}

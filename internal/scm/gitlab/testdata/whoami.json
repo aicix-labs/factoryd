@@ -1,0 +1,14 @@
+{
+  "exchanges": [
+    {
+      "method": "GET",
+      "path": "/api/v4/user",
+      "status": 200,
+      "body": {
+        "id": 2002,
+        "username": "factory-reviewer",
+        "name": "Factory Reviewer"
+      }
+    }
+  ]
+}

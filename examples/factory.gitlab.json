@@ -1,0 +1,26 @@
+{
+  "schema_version": 1,
+  "name": "widgets",
+  "provider": "gitlab",
+  "gitlab": {
+    "base_url": "https://gitlab.example.com/api/v4",
+    "project": "acme/widgets",
+    "remove_source_branch": true
+  },
+  "target_branch": "main",
+  "paths": {
+    "root": "/var/lib/factoryd/widgets",
+    "producer_workdir": "/var/lib/factoryd/widgets/clone"
+  },
+  "credentials": {
+    "producer": {"env": "FACTORYD_PRODUCER_TOKEN"},
+    "reviewer": {"file": "/etc/factoryd/widgets/reviewer.token"}
+  },
+  "gate": {
+    "command": ["make", "check"],
+    "timeout_seconds": 900
+  },
+  "alerts": [
+    {"kind": "webhook", "url": "https://hooks.example.com/factoryd"}
+  ]
+}

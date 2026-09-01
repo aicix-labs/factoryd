@@ -1,0 +1,32 @@
+{
+  "exchanges": [
+    {
+      "method": "GET",
+      "path": "/repos/acme/widgets/issues/42/comments?per_page=100",
+      "status": 200,
+      "body": [
+        {
+          "body": "looks good to me",
+          "user": {
+            "login": "someone",
+            "id": 3003
+          }
+        },
+        {
+          "body": "### adversarial pass \u2014 stale-lens \u2014 **CLEARED**\n\nPinned to `cccccccccccccccccccccccccccccccccccccccc`.\n\nAttempted:\n\n- tried the previous head\n\nno escape found\n\n<!-- factoryd:audit:v1\n{\n  \"lens\": \"stale-lens\",\n  \"verdict\": \"CLEARED\",\n  \"sha\": \"cccccccccccccccccccccccccccccccccccccccc\",\n  \"attempts\": [\n    \"tried the previous head\"\n  ],\n  \"notes\": \"no escape found\",\n  \"posted_by\": \"factory-reviewer\",\n  \"posted_at\": \"2026-09-01T10:05:00Z\"\n}\n-->\n",
+          "user": {
+            "login": "factory-reviewer",
+            "id": 2002
+          }
+        },
+        {
+          "body": "### adversarial pass \u2014 scope-escape \u2014 **CLEARED**\n\nPinned to `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`.\n\nAttempted:\n\n- reverted the guard and confirmed the new test goes red\n- fed the guard a path that only mentions the pattern in a comment\n\nno escape found\n\n<!-- factoryd:audit:v1\n{\n  \"lens\": \"scope-escape\",\n  \"verdict\": \"CLEARED\",\n  \"sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"attempts\": [\n    \"reverted the guard and confirmed the new test goes red\",\n    \"fed the guard a path that only mentions the pattern in a comment\"\n  ],\n  \"notes\": \"no escape found\",\n  \"posted_by\": \"factory-reviewer\",\n  \"posted_at\": \"2026-09-01T10:05:00Z\"\n}\n-->\n",
+          "user": {
+            "login": "factory-reviewer",
+            "id": 2002
+          }
+        }
+      ]
+    }
+  ]
+}

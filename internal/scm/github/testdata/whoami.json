@@ -1,0 +1,14 @@
+{
+  "exchanges": [
+    {
+      "method": "GET",
+      "path": "/user",
+      "status": 200,
+      "body": {
+        "id": 2002,
+        "login": "factory-reviewer",
+        "name": "Factory Reviewer"
+      }
+    }
+  ]
+}

@@ -1,0 +1,18 @@
+{
+  "exchanges": [
+    {
+      "method": "POST",
+      "path": "/repos/acme/widgets/issues/42/comments",
+      "status": 201,
+      "body": {
+        "id": 9002
+      },
+      "request_body_contains": [
+        "factoryd:audit:v1",
+        "reverted the guard",
+        "CLEARED",
+        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+      ]
+    }
+  ]
+}

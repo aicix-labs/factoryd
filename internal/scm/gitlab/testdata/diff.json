@@ -1,0 +1,27 @@
+{
+  "exchanges": [
+    {
+      "method": "GET",
+      "path": "/api/v4/projects/acme%2Fwidgets/merge_requests/42/diffs?page=1&per_page=100",
+      "status": 200,
+      "body": [
+        {
+          "old_path": "internal/gate/scope.go",
+          "new_path": "internal/gate/scope.go",
+          "new_file": false,
+          "renamed_file": false,
+          "deleted_file": false,
+          "diff": "@@ -1,4 +1,6 @@\n context\n-old\n+new1\n+new2\n+new3\n"
+        },
+        {
+          "old_path": "old/name.go",
+          "new_path": "new/name.go",
+          "new_file": false,
+          "renamed_file": true,
+          "deleted_file": false,
+          "diff": ""
+        }
+      ]
+    }
+  ]
+}

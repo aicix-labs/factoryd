@@ -1,0 +1,26 @@
+{
+  "exchanges": [
+    {
+      "method": "GET",
+      "path": "/repos/acme/widgets/pulls/42/files?per_page=100",
+      "status": 200,
+      "body": [
+        {
+          "filename": "internal/gate/scope.go",
+          "additions": 3,
+          "deletions": 1,
+          "status": "modified",
+          "patch": "@@ -1,4 +1,6 @@\n context\n-old\n+new1\n+new2\n+new3\n"
+        },
+        {
+          "filename": "new/name.go",
+          "previous_filename": "old/name.go",
+          "additions": 0,
+          "deletions": 0,
+          "status": "renamed",
+          "patch": ""
+        }
+      ]
+    }
+  ]
+}

@@ -1,0 +1,27 @@
+{
+  "schema_version": 1,
+  "name": "widgets",
+  "provider": "github",
+  "github": {
+    "owner": "acme",
+    "repo": "widgets",
+    "merge_method": "merge"
+  },
+  "target_branch": "main",
+  "paths": {
+    "root": "/var/lib/factoryd/widgets",
+    "producer_workdir": "/var/lib/factoryd/widgets/clone"
+  },
+  "credentials": {
+    "producer": {"file": "/etc/factoryd/widgets/producer.token"},
+    "reviewer": {"file": "/etc/factoryd/widgets/reviewer.token"}
+  },
+  "gate": {
+    "command": ["bash", "-c", "go build ./... && go vet ./... && go test -count=1 ./..."],
+    "timeout_seconds": 900
+  },
+  "alerts": [
+    {"kind": "file", "path": "/var/log/factoryd/widgets-alerts.log"},
+    {"kind": "command", "command": ["/usr/local/bin/notify-operator"]}
+  ]
+}
