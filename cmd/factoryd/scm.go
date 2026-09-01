@@ -77,7 +77,7 @@ func runSCM(args []string) int {
 	switch verb {
 	case "whoami":
 		id, err := d.Whoami(ctx)
-		return out.emit(id, err, func() string { return id.String() })
+		return out.emit(id, err, func() string { return id.String() + "\n" })
 
 	case "list-open":
 		cs, err := d.ListOpen(ctx)
