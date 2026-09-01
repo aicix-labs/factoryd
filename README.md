@@ -21,7 +21,10 @@ specification, including the ten production failures that motivate it, is in
 That rule is enforced on this repository, not just described by it. The
 conformance suite has its own control test that asserts the suite *rejects*
 seven deliberately broken drivers, and names which scenario catches each one —
-because a suite nothing has ever been shown to reject proves nothing.
+because a suite nothing has ever been shown to reject proves nothing. Its
+verb-coverage guard derives both sides of its comparison (reflection over the
+interface, observation of what scenarios called), so it cannot pass by virtue of
+a list nobody updated.
 
 ## Status
 
@@ -102,10 +105,14 @@ credential resolution never falls back from one role to the other.
 never clears a change. A caller who forgets to inspect an outcome gets an
 unusable value, not a false green.
 
-**The API is not the authority on what landed.** After a merge, the merge commit
-is confirmed to be an ancestor of the target branch. A provider that reports a
-merge that is not on the branch yields `MergeUnknown` — not `Merged`, and not a
-refusal, because what happened is genuinely not known and a human has to look.
+**The API is not the authority on what landed.** `Driver.Merge` returns
+`ProviderMerge` — what the provider *said*. Only `MergeVerified`, having
+confirmed the commit is an ancestor of the target branch, can produce a `Merged`
+`MergeResult`; the `verified` field is unexported, so an unconfirmed merge is not
+a bug to test for, it does not typecheck. A provider that reports a merge which
+is not on the branch yields `MergeUnknown` — not `Merged`, and not a refusal,
+because what happened is genuinely not known and a human has to look. The sha it
+claimed is kept in `ClaimedCommit`, since that is what has to be checked by hand.
 
 **Processes are held by handle, never matched by pattern.** `pkill -f
 "supervisor.sh"` matched the invoking shell (killing the operator's session,

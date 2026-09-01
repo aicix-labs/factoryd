@@ -49,16 +49,33 @@ scenario that calls it fails `_verb_coverage`. This is deliberate — in v1, fiv
 verbs existed only in the GitHub driver and the producer was silently
 GitHub-only for weeks.
 
+Neither side of that check is maintained by hand. The method list comes from
+reflection over `scm.Driver`; the exercised list comes from a recorder that
+observes what each scenario actually called. A verb you forget to cover is
+caught whether or not you remember this file exists.
+
 1. Add the method to `scm.Driver`.
-2. Add a scenario to `internal/scm/conformance/conformance.go`, listing the verbs
-   it exercises.
-3. Record a fixture bundle for **both** providers under
+2. Forward it in `internal/scm/conformance/recorder.go`. The recorder implements
+   `scm.Driver`, so until you do, the package does not compile.
+3. Add a scenario to `internal/scm/conformance/conformance.go` that calls it.
+4. Record a fixture bundle for **both** providers under
    `internal/scm/{github,gitlab}/testdata/<scenario>.json`.
-4. Implement it in both drivers.
+5. Implement it in both drivers.
 
 The fixture player is strict in both directions: a request the bundle does not
 contain fails the test, and an exchange the driver never made also fails it. A
 permissive fixture player is a check that cannot fail.
+
+## Merge results
+
+`Driver.Merge` returns `ProviderMerge` — what the provider said. Only
+`MergeVerified`, having confirmed the commit is an ancestor of the target
+branch, produces a `MergeResult` with `Merged`. The `verified` field is
+unexported, so a `Merged` result nothing confirmed cannot be constructed outside
+`internal/scm/merge.go`, and `Validate` rejects one if you try.
+
+Do not add a way to build a verified merge from a driver. A provider cannot
+attest to what landed on a branch; that is the whole point of the split.
 
 ## Adding a mutant
 

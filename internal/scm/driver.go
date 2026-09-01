@@ -224,10 +224,13 @@ type Driver interface {
 	Comment(ctx context.Context, id ChangeID, body string) error
 	SetDraft(ctx context.Context, id ChangeID, draft bool) error
 
-	// Merge attempts the merge, pinned to expectedHead. It reports what
-	// happened; it never returns Merged on a provider response that did not
-	// merge. See MergeResult.
-	Merge(ctx context.Context, id ChangeID, expectedHead string) (MergeResult, error)
+	// Merge attempts the merge, pinned to expectedHead. It reports what the
+	// provider said; it never returns Merged on a response that did not merge.
+	//
+	// It returns ProviderMerge, not MergeResult, because a provider cannot
+	// attest that a commit landed on a branch. Only MergeVerified, having
+	// checked ancestry, can produce a Merged MergeResult.
+	Merge(ctx context.Context, id ChangeID, expectedHead string) (ProviderMerge, error)
 
 	// IsAncestor reports whether sha is reachable from ref. This is how a
 	// reported merge is verified against the repository rather than against

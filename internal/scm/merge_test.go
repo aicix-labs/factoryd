@@ -16,7 +16,7 @@ func TestZeroMergeResultIsNotSuccess(t *testing.T) {
 	if r.Outcome != MergeUnknown {
 		t.Fatalf("zero outcome = %v, want MergeUnknown", r.Outcome)
 	}
-	if r.Verified {
+	if r.Verified() {
 		t.Fatal("the zero MergeResult claims to be verified")
 	}
 	// A zero result must not pass validation either, or a caller could build
@@ -26,14 +26,38 @@ func TestZeroMergeResultIsNotSuccess(t *testing.T) {
 	}
 }
 
+// TestMergedRequiresVerification pins the invariant the type's documentation
+// claims. Merged means "the provider merged AND the commit was confirmed to be
+// an ancestor of the target branch"; a value asserting the first half only must
+// not validate.
+func TestMergedRequiresVerification(t *testing.T) {
+	// Anything another package could construct is unverified by definition,
+	// because the field is unexported.
+	outside := MergeResult{Outcome: Merged, MergeCommit: "abc"}
+	if err := outside.Validate(); err == nil {
+		t.Fatal("a Merged result that nothing confirmed validated")
+	}
+	if outside.Verified() {
+		t.Fatal("a hand-built MergeResult reported itself verified")
+	}
+
+	// A driver cannot even express one: ProviderMerge has no verified field.
+	// This is a compile-time property, asserted here so the intent is recorded.
+	var claim ProviderMerge = ProviderMerged("abc")
+	if err := claim.Validate(); err != nil {
+		t.Fatalf("a well-formed provider claim was rejected: %v", err)
+	}
+}
+
 func TestMergeResultValidate(t *testing.T) {
 	cases := []struct {
 		name    string
 		r       MergeResult
 		wantErr bool
 	}{
-		{"merged with commit", MergeResult{Outcome: Merged, MergeCommit: "abc"}, false},
+		{"merged, unverified", MergeResult{Outcome: Merged, MergeCommit: "abc"}, true},
 		{"merged without commit", MergeResult{Outcome: Merged}, true},
+		{"refusal marked verified", MergeResult{Outcome: RefusedDraft, Reason: "x", verified: true}, true},
 		{"refusal with reason", Refused(RefusedDraft, "it is a draft"), false},
 		{"refusal without reason", MergeResult{Outcome: RefusedDraft}, true},
 		{"refusal carrying a commit", MergeResult{Outcome: RefusedConflict, Reason: "x", MergeCommit: "abc"}, true},
@@ -80,7 +104,7 @@ func TestAllMergeOutcomesAreNamed(t *testing.T) {
 // ---------- MergeVerified ----------
 
 type fakeDriver struct {
-	merge       MergeResult
+	merge       ProviderMerge
 	mergeErr    error
 	ancestor    bool
 	ancestErr   error
@@ -88,7 +112,7 @@ type fakeDriver struct {
 }
 
 func (f *fakeDriver) Provider() string { return "fake" }
-func (f *fakeDriver) Merge(context.Context, ChangeID, string) (MergeResult, error) {
+func (f *fakeDriver) Merge(context.Context, ChangeID, string) (ProviderMerge, error) {
 	return f.merge, f.mergeErr
 }
 func (f *fakeDriver) IsAncestor(context.Context, string, string) (bool, error) {
@@ -108,7 +132,7 @@ func (f *fakeDriver) Whoami(context.Context) (Identity, error)                  
 
 func TestMergeVerified(t *testing.T) {
 	ctx := context.Background()
-	merged := MergeResult{Outcome: Merged, MergeCommit: "deadbeef"}
+	merged := ProviderMerged("deadbeef")
 
 	t.Run("verified merge", func(t *testing.T) {
 		d := &fakeDriver{merge: merged, ancestor: true}
@@ -116,8 +140,11 @@ func TestMergeVerified(t *testing.T) {
 		if err != nil {
 			t.Fatal(err)
 		}
-		if r.Outcome != Merged || !r.Verified {
-			t.Fatalf("got %v verified=%v, want merged and verified", r.Outcome, r.Verified)
+		if r.Outcome != Merged || !r.Verified() {
+			t.Fatalf("got %v verified=%v, want merged and verified", r.Outcome, r.Verified())
+		}
+		if err := r.Validate(); err != nil {
+			t.Fatal(err)
 		}
 	})
 
@@ -130,8 +157,12 @@ func TestMergeVerified(t *testing.T) {
 		if r.Outcome != MergeUnknown {
 			t.Fatalf("outcome = %v, want unknown: the API said merged, the branch says otherwise", r.Outcome)
 		}
-		if r.MergeCommit != "" || r.Verified {
-			t.Fatalf("unverified result carries commit %q verified=%v", r.MergeCommit, r.Verified)
+		if r.MergeCommit != "" || r.Verified() {
+			t.Fatalf("unverified result carries commit %q verified=%v", r.MergeCommit, r.Verified())
+		}
+		// The provider's claimed commit must still be reachable as data.
+		if r.ClaimedCommit != "deadbeef" {
+			t.Fatalf("ClaimedCommit = %q, want the commit the provider claimed", r.ClaimedCommit)
 		}
 		if !strings.Contains(r.Reason, "not an ancestor") {
 			t.Fatalf("reason = %q, want it to say the commit is not an ancestor", r.Reason)
@@ -151,7 +182,7 @@ func TestMergeVerified(t *testing.T) {
 	})
 
 	t.Run("a refusal is not verified", func(t *testing.T) {
-		d := &fakeDriver{merge: Refused(RefusedDraft, "it is a draft")}
+		d := &fakeDriver{merge: RefusedByProvider(RefusedDraft, "it is a draft")}
 		r, err := MergeVerified(ctx, d, "1", "head", "main")
 		if err != nil {
 			t.Fatal(err)
@@ -165,7 +196,7 @@ func TestMergeVerified(t *testing.T) {
 	})
 
 	t.Run("a driver returning an invalid result is an error", func(t *testing.T) {
-		d := &fakeDriver{merge: MergeResult{Outcome: Merged}} // Merged, no commit
+		d := &fakeDriver{merge: ProviderMerge{Outcome: Merged}} // Merged, no commit
 		if _, err := MergeVerified(ctx, d, "1", "head", "main"); err == nil {
 			t.Fatal("accepted a Merged result with no merge commit")
 		}

@@ -211,12 +211,16 @@ func runSCM(args []string) int {
 		if out.json {
 			_ = json.NewEncoder(os.Stdout).Encode(map[string]any{
 				"outcome": r.Outcome.String(), "merge_commit": r.MergeCommit,
-				"verified": r.Verified, "reason": r.Reason,
+				"claimed_commit": r.ClaimedCommit,
+				"verified":       r.Verified(), "reason": r.Reason,
 			})
 		} else if r.Outcome == scm.Merged {
 			fmt.Printf("merged %s into %s (verified)\n", r.MergeCommit, c.TargetBranch)
 		} else {
 			fmt.Printf("%s: %s\n", r.Outcome, r.Reason)
+			if r.ClaimedCommit != "" {
+				fmt.Printf("  the provider claimed commit %s; check it by hand\n", r.ClaimedCommit)
+			}
 		}
 		// The exit code carries the outcome. A merge that did not merge must
 		// never exit 0 -- that was v1's defining bug.

@@ -57,18 +57,8 @@ type Result struct {
 	Err      error
 }
 
-// driverVerbs is every method of scm.Driver. Check asserts the scenario set
-// exercises all of them: a driver method that no scenario calls could be a stub
-// returning "not implemented" and nothing would notice.
-var driverVerbs = []string{
-	"Provider", "ListOpen", "Get", "Diff", "Pipeline", "Comment", "SetDraft",
-	"Merge", "IsAncestor", "PostAudit", "Audits", "Whoami",
-}
-
 type scenario struct {
 	name string
-	// verbs are the Driver methods this scenario exercises.
-	verbs []string
 	// denyHTTP runs the scenario against a transport that refuses every
 	// request, asserting the driver decides locally.
 	denyHTTP bool
@@ -80,14 +70,19 @@ type scenario struct {
 // self-checks (verb coverage).
 func Check(ctx context.Context, f Factory) []Result {
 	var out []Result
-
-	if err := checkVerbCoverage(); err != nil {
-		out = append(out, Result{Scenario: "_verb_coverage", Err: err})
-	}
+	observed := map[string]bool{}
 
 	for _, s := range scenarios() {
-		out = append(out, Result{Scenario: s.name, Err: runScenario(ctx, f, s)})
+		seen, err := runScenario(ctx, f, s)
+		for v := range seen {
+			observed[v] = true
+		}
+		out = append(out, Result{Scenario: s.name, Err: err})
 	}
+
+	// Coverage is decided on what the scenarios actually called, not on what
+	// they claim to call.
+	out = append(out, Result{Scenario: "_verb_coverage", Err: checkVerbCoverage(observed)})
 	return out
 }
 
@@ -102,16 +97,14 @@ func Failed(rs []Result) []Result {
 	return out
 }
 
-func checkVerbCoverage() error {
-	covered := map[string]bool{}
-	for _, s := range scenarios() {
-		for _, v := range s.verbs {
-			covered[v] = true
-		}
-	}
+// checkVerbCoverage compares the verbs the scenarios actually called against
+// the methods of scm.Driver. Both sides are derived -- one by reflection, one by
+// observation -- so adding a method to the interface without a scenario that
+// calls it fails here with no list to remember to update.
+func checkVerbCoverage(observed map[string]bool) error {
 	var missing []string
-	for _, v := range driverVerbs {
-		if !covered[v] {
+	for _, v := range interfaceVerbs() {
+		if !observed[v] {
 			missing = append(missing, v)
 		}
 	}
@@ -123,56 +116,56 @@ func checkVerbCoverage() error {
 		strings.Join(missing, ", "))
 }
 
-func runScenario(ctx context.Context, f Factory, s scenario) error {
+func runScenario(ctx context.Context, f Factory, s scenario) (map[string]bool, error) {
 	var tr *httpfixture.Transport
 	if s.denyHTTP {
 		tr = httpfixture.Deny()
 	} else {
 		b, err := httpfixture.Load(f.FixtureDir, s.name)
 		if err != nil {
-			return fmt.Errorf("loading fixture: %w", err)
+			return nil, fmt.Errorf("loading fixture: %w", err)
 		}
 		tr = httpfixture.NewTransport(b)
 	}
 
-	d, err := f.New(tr.Client())
+	inner, err := f.New(tr.Client())
 	if err != nil {
-		return fmt.Errorf("building driver: %w", err)
+		return nil, fmt.Errorf("building driver: %w", err)
 	}
-	if got := d.Provider(); got != f.Provider {
-		return fmt.Errorf("Provider() = %q, want %q", got, f.Provider)
+	rec := newRecorder(inner)
+
+	if got := rec.Provider(); got != f.Provider {
+		return rec.observed(), fmt.Errorf("Provider() = %q, want %q", got, f.Provider)
 	}
 
-	if err := s.run(ctx, d); err != nil {
-		return err
+	if err := s.run(ctx, rec); err != nil {
+		return rec.observed(), err
 	}
 	// Fixture accounting is part of the assertion, not bookkeeping: it catches
 	// a driver that skipped a call the scenario depends on.
-	return tr.Done()
+	return rec.observed(), tr.Done()
 }
 
 func scenarios() []scenario {
 	return []scenario{
-		// Provider is asserted by runScenario for every scenario; it is
-		// listed once so the coverage check accounts for it.
-		{name: "whoami", verbs: []string{"Whoami", "Provider"}, run: scWhoami},
-		{name: "list_open", verbs: []string{"ListOpen"}, run: scListOpen},
-		{name: "get", verbs: []string{"Get"}, run: scGet},
-		{name: "diff", verbs: []string{"Diff"}, run: scDiff},
-		{name: "pipeline_success", verbs: []string{"Pipeline"}, run: scPipelineSuccess},
-		{name: "pipeline_failed", verbs: []string{"Pipeline"}, run: scPipelineFailed},
-		{name: "pipeline_none", verbs: []string{"Pipeline"}, run: scPipelineNone},
-		{name: "comment", verbs: []string{"Comment"}, run: scComment},
-		{name: "set_draft_ready", verbs: []string{"SetDraft"}, run: scSetDraftReady},
-		{name: "merge_success", verbs: []string{"Merge", "IsAncestor"}, run: scMergeSuccess},
-		{name: "merge_refused_draft", verbs: []string{"Merge"}, run: scMergeRefusedDraft},
-		{name: "merge_refused_unmergeable", verbs: []string{"Merge"}, run: scMergeUnmergeable},
-		{name: "merge_head_moved", verbs: []string{"Merge"}, run: scMergeHeadMoved},
-		{name: "merge_reported_but_absent", verbs: []string{"Merge"}, run: scMergeReportedButAbsent},
-		{name: "merge_unverified", verbs: []string{"Merge", "IsAncestor"}, run: scMergeUnverified},
-		{name: "post_audit", verbs: []string{"PostAudit"}, run: scPostAudit},
-		{name: "audits", verbs: []string{"Audits"}, run: scAudits},
-		{name: "audit_requires_attempts", verbs: []string{"PostAudit"}, denyHTTP: true, run: scAuditRequiresAttempts},
+		{name: "whoami", run: scWhoami},
+		{name: "list_open", run: scListOpen},
+		{name: "get", run: scGet},
+		{name: "diff", run: scDiff},
+		{name: "pipeline_success", run: scPipelineSuccess},
+		{name: "pipeline_failed", run: scPipelineFailed},
+		{name: "pipeline_none", run: scPipelineNone},
+		{name: "comment", run: scComment},
+		{name: "set_draft_ready", run: scSetDraftReady},
+		{name: "merge_success", run: scMergeSuccess},
+		{name: "merge_refused_draft", run: scMergeRefusedDraft},
+		{name: "merge_refused_unmergeable", run: scMergeUnmergeable},
+		{name: "merge_head_moved", run: scMergeHeadMoved},
+		{name: "merge_reported_but_absent", run: scMergeReportedButAbsent},
+		{name: "merge_unverified", run: scMergeUnverified},
+		{name: "post_audit", run: scPostAudit},
+		{name: "audits", run: scAudits},
+		{name: "audit_requires_attempts", denyHTTP: true, run: scAuditRequiresAttempts},
 	}
 }
 
@@ -342,8 +335,11 @@ func scMergeSuccess(ctx context.Context, d scm.Driver) error {
 	if r.MergeCommit != MergeSHA {
 		return fmt.Errorf("MergeCommit = %q, want %q", r.MergeCommit, MergeSHA)
 	}
-	if !r.Verified {
-		return fmt.Errorf("Verified = false; a merge reported by the API but not confirmed by ancestry is not a merge")
+	if !r.Verified() {
+		return fmt.Errorf("Verified() = false; a merge reported by the API but not confirmed by ancestry is not a merge")
+	}
+	if r.ClaimedCommit != MergeSHA {
+		return fmt.Errorf("ClaimedCommit = %q, want %q", r.ClaimedCommit, MergeSHA)
 	}
 	return nil
 }
@@ -358,8 +354,8 @@ func refusal(r scm.MergeResult, want scm.MergeOutcome, reasonSubstr string) erro
 	if r.MergeCommit != "" {
 		return fmt.Errorf("Outcome %v carries merge commit %q", r.Outcome, r.MergeCommit)
 	}
-	if r.Verified {
-		return fmt.Errorf("Outcome %v reported Verified = true", r.Outcome)
+	if r.Verified() {
+		return fmt.Errorf("Outcome %v reported Verified() = true", r.Outcome)
 	}
 	if reasonSubstr != "" && !strings.Contains(r.Reason, reasonSubstr) {
 		return fmt.Errorf("Reason = %q, want it to mention %q", r.Reason, reasonSubstr)
@@ -410,7 +406,16 @@ func scMergeUnverified(ctx context.Context, d scm.Driver) error {
 	}
 	// The API reported a merge commit; the repository says it is not on the
 	// target branch. The API is not the authority on what landed.
-	return refusal(r, scm.MergeUnknown, "not an ancestor")
+	if err := refusal(r, scm.MergeUnknown, "not an ancestor"); err != nil {
+		return err
+	}
+	// The commit the provider claimed must survive into a field. Someone
+	// investigating this Unknown has to go and look at that sha, and digging it
+	// out of prose is not a structured result.
+	if r.ClaimedCommit != MergeSHA {
+		return fmt.Errorf("ClaimedCommit = %q, want the commit the provider claimed (%s)", r.ClaimedCommit, MergeSHA)
+	}
+	return nil
 }
 
 func scPostAudit(ctx context.Context, d scm.Driver) error {
