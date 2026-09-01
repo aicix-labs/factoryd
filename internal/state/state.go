@@ -14,6 +14,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"time"
 
 	"github.com/aicix-labs/factoryd/internal/proc"
@@ -60,6 +61,16 @@ func (t *Turn) Age(now time.Time) time.Duration {
 	return now.Sub(t.StartedAt)
 }
 
+// Pending is a trigger that exists and has not been consumed. It carries the
+// time it was first observed, so an unhandled signal has an age rather than
+// just a presence -- v1 could tell you a trigger existed but not that it had
+// been sitting there for two hours.
+type Pending struct {
+	Label     string    `json:"label"`
+	Path      string    `json:"path"`
+	FirstSeen time.Time `json:"first_seen"`
+}
+
 // RoleState is everything the factory knows about one role.
 type RoleState struct {
 	// Supervisor is the supervising process, by handle. Nil means no
@@ -73,6 +84,11 @@ type RoleState struct {
 	// legitimately spans turns, and a guard that cannot tell "still working"
 	// from "achieving nothing" halts real work.
 	SpinCount int `json:"spin_count"`
+	// Pending are the triggers seen and not yet consumed, oldest first.
+	Pending []Pending `json:"pending,omitempty"`
+	// WatchMode records whether the watcher is event-driven or polling, so a
+	// degraded watcher is visible rather than merely slower.
+	WatchMode string `json:"watch_mode,omitempty"`
 	// LastProgressAt is the mtime of the role's progress file at the last
 	// observation.
 	LastProgressAt time.Time `json:"last_progress_at,omitempty"`
@@ -83,6 +99,34 @@ type RoleState struct {
 	Halted     bool      `json:"halted"`
 	HaltReason string    `json:"halt_reason,omitempty"`
 	HaltedAt   time.Time `json:"halted_at,omitempty"`
+}
+
+// SetPending replaces the pending set with what was just observed, keeping the
+// original first-seen time for anything already known. Re-stamping FirstSeen on
+// every observation would make every trigger look freshly arrived, and an alarm
+// that resets its own clock never fires.
+func (rs *RoleState) SetPending(observed []Pending) {
+	prior := make(map[string]time.Time, len(rs.Pending))
+	for _, p := range rs.Pending {
+		prior[p.Path] = p.FirstSeen
+	}
+	out := make([]Pending, 0, len(observed))
+	for _, p := range observed {
+		if first, ok := prior[p.Path]; ok {
+			p.FirstSeen = first
+		}
+		out = append(out, p)
+	}
+	sort.Slice(out, func(i, j int) bool { return out[i].FirstSeen.Before(out[j].FirstSeen) })
+	rs.Pending = out
+}
+
+// OldestPending returns the longest-waiting pending trigger.
+func (rs *RoleState) OldestPending() (Pending, bool) {
+	if len(rs.Pending) == 0 {
+		return Pending{}, false
+	}
+	return rs.Pending[0], true
 }
 
 // Verdict is the reviewer's decision on one change.
@@ -169,6 +213,14 @@ func (s *State) Validate() error {
 		}
 		if rs.SpinCount < 0 {
 			return fmt.Errorf("state: role %s has a negative spin count", r)
+		}
+		for i, p := range rs.Pending {
+			if p.Label == "" || p.Path == "" {
+				return fmt.Errorf("state: role %s pending[%d] has no label or path", r, i)
+			}
+			if p.FirstSeen.IsZero() {
+				return fmt.Errorf("state: role %s pending[%d] (%s) has no first-seen time; a pending trigger with no age cannot be escalated", r, i, p.Label)
+			}
 		}
 	}
 	if v := s.LastVerdict; v != nil && !ValidVerdictKind(v.Kind) {
@@ -274,9 +326,19 @@ func (s *State) Save(path string) error {
 	return d.Sync()
 }
 
-// Update loads, applies fn, and saves. It is the only supported way to modify
-// the document, so that every write goes through validation.
+// Update loads, applies fn, and saves, holding an exclusive lock for the whole
+// sequence. It is the only supported way to modify the document, so that every
+// write goes through validation and no two writers interleave.
+//
+// The lock matters because the document is shared between both roles'"'"'
+// supervisors. Load-then-Save without it loses whichever update landed first.
 func Update(path, factory string, fn func(*State) error) (*State, error) {
+	unlock, err := lock(path)
+	if err != nil {
+		return nil, err
+	}
+	defer unlock()
+
 	s, err := Load(path, factory)
 	if err != nil {
 		return nil, err
@@ -289,3 +351,6 @@ func Update(path, factory string, fn func(*State) error) (*State, error) {
 	}
 	return s, nil
 }
+
+// LockPath is the advisory lock guarding the state document.
+func LockPath(statePath string) string { return statePath + ".lock" }

@@ -1,0 +1,514 @@
+package supervise_test
+
+import (
+	"context"
+	"errors"
+	"io"
+	"log/slog"
+	"os"
+	"path/filepath"
+	"strings"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/aicix-labs/factoryd/internal/config"
+	"github.com/aicix-labs/factoryd/internal/proc"
+	"github.com/aicix-labs/factoryd/internal/state"
+	"github.com/aicix-labs/factoryd/internal/supervise"
+)
+
+// fakeRunner is the agent turn under test. Each turn calls act, which decides
+// what that turn does to the world: consume its trigger, touch progress, or
+// nothing at all.
+type fakeRunner struct {
+	mu    sync.Mutex
+	turns []supervise.Turn
+	act   func(n int, t supervise.Turn) supervise.TurnResult
+}
+
+func (f *fakeRunner) Run(_ context.Context, t supervise.Turn, started func(proc.Ref)) (supervise.TurnResult, error) {
+	f.mu.Lock()
+	f.turns = append(f.turns, t)
+	n := len(f.turns)
+	f.mu.Unlock()
+	if started != nil {
+		if ref, err := proc.Self("turn"); err == nil {
+			started(ref)
+		}
+	}
+	if f.act == nil {
+		return supervise.TurnResult{}, nil
+	}
+	return f.act(n, t), nil
+}
+
+func (f *fakeRunner) count() int {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	return len(f.turns)
+}
+
+type fixture struct {
+	cfg    *config.Config
+	root   string
+	inbox  string
+	outbox string
+	slept  []time.Duration
+}
+
+func newFixture(t *testing.T) *fixture {
+	t.Helper()
+	root := t.TempDir()
+	fx := &fixture{
+		root:   root,
+		inbox:  filepath.Join(root, "inbox"),
+		outbox: filepath.Join(root, "outbox"),
+	}
+	for _, d := range []string{fx.inbox, fx.outbox, filepath.Join(root, "work")} {
+		if err := os.MkdirAll(d, 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	fx.cfg = &config.Config{
+		SchemaVersion: config.SchemaVersion,
+		Name:          "widgets",
+		Provider:      "github",
+		GitHub:        &config.GitHub{Owner: "acme", Repo: "widgets"},
+		TargetBranch:  "main",
+		Paths:         config.Paths{Root: root, ProducerWorkdir: filepath.Join(root, "work")},
+		Credentials: config.Credentials{
+			Producer: config.CredentialRef{Env: "P"},
+			Reviewer: config.CredentialRef{Env: "R"},
+		},
+		Gate: config.Gate{Command: []string{"true"}},
+		Roles: config.Roles{
+			Producer: config.RoleSpec{Command: []string{"true"}},
+			Reviewer: config.RoleSpec{Command: []string{"true"}},
+		},
+		Supervisor: config.Supervisor{
+			SpinWarn: 2, SpinAbort: 4, PollIntervalSeconds: 1, BackoffSeconds: 1,
+			ForcePoll: true,
+		},
+		Alerts: []config.Alert{{Kind: "file", Path: filepath.Join(root, "alerts.log")}},
+	}
+	if err := fx.cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return fx
+}
+
+func (fx *fixture) wake(t *testing.T) string {
+	t.Helper()
+	p := filepath.Join(fx.inbox, "wake")
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func (fx *fixture) progress(t *testing.T) {
+	t.Helper()
+	if err := fx.progressQuiet(); err != nil {
+		t.Fatal(err)
+	}
+}
+
+// progressQuiet is what a runner goroutine calls. t.Fatal from a goroutine that
+// is not the test's own is not allowed, and a supervisor still winding down
+// after the test body returns would trip exactly that.
+func (fx *fixture) progressQuiet() error {
+	p := fx.cfg.ProgressPath("reviewer")
+	// A fresh mtime, unambiguously later than anything already recorded.
+	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
+		return err
+	}
+	now := time.Now().Add(time.Second)
+	return os.Chtimes(p, now, now)
+}
+
+func (fx *fixture) newSupervisor(t *testing.T, r supervise.Runner, maxTurns int) *supervise.Supervisor {
+	t.Helper()
+	s, err := supervise.New(supervise.Options{
+		Config: fx.cfg,
+		Role:   "reviewer",
+		Runner: r,
+		Log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Sleep: func(ctx context.Context, d time.Duration) error {
+			fx.slept = append(fx.slept, d)
+			return ctx.Err()
+		},
+		MaxTurns: maxTurns,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { s.Close() })
+	return s
+}
+
+func (fx *fixture) roleState(t *testing.T) *state.RoleState {
+	t.Helper()
+	st, err := state.Load(fx.cfg.StatePath(), fx.cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return st.Role(state.RoleReviewer)
+}
+
+func ctxWithTimeout(t *testing.T) (context.Context, context.CancelFunc) {
+	t.Helper()
+	return context.WithTimeout(context.Background(), 20*time.Second)
+}
+
+// ---------- the loop ----------
+
+// One trigger, one turn. The turn consumes it, and the supervisor re-arms
+// rather than stopping -- v1's producer stopped after every verdict and needed
+// a human to re-prompt it.
+func TestConsumedTriggerRunsOneTurnAndReArms(t *testing.T) {
+	fx := newFixture(t)
+	p := fx.wake(t)
+
+	r := &fakeRunner{act: func(n int, _ supervise.Turn) supervise.TurnResult {
+		if n == 1 {
+			os.Remove(p)
+		}
+		return supervise.TurnResult{}
+	}}
+	s := fx.newSupervisor(t, r, 1)
+
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if got := r.count(); got != 1 {
+		t.Fatalf("ran %d turns for one trigger, want 1", got)
+	}
+
+	rs := fx.roleState(t)
+	if rs.SpinCount != 0 {
+		t.Fatalf("spin count = %d after a consumed trigger, want 0", rs.SpinCount)
+	}
+	if rs.LastTurn == nil || rs.LastTurn.Running() {
+		t.Fatalf("last turn = %+v, want a finished turn", rs.LastTurn)
+	}
+	if len(rs.Pending) != 0 {
+		t.Fatalf("pending = %+v after the trigger was consumed", rs.Pending)
+	}
+	if rs.Supervisor == nil {
+		t.Fatal("the supervisor did not record itself")
+	}
+}
+
+// The distinction §6.3 exists for: a turn that leaves its trigger but touches
+// progress is working, not spinning. A guard that could not tell these apart
+// would halt a legitimate multi-turn task.
+func TestProgressResetsTheSpinCounterWithoutConsumption(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+
+	r := &fakeRunner{act: func(_ int, _ supervise.Turn) supervise.TurnResult {
+		fx.progress(t)
+		return supervise.TurnResult{}
+	}}
+	s := fx.newSupervisor(t, r, 6)
+
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); err != nil {
+		t.Fatalf("a task that kept reporting progress was halted: %v", err)
+	}
+	if got := r.count(); got != 6 {
+		t.Fatalf("ran %d turns, want 6", got)
+	}
+	if rs := fx.roleState(t); rs.SpinCount != 0 || rs.Halted {
+		t.Fatalf("spin=%d halted=%v after six turns of real progress", rs.SpinCount, rs.Halted)
+	}
+	if len(fx.slept) != 0 {
+		t.Fatalf("backed off %v while the agent was making progress", fx.slept)
+	}
+}
+
+// Neither consumed nor progressed: the counter must climb and the supervisor
+// must halt at spin_abort rather than relaunching a paid model turn forever.
+func TestSpinGuardHalts(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+
+	r := &fakeRunner{act: func(_ int, _ supervise.Turn) supervise.TurnResult {
+		return supervise.TurnResult{ExitCode: 1}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	err := s.Run(ctx)
+	if !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted", err)
+	}
+	// spin_abort is 4, so the fourth fruitless turn halts.
+	if got := r.count(); got != 4 {
+		t.Fatalf("ran %d turns before halting, want 4 (spin_abort)", got)
+	}
+
+	rs := fx.roleState(t)
+	if !rs.Halted {
+		t.Fatal("state does not record the halt")
+	}
+	if rs.HaltReason == "" {
+		t.Fatal("halted with no reason recorded")
+	}
+	if !strings.Contains(rs.HaltReason, "spin_abort") {
+		t.Fatalf("halt reason does not name the guard that fired: %q", rs.HaltReason)
+	}
+
+	// The sentinel must exist and say why.
+	body, err := os.ReadFile(fx.cfg.StopPath("reviewer"))
+	if err != nil {
+		t.Fatalf("no stop sentinel: %v", err)
+	}
+	if !strings.Contains(string(body), "reason:") {
+		t.Fatalf("sentinel does not carry a reason:\n%s", body)
+	}
+
+	// The trigger is the only evidence a signal ever arrived. Halting must not
+	// destroy it.
+	if _, err := os.Stat(filepath.Join(fx.inbox, "wake")); err != nil {
+		t.Fatalf("the trigger was removed on abort: %v", err)
+	}
+	if len(rs.Pending) == 0 {
+		t.Fatal("state forgot the pending trigger on abort")
+	}
+}
+
+func TestSpinGuardBacksOffBeforeHalting(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		return supervise.TurnResult{ExitCode: 1}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	_ = s.Run(ctx)
+
+	// Three fruitless turns precede the halting fourth, each followed by a
+	// backoff. Without one, the loop would re-arm instantly on a trigger that
+	// is still there and burn model turns in a tight ring.
+	if len(fx.slept) != 3 {
+		t.Fatalf("backed off %v, want three delays before the halt", fx.slept)
+	}
+	for i := 1; i < len(fx.slept); i++ {
+		if fx.slept[i] <= fx.slept[i-1] {
+			t.Fatalf("backoff did not escalate: %v", fx.slept)
+		}
+	}
+}
+
+// A halted factory stays halted until an operator clears it.
+func TestStopSentinelRefusesToStart(t *testing.T) {
+	fx := newFixture(t)
+	if err := os.WriteFile(fx.cfg.StopPath("reviewer"), []byte("reason: earlier halt\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	fx.wake(t)
+
+	r := &fakeRunner{}
+	s := fx.newSupervisor(t, r, 5)
+
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	err := s.Run(ctx)
+	if !errors.Is(err, supervise.ErrStopSentinel) {
+		t.Fatalf("Run returned %v, want ErrStopSentinel", err)
+	}
+	if r.count() != 0 {
+		t.Fatalf("ran %d turns despite the stop sentinel", r.count())
+	}
+}
+
+// Two supervisors for one role must not both run. The check is on a process
+// handle, not on a command-line pattern.
+func TestSecondSupervisorIsRefused(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+
+	// The first supervisor must stay alive for the duration, so its turns
+	// report progress rather than tripping its own spin guard.
+	alive := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		_ = fx.progressQuiet()
+		return supervise.TurnResult{}
+	}}
+	first := fx.newSupervisor(t, alive, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- first.Run(ctx) }()
+	// Stop the first supervisor before the fixture directory goes away,
+	// whichever way this test exits.
+	t.Cleanup(func() { cancel(); <-done })
+
+	// Wait for the first to claim the role.
+	deadline := time.Now().Add(5 * time.Second)
+	for {
+		if fx.roleState(t).Supervisor != nil {
+			break
+		}
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("the first supervisor never recorded itself")
+		}
+		time.Sleep(5 * time.Millisecond)
+	}
+
+	// This process IS the recorded supervisor, so a same-PID claim is allowed
+	// (a restart in place). Simulate a genuinely different live process by
+	// pointing the record at our parent, which is alive and is not us.
+	if _, err := state.Update(fx.cfg.StatePath(), fx.cfg.Name, func(st *state.State) error {
+		ref, err := proc.Take(os.Getppid(), "reviewer", "other supervisor")
+		if err != nil {
+			return err
+		}
+		st.Role(state.RoleReviewer).Supervisor = &ref
+		return nil
+	}); err != nil {
+		t.Skipf("cannot take a handle on the parent process: %v", err)
+	}
+
+	second := fx.newSupervisor(t, &fakeRunner{}, 5)
+	if err := second.Run(context.Background()); !errors.Is(err, supervise.ErrAlreadyRunning) {
+		t.Fatalf("second supervisor returned %v, want ErrAlreadyRunning", err)
+	}
+}
+
+// A dead supervisor record must not block a restart forever. This is the other
+// half of the liveness check: it has to be able to say "not running" too.
+func TestDeadSupervisorRecordIsReplaced(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	if _, err := state.Update(fx.cfg.StatePath(), fx.cfg.Name, func(st *state.State) error {
+		st.Role(state.RoleReviewer).Supervisor = &proc.Ref{PID: 999999, StartToken: "1", Role: "reviewer"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		os.Remove(filepath.Join(fx.inbox, "wake"))
+		return supervise.TurnResult{}
+	}}
+	s := fx.newSupervisor(t, r, 1)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); err != nil {
+		t.Fatalf("a dead supervisor record blocked a restart: %v", err)
+	}
+}
+
+// A pending trigger's age must survive across turns. Re-stamping it every
+// observation would make an old signal look new, and an alarm that resets its
+// own clock never fires.
+func TestPendingAgeSurvivesTurns(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		fx.progress(t)
+		return supervise.TurnResult{}
+	}}
+	s := fx.newSupervisor(t, r, 1)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	first, ok := fx.roleState(t).OldestPending()
+	if !ok {
+		t.Fatal("no pending trigger recorded")
+	}
+
+	time.Sleep(20 * time.Millisecond)
+	s2 := fx.newSupervisor(t, r, 1)
+	if err := s2.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	second, ok := fx.roleState(t).OldestPending()
+	if !ok {
+		t.Fatal("the pending trigger vanished")
+	}
+	if !second.FirstSeen.Equal(first.FirstSeen) {
+		t.Fatalf("first-seen moved from %v to %v; the trigger's age was reset",
+			first.FirstSeen, second.FirstSeen)
+	}
+}
+
+// A supervisor whose trigger is always pending and whose turns always report
+// progress never blocks in Wait. It must still stop when cancelled, or it
+// cannot be shut down at all while it is busy.
+func TestCancelStopsABusySupervisor(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		_ = fx.progressQuiet()
+		return supervise.TurnResult{}
+	}}
+	s := fx.newSupervisor(t, r, 0) // unbounded, as in production
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+
+	// Let it get into the loop, then stop it.
+	deadline := time.Now().Add(5 * time.Second)
+	for r.count() == 0 {
+		if time.Now().After(deadline) {
+			cancel()
+			t.Fatal("the supervisor never ran a turn")
+		}
+		time.Sleep(2 * time.Millisecond)
+	}
+	cancel()
+
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v on cancellation, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("a busy supervisor did not stop within 10s of cancellation")
+	}
+}
+
+func TestTriggersForBothRoles(t *testing.T) {
+	fx := newFixture(t)
+	for _, role := range []string{"producer", "reviewer"} {
+		specs, err := supervise.TriggersFor(fx.cfg, role)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if len(specs) == 0 {
+			t.Fatalf("role %s waits on nothing", role)
+		}
+	}
+	if _, err := supervise.TriggersFor(fx.cfg, "operator"); err == nil {
+		t.Fatal("TriggersFor accepted a role that does not exist")
+	}
+}
+
+func TestNewRejectsBadOptions(t *testing.T) {
+	fx := newFixture(t)
+	cases := map[string]supervise.Options{
+		"no config": {Role: "reviewer", Runner: &fakeRunner{}},
+		"no runner": {Config: fx.cfg, Role: "reviewer"},
+		"bad role":  {Config: fx.cfg, Role: "operator", Runner: &fakeRunner{}},
+	}
+	for name, o := range cases {
+		if s, err := supervise.New(o); err == nil {
+			s.Close()
+			t.Errorf("%s: New accepted it", name)
+		}
+	}
+}

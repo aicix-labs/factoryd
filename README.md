@@ -28,7 +28,7 @@ a list nobody updated.
 
 ## Status
 
-Early. Steps 1–3 of the [delivery sequence](SPEC.md#11-delivery-sequence) are
+Early. Steps 1–4 of the [delivery sequence](SPEC.md#11-delivery-sequence) are
 implemented and tested; the rest is not, and the binary says so rather than
 pretending.
 
@@ -37,13 +37,13 @@ pretending.
 | 1 | `Driver` interface, GitHub + GitLab drivers, shared conformance suite | **done** |
 | 2 | Typed merge results, post-merge ancestry verification | **done** |
 | 3 | Versioned state document, process handles, `doctor` | **done** |
-| 4 | Supervisor (both roles, one implementation), spin/abort, progress | not started |
+| 4 | Supervisor (both roles, one implementation), spin/abort, progress | **done** |
 | 5 | `submit`: the gate, identity check, sandbox-aware materialization | not started |
 | 6 | Health, alert transports, resource guards | not started |
 | 7 | Status page | not started |
 
-`factoryd supervise`, `submit`, `signal`, `audit` and `status` exit non-zero with
-"not implemented in this build". A subcommand that silently did nothing would be
+`factoryd submit`, `signal`, `audit` and `status` exit non-zero with "not
+implemented in this build". A subcommand that silently did nothing would be
 indistinguishable from one that ran and found nothing to do.
 
 ## What works today
@@ -69,6 +69,34 @@ ok    distinct identities          producer producer-bot (id 1001), reviewer fac
 
 1 of 13 checks FAILED: producer workdir
 ```
+
+a supervised role loop, where the agent turn is any command you configure:
+
+```console
+$ factoryd supervise --config f.json --role reviewer
+INFO msg="watcher armed" role=reviewer mode=inotify
+INFO msg="turn starting"  turn=reviewer-20260901T194139-1 triggers=wake
+INFO msg="turn finished"  turn=reviewer-20260901T194139-1 exit=0 consumed=false progressed=true spin=0
+INFO msg="turn starting"  turn=reviewer-20260901T194139-2 triggers=wake
+INFO msg="turn finished"  turn=reviewer-20260901T194139-2 exit=0 consumed=true  progressed=false spin=0
+```
+
+That first turn left its trigger in place and still did not count against the
+spin guard, because it touched its progress file. A turn that leaves the trigger
+*and* reports nothing does count, and at `spin_abort` the supervisor stops:
+
+```console
+WARN  msg="turn achieved nothing" spin=3 warn_at=2 abort_at=4
+ERROR msg="supervisor halting" reason="4 consecutive turns consumed no trigger
+      and reported no progress (spin_abort=4); last trigger wake, last exit 1"
+      sentinel=/var/lib/factoryd/widgets/reviewer.stop triggers_preserved=wake
+$ echo $?
+3
+```
+
+The trigger is deliberately left on disk: it is the only evidence a signal ever
+arrived. The sentinel is removed by an operator and by nobody else — a circuit
+breaker that resets itself is a slower version of the loop it was meant to stop.
 
 and direct, scriptable access to the provider:
 
@@ -120,6 +148,28 @@ twice) and matched child subshells that share argv (two false "duplicate
 supervisor" alarms). A PID alone is not an identity either, so every reference
 carries the kernel's process start token; a recycled PID reports dead.
 
+**Progress, not consumption, resets the spin guard.** A supervisor that halted
+whenever a turn left its trigger behind would halt every task too large for one
+turn. So an agent touches a progress file to say "I advanced", and only turns
+that consume nothing *and* report nothing count toward the circuit breaker. This
+distinction was a bug in the first implementation of the rule and is now the
+thing its tests are mostly about.
+
+**The watcher cannot be lost.** In v1 it was a separate single-shot script; it
+exited after firing, nothing re-armed it, and a reviewer signal then sat unseen
+for two hours and twenty minutes. Here it is a value the supervisor owns for its
+whole life. It is event-driven via inotify with a poll fallback, it never
+consumes a trigger, and it returns immediately for a trigger that was already
+there — a watcher that only reported *new* events would reproduce the same gap.
+When it falls back to polling it says so at boot and records it in state, because
+silent degradation is indistinguishable from working.
+
+**One state document, one writer at a time.** Both roles'"'"' supervisors write the
+same `state.json`, and `Update` is a read-modify-write. Without a lock the later
+writer silently discards the other'"'"'s changes — measured at 165 of 200 updates
+lost under contention — including a halt reason, which is the one field nobody
+can afford to lose.
+
 **An audit that lists nothing tried is not a pass.** An adversarial pass with an
 empty `attempts` list is rejected at the type boundary, before it reaches the
 provider.
@@ -131,7 +181,8 @@ $ go build ./...
 $ go test -race -count=1 ./...
 ```
 
-Go 1.25, no third-party dependencies.
+Go 1.25, no third-party dependencies — inotify comes from the standard
+library'"'"'s `syscall` package.
 
 `-count=1` is not decoration: a shared build cache replays cached test *results*,
 so a green run without it can mean nothing executed.
@@ -146,8 +197,12 @@ internal/scm/          Driver interface, typed results, audit wire format
   httpfixture/         strict recorded-exchange replay (unrecorded request = failure,
                        unused exchange = failure)
   httpjson/            the shared JSON-over-HTTP client
+internal/supervise/    one role loop, parameterised by role: block, run one
+                       turn, re-arm; the spin guard and the halt sentinel
+internal/watch/        inotify with a poll fallback; never consumes a trigger
 internal/config/       one JSON config per factory, decoded strictly
 internal/state/        the single versioned state document, written atomically
+                       under an exclusive lock
 internal/proc/         process references by handle and start token
 internal/doctor/       "could this factory actually run?"
 internal/factory/      config -> driver

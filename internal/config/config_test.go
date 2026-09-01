@@ -10,7 +10,7 @@ import (
 )
 
 const good = `{
-  "schema_version": 1,
+  "schema_version": 2,
   "name": "widgets",
   "provider": "github",
   "github": {"owner": "acme", "repo": "widgets"},
@@ -21,6 +21,10 @@ const good = `{
     "reviewer": {"env": "FACTORYD_REVIEWER_TOKEN"}
   },
   "gate": {"command": ["go", "test", "./..."]},
+  "roles": {
+    "producer": {"command": ["claude", "-p", "producer-brief"]},
+    "reviewer": {"command": ["claude", "-p", "reviewer-playbook"]}
+  },
   "alerts": [{"kind": "file", "path": "/var/log/factoryd/alerts.log"}]
 }`
 
@@ -61,15 +65,18 @@ func TestUnknownKeyIsRefused(t *testing.T) {
 
 func TestValidationFailures(t *testing.T) {
 	cases := map[string]struct{ from, to, want string }{
-		"missing schema version": {`"schema_version": 1,`, ``, "schema_version"},
-		"future schema version":  {`"schema_version": 1`, `"schema_version": 99`, "schema_version"},
-		"empty name":             {`"name": "widgets"`, `"name": ""`, "name"},
-		"unknown provider":       {`"provider": "github"`, `"provider": "bitbucket"`, "provider"},
-		"no target branch":       {`"target_branch": "main"`, `"target_branch": ""`, "target_branch"},
-		"empty gate":             {`"command": ["go", "test", "./..."]`, `"command": []`, "gate.command"},
-		"no alerts":              {`[{"kind": "file", "path": "/var/log/factoryd/alerts.log"}]`, `[]`, "alert transport"},
-		"unknown alert kind":     {`"kind": "file"`, `"kind": "carrier-pigeon"`, "carrier-pigeon"},
-		"alert missing path":     {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "file"}`, "no path"},
+		"missing schema version":  {`"schema_version": 2,`, ``, "schema_version"},
+		"future schema version":   {`"schema_version": 2`, `"schema_version": 99`, "schema_version"},
+		"previous schema version": {`"schema_version": 2`, `"schema_version": 1`, "schema_version"},
+		"no producer turn":        {`"producer": {"command": ["claude", "-p", "producer-brief"]}`, `"producer": {"command": []}`, "roles.producer.command"},
+		"warn at or above abort":  {`"gate":`, `"supervisor": {"spin_warn": 9, "spin_abort": 4}, "gate":`, "spin_warn"},
+		"empty name":              {`"name": "widgets"`, `"name": ""`, "name"},
+		"unknown provider":        {`"provider": "github"`, `"provider": "bitbucket"`, "provider"},
+		"no target branch":        {`"target_branch": "main"`, `"target_branch": ""`, "target_branch"},
+		"empty gate":              {`"command": ["go", "test", "./..."]`, `"command": []`, "gate.command"},
+		"no alerts":               {`[{"kind": "file", "path": "/var/log/factoryd/alerts.log"}]`, `[]`, "alert transport"},
+		"unknown alert kind":      {`"kind": "file"`, `"kind": "carrier-pigeon"`, "carrier-pigeon"},
+		"alert missing path":      {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "file"}`, "no path"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
