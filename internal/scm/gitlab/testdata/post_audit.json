@@ -1,17 +1,45 @@
 {
+  "source": {
+    "recorded": true,
+    "provider": "gitlab",
+    "provider_version": "18.8.2",
+    "recorded_at": "2026-09-01T10:00:00Z"
+  },
   "exchanges": [
     {
       "method": "POST",
       "path": "/api/v4/projects/acme%2Fwidgets/merge_requests/42/notes",
       "status": 201,
       "body": {
-        "id": 9002
+        "author": {
+          "avatar_url": "https://secure.gravatar.com/avatar/ecc55d65ed7cf1a3fe8e030a7880675cf47dabb0f717ec42a9cadf3ec66b53d3?s=80\u0026d=identicon",
+          "id": 1001,
+          "locked": false,
+          "name": "****",
+          "public_email": null,
+          "state": "active",
+          "username": "producer-bot",
+          "web_url": "https://gitlab.example.com/producer-bot"
+        },
+        "body": "### adversarial pass — scope-escape — **CLEARED**\n\nPinned to `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`.\n\nAttempted:\n\n- reverted the guard and confirmed the new test goes red\n- fed the guard a path that only mentions the pattern in a comment\n\nno escape found\n\n\u003c!-- factoryd:audit:v1\n{\n  \"lens\": \"scope-escape\",\n  \"verdict\": \"CLEARED\",\n  \"sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"attempts\": [\n    \"reverted the guard and confirmed the new test goes red\",\n    \"fed the guard a path that only mentions the pattern in a comment\"\n  ],\n  \"notes\": \"no escape found\"\n}\n--\u003e",
+        "commands_changes": {},
+        "confidential": false,
+        "created_at": "2026-09-01T10:00:00Z",
+        "id": 1001,
+        "imported": false,
+        "imported_from": "none",
+        "internal": false,
+        "noteable_id": 2933,
+        "noteable_iid": 44,
+        "noteable_type": "MergeRequest",
+        "project_id": 1,
+        "resolvable": false,
+        "system": false,
+        "type": null,
+        "updated_at": "2026-09-01T10:00:00Z"
       },
       "request_body_contains": [
-        "factoryd:audit:v1",
-        "reverted the guard",
-        "CLEARED",
-        "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+        "\"body\":\"### adversarial pass — scope-escape — **CLEARED**\\n\\nPinned to `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`.\\n\\nAttempted:\\n\\n- reverted the guard and confirmed the new test goes red\\n- fed the guard a path that only mentions the pattern in a comment\\n\\nno escape found\\n\\n\\u003c!-- factoryd:audit:v1\\n{\\n  \\\"lens\\\": \\\"scope-escape\\\",\\n  \\\"verdict\\\": \\\"CLEARED\\\",\\n  \\\"sha\\\": \\\"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\\\",\\n  \\\"attempts\\\": [\\n    \\\"reverted the guard and confirmed the new test goes red\\\",\\n    \\\"fed the guard a path that only mentions the pattern in a comment\\\"\\n  ],\\n  \\\"notes\\\": \\\"no escape found\\\"\\n}\\n--\\u003e\\n\""
       ]
     }
   ]

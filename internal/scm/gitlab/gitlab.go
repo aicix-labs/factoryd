@@ -410,15 +410,26 @@ func (d *Driver) Merge(ctx context.Context, id scm.ChangeID, expectedHead string
 		var he *httpjson.Error
 		if httpjson.AsError(err, &he) {
 			switch he.Status {
-			case http.StatusMethodNotAllowed:
-				// "Branch cannot be merged" -- the v1 bug, now a typed refusal.
-				return scm.RefusedByProvider(scm.RefusedConflict, "gitlab refused the merge: %s", he.Message()), nil
-			case http.StatusNotAcceptable:
-				return scm.RefusedByProvider(scm.RefusedConflict, "gitlab reported a conflict: %s", he.Message()), nil
-			case http.StatusConflict:
-				return scm.RefusedByProvider(scm.RefusedConflict, "head sha mismatch: %s", he.Message()), nil
-			case http.StatusUnprocessableEntity:
-				return scm.RefusedByProvider(scm.RefusedPipeline, "gitlab would not merge: %s", he.Message()), nil
+			case http.StatusMethodNotAllowed, // 405: not in a mergeable state
+				http.StatusNotAcceptable,       // 406: conflict, older instances
+				http.StatusConflict,            // 409: the head moved
+				http.StatusUnprocessableEntity: // 422: "Branch cannot be merged"
+				//
+				// All four are "the provider refused", and the status code does
+				// not reliably say why.
+				//
+				// This mapping is recorded, not assumed. Against GitLab 18.8.2
+				// a genuine conflict answers 422 with "Branch cannot be merged"
+				// (see testdata/merge_refused_unmergeable.json), while 405 is
+				// what comes back when mergeability has not been computed yet.
+				// The hand-written fixture this replaced said 405 meant the
+				// conflict and 422 meant CI, so a real conflict was reported as
+				// RefusedPipeline -- the wrong reason, with the suite green.
+				//
+				// Whether CI is green is decided from Pipeline(), by the gate.
+				// It is not inferred from the shape of a merge refusal.
+				return scm.RefusedByProvider(scm.RefusedConflict,
+					"gitlab refused the merge (HTTP %d): %s", he.Status, he.Message()), nil
 			}
 		}
 		return scm.ProviderMerge{}, fmt.Errorf("gitlab merge %s: %w", id, err)

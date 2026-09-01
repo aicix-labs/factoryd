@@ -35,9 +35,10 @@ const (
 	StaleSHA     = "cccccccccccccccccccccccccccccccccccccccc"
 	ReviewerName = "factory-reviewer"
 	ProducerName = "producer-bot"
-	// UnmergeableMessage is the literal GitLab message that v1 printed while
-	// returning exit status 0.
-	UnmergeableMessage = "Branch cannot be merged"
+	// ChangeTitle and SourceBranch are what the recorder creates on a live
+	// provider, so the assertions here and the fixtures stay in step.
+	ChangeTitle  = "gate: match command position, not the mention"
+	SourceBranch = "producer/fix-thing"
 )
 
 // Factory builds the driver under test, bound to a supplied HTTP client.
@@ -49,6 +50,16 @@ type Factory struct {
 	FixtureDir string
 	// New builds the driver. It must not perform any I/O.
 	New func(hc *http.Client) (scm.Driver, error)
+
+	// UnmergeableMessage is this provider's own wording when it refuses an
+	// unmergeable change, taken from the recorded fixture.
+	//
+	// It is per-provider because the two do not agree: GitLab says "Branch
+	// cannot be merged" -- the message v1 printed while returning exit status
+	// 0 -- and GitHub says "Pull Request has merge conflicts". The suite used
+	// to assert GitLab's wording for both, which passed only because the
+	// hand-written GitHub fixture had copied it.
+	UnmergeableMessage string
 }
 
 // Result is one scenario's outcome. Err == nil means the scenario passed.
@@ -62,7 +73,7 @@ type scenario struct {
 	// denyHTTP runs the scenario against a transport that refuses every
 	// request, asserting the driver decides locally.
 	denyHTTP bool
-	run      func(ctx context.Context, d scm.Driver) error
+	run      func(ctx context.Context, d scm.Driver, f Factory) error
 }
 
 // Check runs every scenario against the driver f builds and returns one Result
@@ -71,6 +82,13 @@ type scenario struct {
 func Check(ctx context.Context, f Factory) []Result {
 	var out []Result
 	observed := map[string]bool{}
+
+	if f.UnmergeableMessage == "" {
+		// Without it the unmergeable scenario would accept any reason at all,
+		// including an empty one.
+		out = append(out, Result{Scenario: "_factory",
+			Err: fmt.Errorf("Factory.UnmergeableMessage is empty; the unmergeable scenario would assert nothing about the reason")})
+	}
 
 	for _, s := range scenarios() {
 		seen, err := runScenario(ctx, f, s)
@@ -138,7 +156,7 @@ func runScenario(ctx context.Context, f Factory, s scenario) (map[string]bool, e
 		return rec.observed(), fmt.Errorf("Provider() = %q, want %q", got, f.Provider)
 	}
 
-	if err := s.run(ctx, rec); err != nil {
+	if err := s.run(ctx, rec, f); err != nil {
 		return rec.observed(), err
 	}
 	// Fixture accounting is part of the assertion, not bookkeeping: it catches
@@ -171,7 +189,7 @@ func scenarios() []scenario {
 
 // ---------- scenarios ----------
 
-func scWhoami(ctx context.Context, d scm.Driver) error {
+func scWhoami(ctx context.Context, d scm.Driver, f Factory) error {
 	id, err := d.Whoami(ctx)
 	if err != nil {
 		return err
@@ -185,7 +203,7 @@ func scWhoami(ctx context.Context, d scm.Driver) error {
 	return nil
 }
 
-func scListOpen(ctx context.Context, d scm.Driver) error {
+func scListOpen(ctx context.Context, d scm.Driver, f Factory) error {
 	cs, err := d.ListOpen(ctx)
 	if err != nil {
 		return err
@@ -195,22 +213,44 @@ func scListOpen(ctx context.Context, d scm.Driver) error {
 	if len(cs) != 2 {
 		return fmt.Errorf("ListOpen returned %d changes, want 2 (the fixture is paginated)", len(cs))
 	}
-	if cs[0].ID != ChangeID || cs[1].ID != "43" {
-		return fmt.Errorf("ListOpen ids = %q, %q; want %q, %q", cs[0].ID, cs[1].ID, ChangeID, "43")
+
+	// Looked up by id, not by position. Providers return open changes
+	// newest-first, and the earlier hand-written fixtures happened to list them
+	// oldest-first -- so this assertion used to encode an ordering neither API
+	// promises. Recording exposed it.
+	byID := map[scm.ChangeID]scm.Change{}
+	for _, c := range cs {
+		byID[c.ID] = c
 	}
-	if cs[0].State != scm.StateOpen {
-		return fmt.Errorf("ListOpen[0].State = %v, want open", cs[0].State)
+	first, ok := byID[ChangeID]
+	if !ok {
+		return fmt.Errorf("ListOpen did not return change %s; got %v", ChangeID, ids(cs))
 	}
-	if cs[0].Draft {
-		return fmt.Errorf("ListOpen[0].Draft = true, want false")
+	second, ok := byID["43"]
+	if !ok {
+		return fmt.Errorf("ListOpen did not return change 43; got %v", ids(cs))
 	}
-	if !cs[1].Draft {
-		return fmt.Errorf("ListOpen[1].Draft = false, want true (change 43 is a draft in the fixture)")
+	if first.State != scm.StateOpen {
+		return fmt.Errorf("ListOpen change %s State = %v, want open", ChangeID, first.State)
+	}
+	if first.Draft {
+		return fmt.Errorf("ListOpen change %s Draft = true, want false", ChangeID)
+	}
+	if !second.Draft {
+		return fmt.Errorf("ListOpen change 43 Draft = false, want true (it is a draft in the fixture)")
 	}
 	return nil
 }
 
-func scGet(ctx context.Context, d scm.Driver) error {
+func ids(cs []scm.Change) []scm.ChangeID {
+	out := make([]scm.ChangeID, 0, len(cs))
+	for _, c := range cs {
+		out = append(out, c.ID)
+	}
+	return out
+}
+
+func scGet(ctx context.Context, d scm.Driver, f Factory) error {
 	c, err := d.Get(ctx, ChangeID)
 	if err != nil {
 		return err
@@ -222,8 +262,8 @@ func scGet(ctx context.Context, d scm.Driver) error {
 		return fmt.Errorf("Get.HeadSHA = %q, want %q", c.HeadSHA, HeadSHA)
 	case c.TargetBranch != TargetBranch:
 		return fmt.Errorf("Get.TargetBranch = %q, want %q", c.TargetBranch, TargetBranch)
-	case c.SourceBranch != "producer/fix-thing":
-		return fmt.Errorf("Get.SourceBranch = %q, want %q", c.SourceBranch, "producer/fix-thing")
+	case c.SourceBranch != SourceBranch:
+		return fmt.Errorf("Get.SourceBranch = %q, want %q", c.SourceBranch, SourceBranch)
 	case c.Author != ProducerName:
 		return fmt.Errorf("Get.Author = %q, want %q", c.Author, ProducerName)
 	case c.State != scm.StateOpen:
@@ -236,7 +276,7 @@ func scGet(ctx context.Context, d scm.Driver) error {
 	return nil
 }
 
-func scDiff(ctx context.Context, d scm.Driver) error {
+func scDiff(ctx context.Context, d scm.Driver, f Factory) error {
 	fs, err := d.Diff(ctx, ChangeID)
 	if err != nil {
 		return err
@@ -261,7 +301,7 @@ func scDiff(ctx context.Context, d scm.Driver) error {
 	return nil
 }
 
-func scPipelineSuccess(ctx context.Context, d scm.Driver) error {
+func scPipelineSuccess(ctx context.Context, d scm.Driver, f Factory) error {
 	p, err := d.Pipeline(ctx, ChangeID)
 	if err != nil {
 		return err
@@ -278,7 +318,7 @@ func scPipelineSuccess(ctx context.Context, d scm.Driver) error {
 	return nil
 }
 
-func scPipelineFailed(ctx context.Context, d scm.Driver) error {
+func scPipelineFailed(ctx context.Context, d scm.Driver, f Factory) error {
 	p, err := d.Pipeline(ctx, ChangeID)
 	if err != nil {
 		return err
@@ -292,7 +332,7 @@ func scPipelineFailed(ctx context.Context, d scm.Driver) error {
 	return nil
 }
 
-func scPipelineNone(ctx context.Context, d scm.Driver) error {
+func scPipelineNone(ctx context.Context, d scm.Driver, f Factory) error {
 	p, err := d.Pipeline(ctx, ChangeID)
 	if err != nil {
 		return err
@@ -311,17 +351,17 @@ func scPipelineNone(ctx context.Context, d scm.Driver) error {
 	return nil
 }
 
-func scComment(ctx context.Context, d scm.Driver) error {
+func scComment(ctx context.Context, d scm.Driver, f Factory) error {
 	// The fixture asserts the body reached the provider; see
 	// request_body_contains in comment.json.
 	return d.Comment(ctx, ChangeID, "changes-requested: the guard matches the mention, not the command")
 }
 
-func scSetDraftReady(ctx context.Context, d scm.Driver) error {
+func scSetDraftReady(ctx context.Context, d scm.Driver, f Factory) error {
 	return d.SetDraft(ctx, ChangeID, false)
 }
 
-func scMergeSuccess(ctx context.Context, d scm.Driver) error {
+func scMergeSuccess(ctx context.Context, d scm.Driver, f Factory) error {
 	r, err := scm.MergeVerified(ctx, d, ChangeID, HeadSHA, TargetBranch)
 	if err != nil {
 		return err
@@ -363,7 +403,7 @@ func refusal(r scm.MergeResult, want scm.MergeOutcome, reasonSubstr string) erro
 	return nil
 }
 
-func scMergeRefusedDraft(ctx context.Context, d scm.Driver) error {
+func scMergeRefusedDraft(ctx context.Context, d scm.Driver, f Factory) error {
 	r, err := scm.MergeVerified(ctx, d, ChangeID, HeadSHA, TargetBranch)
 	if err != nil {
 		return err
@@ -371,17 +411,17 @@ func scMergeRefusedDraft(ctx context.Context, d scm.Driver) error {
 	return refusal(r, scm.RefusedDraft, "draft")
 }
 
-func scMergeUnmergeable(ctx context.Context, d scm.Driver) error {
+func scMergeUnmergeable(ctx context.Context, d scm.Driver, f Factory) error {
 	r, err := scm.MergeVerified(ctx, d, ChangeID, HeadSHA, TargetBranch)
 	if err != nil {
 		return err
 	}
-	// This is the v1 bug, reproduced: the provider says the branch cannot be
-	// merged. v1 printed it and exited 0.
-	return refusal(r, scm.RefusedConflict, UnmergeableMessage)
+	// This is the v1 bug, reproduced: the provider refuses, in its own words.
+	// v1 printed that message and exited 0.
+	return refusal(r, scm.RefusedConflict, f.UnmergeableMessage)
 }
 
-func scMergeHeadMoved(ctx context.Context, d scm.Driver) error {
+func scMergeHeadMoved(ctx context.Context, d scm.Driver, f Factory) error {
 	r, err := scm.MergeVerified(ctx, d, ChangeID, HeadSHA, TargetBranch)
 	if err != nil {
 		return err
@@ -389,7 +429,7 @@ func scMergeHeadMoved(ctx context.Context, d scm.Driver) error {
 	return refusal(r, scm.RefusedConflict, "head moved")
 }
 
-func scMergeReportedButAbsent(ctx context.Context, d scm.Driver) error {
+func scMergeReportedButAbsent(ctx context.Context, d scm.Driver, f Factory) error {
 	r, err := scm.MergeVerified(ctx, d, ChangeID, HeadSHA, TargetBranch)
 	if err != nil {
 		return err
@@ -399,7 +439,7 @@ func scMergeReportedButAbsent(ctx context.Context, d scm.Driver) error {
 	return refusal(r, scm.MergeUnknown, "")
 }
 
-func scMergeUnverified(ctx context.Context, d scm.Driver) error {
+func scMergeUnverified(ctx context.Context, d scm.Driver, f Factory) error {
 	r, err := scm.MergeVerified(ctx, d, ChangeID, HeadSHA, TargetBranch)
 	if err != nil {
 		return err
@@ -418,7 +458,7 @@ func scMergeUnverified(ctx context.Context, d scm.Driver) error {
 	return nil
 }
 
-func scPostAudit(ctx context.Context, d scm.Driver) error {
+func scPostAudit(ctx context.Context, d scm.Driver, f Factory) error {
 	return d.PostAudit(ctx, ChangeID, HeadSHA, scm.Audit{
 		Lens:    "scope-escape",
 		Verdict: scm.AuditCleared,
@@ -430,7 +470,7 @@ func scPostAudit(ctx context.Context, d scm.Driver) error {
 	})
 }
 
-func scAudits(ctx context.Context, d scm.Driver) error {
+func scAudits(ctx context.Context, d scm.Driver, f Factory) error {
 	as, err := d.Audits(ctx, ChangeID, HeadSHA)
 	if err != nil {
 		return err
@@ -459,7 +499,7 @@ func scAudits(ctx context.Context, d scm.Driver) error {
 	return nil
 }
 
-func scAuditRequiresAttempts(ctx context.Context, d scm.Driver) error {
+func scAuditRequiresAttempts(ctx context.Context, d scm.Driver, f Factory) error {
 	// No attempts recorded. This must be rejected before any request is made:
 	// the transport denies everything, so a driver that posts it fails here.
 	err := d.PostAudit(ctx, ChangeID, HeadSHA, scm.Audit{

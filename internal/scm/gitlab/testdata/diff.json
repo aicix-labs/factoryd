@@ -1,27 +1,47 @@
 {
+  "source": {
+    "recorded": true,
+    "provider": "gitlab",
+    "provider_version": "18.8.2",
+    "recorded_at": "2026-09-01T10:00:00Z"
+  },
   "exchanges": [
     {
       "method": "GET",
-      "path": "/api/v4/projects/acme%2Fwidgets/merge_requests/42/diffs?page=1&per_page=100",
+      "path": "/api/v4/projects/acme%2Fwidgets/merge_requests/42/diffs?page=1\u0026per_page=100",
       "status": 200,
       "body": [
         {
-          "old_path": "internal/gate/scope.go",
-          "new_path": "internal/gate/scope.go",
-          "new_file": false,
-          "renamed_file": false,
+          "a_mode": "100644",
+          "b_mode": "100644",
+          "collapsed": false,
           "deleted_file": false,
-          "diff": "@@ -1,4 +1,6 @@\n context\n-old\n+new1\n+new2\n+new3\n"
+          "diff": "@@ -1,4 +1,6 @@\n package gate\n \n context\n-old\n+new1\n+new2\n+new3\n",
+          "generated_file": false,
+          "new_file": false,
+          "new_path": "internal/gate/scope.go",
+          "old_path": "internal/gate/scope.go",
+          "renamed_file": false,
+          "too_large": false
         },
         {
-          "old_path": "old/name.go",
-          "new_path": "new/name.go",
-          "new_file": false,
-          "renamed_file": true,
+          "a_mode": "100644",
+          "b_mode": "100644",
+          "collapsed": false,
           "deleted_file": false,
-          "diff": ""
+          "diff": "",
+          "generated_file": false,
+          "new_file": false,
+          "new_path": "new/name.go",
+          "old_path": "old/name.go",
+          "renamed_file": true,
+          "too_large": false
         }
-      ]
+      ],
+      "header": {
+        "Link": "\u003chttps://gitlab.example.com/api/v4/projects/acme%2Fwidgets/merge_requests/42/diffs?id=acme%2Fwidgets\u0026merge_request_iid=30\u0026page=1\u0026per_page=100\u0026unidiff=false\u003e; rel=\"first\", \u003chttps://gitlab.example.com/api/v4/projects/acme%2Fwidgets/merge_requests/42/diffs?id=acme%2Fwidgets\u0026merge_request_iid=30\u0026page=1\u0026per_page=100\u0026unidiff=false\u003e; rel=\"last\"",
+        "X-Total-Pages": "1"
+      }
     }
   ]
 }
