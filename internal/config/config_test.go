@@ -179,6 +179,28 @@ func TestCredentialResolveFailsClosed(t *testing.T) {
 	})
 }
 
+// The handoff directory and the factory root are shared between the two roles.
+// The role suffix is the only thing separating their per-role files, so it is
+// worth asserting directly: a shared progress marker lets one role reset the
+// other's spin counter, and a shared halt sentinel lets halting one role stop
+// the other.
+func TestPerRolePathsAreDistinct(t *testing.T) {
+	c, err := config.Load(write(t, good))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if a, b := c.ProgressPath("producer"), c.ProgressPath("reviewer"); a == b {
+		t.Errorf("both roles share the progress marker %s", a)
+	}
+	if a, b := c.StopPath("producer"), c.StopPath("reviewer"); a == b {
+		t.Errorf("both roles share the halt sentinel %s", a)
+	}
+	// And they must still live where the spec puts them.
+	if got := c.ProgressPath("producer"); filepath.Base(got) != "producer-progress" {
+		t.Errorf("producer progress marker is %s, want inbox/producer-progress", got)
+	}
+}
+
 // Describe must never reveal the secret itself.
 func TestDescribeDoesNotLeak(t *testing.T) {
 	p := filepath.Join(t.TempDir(), "tok")

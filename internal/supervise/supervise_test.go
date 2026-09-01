@@ -117,8 +117,10 @@ func (fx *fixture) progress(t *testing.T) {
 // progressQuiet is what a runner goroutine calls. t.Fatal from a goroutine that
 // is not the test's own is not allowed, and a supervisor still winding down
 // after the test body returns would trip exactly that.
-func (fx *fixture) progressQuiet() error {
-	p := fx.cfg.ProgressPath("reviewer")
+func (fx *fixture) progressQuiet() error { return fx.progressQuietFor("reviewer") }
+
+func (fx *fixture) progressQuietFor(role string) error {
+	p := fx.cfg.ProgressPath(role)
 	// A fresh mtime, unambiguously later than anything already recorded.
 	if err := os.WriteFile(p, []byte("x"), 0o644); err != nil {
 		return err
@@ -347,6 +349,48 @@ func TestStaleProgressFileIsNotProgress(t *testing.T) {
 	}
 	if got := r.count(); got != 4 {
 		t.Fatalf("ran %d turns, want 4 (spin_abort); the stale file bought extra turns", got)
+	}
+}
+
+// Two roles, one factory directory. One role's progress must not reset the
+// other's spin counter.
+//
+// The handoff directory is factory-wide and the role suffix on the progress
+// marker is the only thing separating the two. Collapse it and a busy producer
+// continuously clears the reviewer's count, so a reviewer in a crash loop never
+// halts -- the same silent disabling of the breaker, reached from a third
+// direction. Both roles running against one factory is the normal
+// configuration, not a corner.
+func TestOneRolesProgressDoesNotResetAnothers(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+
+	// A busy producer, advancing on every reviewer turn. The reviewer itself
+	// achieves nothing.
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		if err := fx.progressQuietFor("producer"); err != nil {
+			t.Error(err)
+		}
+		return supervise.TurnResult{ExitCode: 1}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted: the producer's progress kept clearing the reviewer's spin counter", err)
+	}
+	if got := r.count(); got != 4 {
+		t.Fatalf("ran %d turns, want 4 (spin_abort); another role's progress bought extra turns", got)
+	}
+
+	// Positive control: the producer really was advancing. Without this, the
+	// halt above could just mean nothing ever touched anything.
+	if _, err := os.Stat(fx.cfg.ProgressPath("producer")); err != nil {
+		t.Fatalf("the producer never advanced, so this test proved nothing: %v", err)
+	}
+	if _, err := os.Stat(fx.cfg.ProgressPath("reviewer")); err == nil {
+		t.Fatal("the reviewer's own progress marker exists; the two roles are not separated in this fixture")
 	}
 }
 
