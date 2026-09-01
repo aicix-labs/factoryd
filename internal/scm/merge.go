@@ -62,42 +62,104 @@ func (o MergeOutcome) String() string {
 	return fmt.Sprintf("MergeOutcome(%d)", int(o))
 }
 
-// MergeResult is the typed result of a merge attempt.
-type MergeResult struct {
+// ProviderMerge is what a provider said happened. It is deliberately a
+// different type from MergeResult, and it is what Driver.Merge returns.
+//
+// A provider cannot attest that a commit landed on a branch -- only the
+// repository can -- so the type a driver returns has no way to express
+// verification. An unverified merge reported as verified is therefore not a bug
+// to test for; it does not typecheck.
+type ProviderMerge struct {
 	Outcome MergeOutcome
-	// MergeCommit is non-empty if and only if Outcome is Merged.
+	// MergeCommit is the commit the provider claims it created. Non-empty if
+	// and only if Outcome is Merged.
 	MergeCommit string
 	// Reason is always populated on anything other than Merged.
 	Reason string
-	// Verified records that MergeCommit was confirmed to be an ancestor of the
-	// target branch, rather than merely reported by the provider API.
-	Verified bool
 }
 
-// Validate enforces the invariants the type exists to hold. Drivers call it
-// before returning, and the conformance suite calls it on every result, so a
-// driver cannot ship a result shape that lies.
+// Validate enforces the shape invariants. Drivers call it before returning, and
+// MergeVerified calls it on whatever a driver hands back, so a driver cannot
+// ship a result that lies about its own shape.
+func (p ProviderMerge) Validate() error {
+	return validateShape(p.Outcome, p.MergeCommit, p.Reason)
+}
+
+// ProviderMerged is the result a driver returns when the provider merged. The
+// commit is required: "merged, but I cannot say into what" is not a merge.
+func ProviderMerged(commit string) ProviderMerge {
+	return ProviderMerge{Outcome: Merged, MergeCommit: commit}
+}
+
+// RefusedByProvider builds a non-merge driver result. It exists so that no
+// driver call site has to remember to populate Reason.
+func RefusedByProvider(o MergeOutcome, format string, args ...any) ProviderMerge {
+	return ProviderMerge{Outcome: o, Reason: fmt.Sprintf(format, args...)}
+}
+
+// MergeResult is a merge outcome that has been checked against the repository.
+//
+// verified is unexported and is set only by MergeVerified. Another package can
+// still write MergeResult{Outcome: Merged, MergeCommit: "abc"}, but that value
+// fails Validate, so a Merged result that nothing confirmed cannot be
+// constructed anywhere outside this file.
+type MergeResult struct {
+	Outcome MergeOutcome
+	// MergeCommit is non-empty if and only if Outcome is Merged, in which case
+	// it has been confirmed to be an ancestor of the target branch.
+	MergeCommit string
+	// ClaimedCommit is the commit the provider said it created. It is retained
+	// even when verification failed, because that sha is precisely what a human
+	// investigating an Unknown has to go and look at.
+	ClaimedCommit string
+	// Reason is always populated on anything other than Merged.
+	Reason string
+
+	verified bool
+}
+
+// Verified reports that MergeCommit was confirmed to be an ancestor of the
+// target branch, rather than merely reported by the provider API.
+func (r MergeResult) Verified() bool { return r.verified }
+
+// Validate enforces the invariants the type exists to hold, including the one
+// its documentation claims: Merged means verified.
 func (r MergeResult) Validate() error {
-	switch r.Outcome {
+	if err := validateShape(r.Outcome, r.MergeCommit, r.Reason); err != nil {
+		return err
+	}
+	if r.Outcome == Merged && !r.verified {
+		return fmt.Errorf("merge result: Merged without verification; only MergeVerified can produce a Merged result")
+	}
+	if r.Outcome != Merged && r.verified {
+		return fmt.Errorf("merge result: %v is marked verified", r.Outcome)
+	}
+	return nil
+}
+
+// validateShape holds the rules common to both result types.
+func validateShape(o MergeOutcome, commit, reason string) error {
+	switch o {
 	case Merged:
-		if r.MergeCommit == "" {
+		if commit == "" {
 			return fmt.Errorf("merge result: Merged with no merge commit")
 		}
 	case MergeUnknown, RefusedDraft, RefusedPipeline, RefusedConflict, RefusedScope, RefusedMissingAudit:
-		if r.MergeCommit != "" {
-			return fmt.Errorf("merge result: %v carries a merge commit %q", r.Outcome, r.MergeCommit)
+		if commit != "" {
+			return fmt.Errorf("merge result: %v carries a merge commit %q", o, commit)
 		}
-		if r.Reason == "" {
-			return fmt.Errorf("merge result: %v with no reason", r.Outcome)
+		if reason == "" {
+			return fmt.Errorf("merge result: %v with no reason", o)
 		}
 	default:
-		return fmt.Errorf("merge result: outcome %v is not a known outcome", r.Outcome)
+		return fmt.Errorf("merge result: outcome %v is not a known outcome", o)
 	}
 	return nil
 }
 
 // Refused builds a non-merge result. It exists so that no call site has to
-// remember to populate Reason.
+// remember to populate Reason. Gates outside this package use it to refuse a
+// merge on scope or on a missing audit.
 func Refused(o MergeOutcome, format string, args ...any) MergeResult {
 	return MergeResult{Outcome: o, Reason: fmt.Sprintf(format, args...)}
 }
@@ -112,28 +174,40 @@ func MergeVerified(ctx context.Context, d Driver, id ChangeID, expectedHead, tar
 	if targetBranch == "" {
 		return MergeResult{}, fmt.Errorf("merge %s: target branch is empty; there is nothing to verify against", id)
 	}
-	res, err := d.Merge(ctx, id, expectedHead)
+	claim, err := d.Merge(ctx, id, expectedHead)
 	if err != nil {
 		return MergeResult{}, err
 	}
-	if verr := res.Validate(); verr != nil {
+	if verr := claim.Validate(); verr != nil {
 		return MergeResult{}, fmt.Errorf("driver %s returned an invalid merge result: %w", d.Provider(), verr)
 	}
-	if res.Outcome != Merged {
-		return res, nil
+	if claim.Outcome != Merged {
+		return MergeResult{Outcome: claim.Outcome, Reason: claim.Reason}, nil
 	}
 
-	ok, err := d.IsAncestor(ctx, res.MergeCommit, targetBranch)
+	unverified := func(format string, args ...any) MergeResult {
+		r := Refused(MergeUnknown, format, args...)
+		// The claimed commit survives into a field, not just into prose: it is
+		// what has to be checked by hand.
+		r.ClaimedCommit = claim.MergeCommit
+		return r
+	}
+
+	ok, err := d.IsAncestor(ctx, claim.MergeCommit, targetBranch)
 	if err != nil {
-		return Refused(MergeUnknown,
+		return unverified(
 			"provider reported merge commit %s but ancestry against %s could not be checked: %v",
-			res.MergeCommit, targetBranch, err), nil
+			claim.MergeCommit, targetBranch, err), nil
 	}
 	if !ok {
-		return Refused(MergeUnknown,
+		return unverified(
 			"provider reported merge commit %s but it is not an ancestor of %s; the merge did not land",
-			res.MergeCommit, targetBranch), nil
+			claim.MergeCommit, targetBranch), nil
 	}
-	res.Verified = true
-	return res, nil
+	return MergeResult{
+		Outcome:       Merged,
+		MergeCommit:   claim.MergeCommit,
+		ClaimedCommit: claim.MergeCommit,
+		verified:      true,
+	}, nil
 }

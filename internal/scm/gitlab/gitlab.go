@@ -378,19 +378,19 @@ func (d *Driver) SetDraft(ctx context.Context, id scm.ChangeID, draft bool) erro
 	return nil
 }
 
-func (d *Driver) Merge(ctx context.Context, id scm.ChangeID, expectedHead string) (scm.MergeResult, error) {
+func (d *Driver) Merge(ctx context.Context, id scm.ChangeID, expectedHead string) (scm.ProviderMerge, error) {
 	if expectedHead == "" {
-		return scm.MergeResult{}, fmt.Errorf("gitlab merge %s: expected head sha is required", id)
+		return scm.ProviderMerge{}, fmt.Errorf("gitlab merge %s: expected head sha is required", id)
 	}
 	m, err := d.get(ctx, id)
 	if err != nil {
-		return scm.MergeResult{}, err
+		return scm.ProviderMerge{}, err
 	}
 	if c := m.toChange(); c.Draft {
-		return scm.Refused(scm.RefusedDraft, "merge request %s is a draft (title %q)", id, m.Title), nil
+		return scm.RefusedByProvider(scm.RefusedDraft, "merge request %s is a draft (title %q)", id, m.Title), nil
 	}
 	if m.SHA != expectedHead {
-		return scm.Refused(scm.RefusedConflict,
+		return scm.RefusedByProvider(scm.RefusedConflict,
 			"head moved: expected %s, merge request is at %s", expectedHead, m.SHA), nil
 	}
 
@@ -412,16 +412,16 @@ func (d *Driver) Merge(ctx context.Context, id scm.ChangeID, expectedHead string
 			switch he.Status {
 			case http.StatusMethodNotAllowed:
 				// "Branch cannot be merged" -- the v1 bug, now a typed refusal.
-				return scm.Refused(scm.RefusedConflict, "gitlab refused the merge: %s", he.Message()), nil
+				return scm.RefusedByProvider(scm.RefusedConflict, "gitlab refused the merge: %s", he.Message()), nil
 			case http.StatusNotAcceptable:
-				return scm.Refused(scm.RefusedConflict, "gitlab reported a conflict: %s", he.Message()), nil
+				return scm.RefusedByProvider(scm.RefusedConflict, "gitlab reported a conflict: %s", he.Message()), nil
 			case http.StatusConflict:
-				return scm.Refused(scm.RefusedConflict, "head sha mismatch: %s", he.Message()), nil
+				return scm.RefusedByProvider(scm.RefusedConflict, "head sha mismatch: %s", he.Message()), nil
 			case http.StatusUnprocessableEntity:
-				return scm.Refused(scm.RefusedPipeline, "gitlab would not merge: %s", he.Message()), nil
+				return scm.RefusedByProvider(scm.RefusedPipeline, "gitlab would not merge: %s", he.Message()), nil
 			}
 		}
-		return scm.MergeResult{}, fmt.Errorf("gitlab merge %s: %w", id, err)
+		return scm.ProviderMerge{}, fmt.Errorf("gitlab merge %s: %w", id, err)
 	}
 
 	commit := out.MergeCommitSHA
@@ -431,10 +431,10 @@ func (d *Driver) Merge(ctx context.Context, id scm.ChangeID, expectedHead string
 	// GitLab can answer 200 with the merge request in a non-merged state.
 	// The status code is not the outcome.
 	if out.State != "merged" || commit == "" {
-		return scm.Refused(scm.MergeUnknown,
+		return scm.RefusedByProvider(scm.MergeUnknown,
 			"gitlab returned 200 but state=%q merge_commit_sha=%q message=%q", out.State, commit, out.Message), nil
 	}
-	return scm.MergeResult{Outcome: scm.Merged, MergeCommit: commit}, nil
+	return scm.ProviderMerged(commit), nil
 }
 
 // ---------- audits ----------

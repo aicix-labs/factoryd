@@ -382,19 +382,19 @@ func (d *Driver) SetDraft(ctx context.Context, id scm.ChangeID, draft bool) erro
 	return nil
 }
 
-func (d *Driver) Merge(ctx context.Context, id scm.ChangeID, expectedHead string) (scm.MergeResult, error) {
+func (d *Driver) Merge(ctx context.Context, id scm.ChangeID, expectedHead string) (scm.ProviderMerge, error) {
 	if expectedHead == "" {
-		return scm.MergeResult{}, fmt.Errorf("github merge %s: expected head sha is required", id)
+		return scm.ProviderMerge{}, fmt.Errorf("github merge %s: expected head sha is required", id)
 	}
 	p, err := d.get(ctx, id)
 	if err != nil {
-		return scm.MergeResult{}, err
+		return scm.ProviderMerge{}, err
 	}
 	if p.Draft {
-		return scm.Refused(scm.RefusedDraft, "pull request %s is a draft", id), nil
+		return scm.RefusedByProvider(scm.RefusedDraft, "pull request %s is a draft", id), nil
 	}
 	if p.Head.SHA != expectedHead {
-		return scm.Refused(scm.RefusedConflict,
+		return scm.RefusedByProvider(scm.RefusedConflict,
 			"head moved: expected %s, pull request is at %s", expectedHead, p.Head.SHA), nil
 	}
 
@@ -411,21 +411,21 @@ func (d *Driver) Merge(ctx context.Context, id scm.ChangeID, expectedHead string
 		if httpjson.AsError(err, &he) {
 			switch he.Status {
 			case http.StatusMethodNotAllowed: // not mergeable
-				return scm.Refused(scm.RefusedConflict, "github refused the merge: %s", he.Message()), nil
+				return scm.RefusedByProvider(scm.RefusedConflict, "github refused the merge: %s", he.Message()), nil
 			case http.StatusConflict: // head sha mismatch
-				return scm.Refused(scm.RefusedConflict, "github reported a conflict: %s", he.Message()), nil
+				return scm.RefusedByProvider(scm.RefusedConflict, "github reported a conflict: %s", he.Message()), nil
 			}
 		}
-		return scm.MergeResult{}, fmt.Errorf("github merge %s: %w", id, err)
+		return scm.ProviderMerge{}, fmt.Errorf("github merge %s: %w", id, err)
 	}
 
 	// A 200 that does not say merged, or says merged without a commit, is not a
 	// merge. v1 read the exit status and called this success.
 	if !out.Merged || out.SHA == "" {
-		return scm.Refused(scm.MergeUnknown,
+		return scm.RefusedByProvider(scm.MergeUnknown,
 			"github returned 200 but merged=%v sha=%q message=%q", out.Merged, out.SHA, out.Message), nil
 	}
-	return scm.MergeResult{Outcome: scm.Merged, MergeCommit: out.SHA}, nil
+	return scm.ProviderMerged(out.SHA), nil
 }
 
 // ---------- audits ----------

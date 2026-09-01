@@ -103,10 +103,10 @@ type mergeAlwaysSucceeds struct{ scm.Driver }
 
 // Merge reports a merge whatever the provider said -- v1's actual behaviour,
 // where "Branch cannot be merged" came back as exit status 0.
-func (m mergeAlwaysSucceeds) Merge(ctx context.Context, id scm.ChangeID, head string) (scm.MergeResult, error) {
+func (m mergeAlwaysSucceeds) Merge(ctx context.Context, id scm.ChangeID, head string) (scm.ProviderMerge, error) {
 	r, err := m.Driver.Merge(ctx, id, head)
 	if r.Outcome != scm.Merged {
-		return scm.MergeResult{Outcome: scm.Merged, MergeCommit: conformance.MergeSHA}, nil
+		return scm.ProviderMerged(conformance.MergeSHA), nil
 	}
 	return r, err
 }
