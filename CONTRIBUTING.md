@@ -92,6 +92,14 @@ Two rules are easy to break by accident:
   legitimately spans turns. A guard that cannot tell "still working" from
   "achieving nothing" halts real work, which is what the first implementation
   of this rule did.
+- **Progress means the marker *moved*, not that it exists.** The progress file
+  is durable: once a turn touches it, it is there forever. A guard reading
+  existence sees progress on every subsequent turn, resets the counter every
+  time, and never fires again — so an agent that advanced once and then
+  crash-loops is relaunched indefinitely. That is the exact failure
+  `spin_abort` exists to prevent, and the existence version compiles, reads
+  naturally, and is easier to write. `TestProgressOnceThenStallStillHalts` and
+  `TestStaleProgressFileIsNotProgress` are what stand between the two.
 
 If you add a loop, add a cancellation check at the top of it. A supervisor whose
 trigger is always pending never blocks in `Wait`, so a check only inside `Wait`

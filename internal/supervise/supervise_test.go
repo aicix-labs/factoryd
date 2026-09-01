@@ -283,6 +283,73 @@ func TestSpinGuardHalts(t *testing.T) {
 	}
 }
 
+// The realistic stall: a turn reports progress once, then achieves nothing.
+//
+// The counter must climb from the last progress and halt. The progress file is
+// durable, so a guard that asked whether it EXISTS rather than whether it MOVED
+// would see progress on every subsequent turn, reset the counter every time,
+// and never fire again -- a producer that progressed once and then crash-loops
+// would be relaunched forever. TestSpinGuardHalts cannot catch that, because
+// its turns never touch progress at all.
+func TestProgressOnceThenStallStillHalts(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+
+	r := &fakeRunner{act: func(n int, _ supervise.Turn) supervise.TurnResult {
+		if n == 1 {
+			// One real step, then nothing. The file it touched stays on disk.
+			_ = fx.progressQuiet()
+			return supervise.TurnResult{}
+		}
+		return supervise.TurnResult{ExitCode: 1}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	err := s.Run(ctx)
+	if !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted: a turn that progressed once and then stalled was relaunched forever", err)
+	}
+	// Turn 1 progresses (spin 0); turns 2-5 achieve nothing (spin 1..4), and
+	// spin_abort is 4.
+	if got := r.count(); got != 5 {
+		t.Fatalf("ran %d turns, want 5 (one that progressed, then spin_abort=4 that did not)", got)
+	}
+
+	rs := fx.roleState(t)
+	if !rs.Halted {
+		t.Fatal("state does not record the halt")
+	}
+	// The progress file is still there. Its presence must not have been what
+	// the guard was reading.
+	if _, err := os.Stat(fx.cfg.ProgressPath("reviewer")); err != nil {
+		t.Fatalf("the progress file vanished, so this test proved nothing: %v", err)
+	}
+}
+
+// A progress file left by an earlier run must not read as progress made by this
+// one. Same rule, different entry path: here the file predates the first turn.
+func TestStaleProgressFileIsNotProgress(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	fx.progress(t) // as if a previous run had advanced
+
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		return supervise.TurnResult{ExitCode: 1}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted: a progress file from an earlier run counted as progress", err)
+	}
+	if got := r.count(); got != 4 {
+		t.Fatalf("ran %d turns, want 4 (spin_abort); the stale file bought extra turns", got)
+	}
+}
+
 func TestSpinGuardBacksOffBeforeHalting(t *testing.T) {
 	fx := newFixture(t)
 	fx.wake(t)
