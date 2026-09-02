@@ -122,14 +122,23 @@ subcommands arrive in; anything not yet built exits non-zero saying so, because 
 subcommand that silently did nothing would be indistinguishable from one that ran
 and found nothing to do.
 
-`doctor` is not optional. It must verify: config parses; both credentials
-authenticate; **producer and reviewer resolve to different identities**; **the
-identity `git` itself would present for the remote is the producer's** (§4.4);
-declared paths exist and are writable; **every path in
-`gate.required_writable_paths` exists and is writable by the identity that will
-run the gate** (§4.4); the
-target repo is reachable; the workdir is a clone, not a worktree (§4.4). It exits
-non-zero on any failure and names which.
+`doctor` is not optional. It must verify:
+
+- config parses;
+- both credentials authenticate, and **producer and reviewer resolve to
+  different identities**;
+- **the identity `git` itself would present for the remote is the producer's**,
+  and **the URL git would actually contact — after rewriting — is the configured
+  remote, addressing the project the provider block names** (§5.4);
+- declared paths exist and are writable; every path in
+  `gate.required_writable_paths` is a writable directory **or is absent with a
+  writable nearest existing ancestor**, since submit creates it (§4.4);
+- every name in `gate.inherit_env` is set in the environment `doctor` is running
+  in (§4.4);
+- the target repo is reachable;
+- the workdir is a clone, not a worktree (§4.4).
+
+It exits non-zero on any failure and names which.
 
 The git-transport check is separate from the API one because the two identities
 are resolved by different mechanisms — one from an explicit header, the other
@@ -222,7 +231,9 @@ credential supplied explicitly, and never through argv.
 ```json
 "gate": {
   "command": ["bash", "-c", "go build ./... && go test ./..."],
-  "required_writable_paths": ["${GOCACHE}", "${TMPDIR}", "build/artifacts"],
+  "env": {"GOCACHE": "/var/cache/factoryd/widgets/go", "GOFLAGS": "-count=1"},
+  "inherit_env": ["PATH", "HOME"],
+  "required_writable_paths": ["${GOCACHE}", "build/artifacts"],
   "timeout_seconds": 900
 }
 ```
@@ -234,14 +245,45 @@ guess presented as a check: it would miss paths that matter and invent ones that
 do not, and a check that is sometimes wrong about what it verified is worse than
 no check, because it is believed.
 
+**The gate's environment is constructed, not inherited.** It has to be, or
+`${GOCACHE}` means one thing when `doctor` reads it and another when `submit`
+runs — two checks of two different paths, both reporting on the third. The gate
+environment is, in order:
+
+1. the `FACTORYD_*` variables submit sets;
+2. the variables named in `gate.inherit_env`, taken from the supervisor's
+   environment — **an allowlist, so nothing arrives unnoticed**; a name in the
+   list that is unset in the supervisor's environment is an error, not an
+   omission;
+3. `gate.env`, which wins over both.
+
+Nothing else is passed through. Anything the gate needs is named by the
+operator, which is what makes the environment the same in `doctor` and in
+`submit`: both compute it from the same configuration rather than reading
+whatever the process happened to be started with.
+
 Resolution rules, so the field means one thing:
 
 - A relative path resolves against the gate's working directory.
-- `${VAR}` expands from the environment the gate will be given. **An unset
-  variable is an error, not an empty expansion** — expanding `${GOCACHE}/x` to
-  `/x` would check a path the gate will never touch and pass.
+- `${VAR}` expands from **that** environment. **An unset variable is an error,
+  not an empty expansion** — expanding `${GOCACHE}/x` to `/x` would check a path
+  the gate will never touch and pass.
 - No shell, no globbing, no `~`. Anything needing those is a path the operator
   should write out.
+
+**A declared path is a directory, and submit creates it if it is absent.**
+Detecting the missing cache directory would be an improvement on reporting it as
+a red gate; creating it removes the failure entirely. So:
+
+- `doctor` requires each path to be a writable directory, **or** absent with a
+  writable nearest existing ancestor — creatable counts as satisfied, and is
+  reported as such rather than silently.
+- `submit` creates any absent path before running the gate.
+- A path that exists as a non-directory, or cannot be created, is exit **3**.
+
+The residual risk is a typo creating a directory nothing uses. That is visible
+and harmless, and much cheaper than a false red gate that teaches the operator
+to disbelieve red.
 
 An empty list is legal and means the gate needs nothing beyond its workdir. It is
 a claim the operator makes, and a wrong one shows up as an exit 3 rather than a
@@ -315,6 +357,11 @@ type Driver interface {
     PostAudit(ctx, id, sha string, a Audit) error
     Audits(ctx, id, sha string) ([]Audit, error)
     Whoami(ctx) (Identity, error)
+
+    // GitCredential is what this provider expects over HTTPS. See §5.4: the
+    // two do not agree on the username half, so it cannot be derived from the
+    // token alone.
+    GitCredential(secret string) GitCredential
 }
 ```
 
@@ -354,6 +401,24 @@ type GitTransport interface {
 }
 ```
 
+**The credential has two halves, and only the provider knows the first.** Git
+authenticates over HTTPS with a username *and* a password, and the conventions
+differ: the token alone is not enough to answer `git credential fill`.
+
+```go
+// GitCredential is what git is handed for an HTTPS remote.
+type GitCredential struct {
+    Username string
+    Secret   string
+}
+```
+
+The username is provider-owned, supplied by `Driver.GitCredential` (§5.3), so
+neither the transport nor the operator has to know the convention. It is not
+cosmetic: the host in the incident behind §1 item 11 had entries under **two**
+different usernames for the same instance, and which one git picked decided
+which identity pushed.
+
 **Configuration.** The remote is declared, not discovered. A transport that
 inferred its remote from the workdir would verify one thing and push to another:
 
@@ -381,6 +446,32 @@ must run with inherited credential sources suppressed:
 - **ssh:** `IdentitiesOnly=yes`, `IdentityAgent=none`, and an explicit
   `IdentityFile`. An agent holding the reviewer's key is the same failure as a
   credential helper holding the reviewer's token.
+
+**Pinning the credential is not enough; the target must be pinned too.** A
+correct `remote` proves nothing on its own. `url.<base>.insteadOf` and
+`pushInsteadOf` rewrite it, `core.sshCommand` and `GIT_SSH_COMMAND` replace the
+transport, and `GIT_DIR`, `GIT_ASKPASS` and the system and global config files
+all reach in from outside. Every one of those can send a correctly-configured
+remote somewhere else, and the push still looks like it worked.
+
+So the git environment is isolated to the same standard as the credential:
+
+- `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` point at `/dev/null`; only
+  configuration submit sets explicitly applies.
+- Inherited `GIT_*` variables are dropped, not merged. `GIT_TERMINAL_PROMPT=0`
+  and an inert `GIT_ASKPASS`, so a missing credential fails rather than waiting
+  for a human who is not there.
+- The transport is set explicitly, never inherited.
+
+And the effective target is checked, not the configured one:
+
+- **the URL git will actually use** — `git remote get-url` and
+  `git remote get-url --push`, both after rewriting — must equal the configured
+  `git.remote`;
+- **`git.remote` must address the same project** the provider block names
+  (`github.owner`/`repo`, or `gitlab.project`). A remote pointing at a different
+  repository than the one being reviewed is a misconfiguration no identity check
+  would catch: the right account pushing to the wrong place.
 
 **The verification oracle**, so `Identity` is implementable rather than aspirational:
 
@@ -534,7 +625,14 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §4.4 identity is undecidable | the helper returns nothing, or the greeting cannot be parsed | a resolvable transport reports a login |
 | §4.4 credential never in argv | the credential appears in the spawned git process's `/proc/<pid>/cmdline` | **the credential is present in the channel it should use** — otherwise "absent from argv" passes for a submit that never supplied it at all |
 | §4.4 `fetch` is covered too | an ambient credential is used for fetch, not only push | fetch succeeds under the producer credential |
-| §4.4 gate paths | a declared path is missing or unwritable → exit **3** | a genuinely red gate still exits **5** |
+| §5.4 URL rewrite | `url.<base>.insteadOf` redirects the configured remote → the effective URL no longer matches, refuse | the same check passes with no rewrite in force |
+| §5.4 push rewrite | `pushInsteadOf` redirects only the push URL | `get-url --push` matches when unrewritten |
+| §5.4 config isolation | a global or system git config that would redirect or re-credential is **not** in force during any git operation | the explicit configuration submit sets *is* in force |
+| §5.4 remote vs project | `git.remote` addresses a different repository than the provider block names → refuse | matching remote and provider block passes |
+| §5.3 `GitCredential` | either driver returns a username its provider will not accept | **both** drivers exercised, each asserting its own convention |
+| §4.4 gate env | a name in `inherit_env` is unset in the supervisor's environment → refuse | a set name resolves and passes |
+| §4.4 gate env agreement | `doctor` and `submit` resolve a `${VAR}` path to different values | both resolve it to the same path from the same config |
+| §4.4 gate paths | a declared path exists as a non-directory, or cannot be created → exit **3** | a genuinely red gate still exits **5**, and an absent-but-creatable path is created and passes |
 | §4.4 unset `${VAR}` | a referenced variable is unset → refuse | a set variable resolves and passes |
 | §4.1 doctor covers the above | each condition above, reached through `doctor` rather than only through unit tests | a healthy factory passes every check |
 
