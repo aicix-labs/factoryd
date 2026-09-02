@@ -58,13 +58,46 @@ caught whether or not you remember this file exists.
 2. Forward it in `internal/scm/conformance/recorder.go`. The recorder implements
    `scm.Driver`, so until you do, the package does not compile.
 3. Add a scenario to `internal/scm/conformance/conformance.go` that calls it.
-4. Record a fixture bundle for **both** providers under
-   `internal/scm/{github,gitlab}/testdata/<scenario>.json`.
-5. Implement it in both drivers.
+4. Implement it in both drivers.
+5. Record a fixture for **both** providers with `cmd/fixturerec` (see below).
 
 The fixture player is strict in both directions: a request the bundle does not
 contain fails the test, and an exchange the driver never made also fails it. A
 permissive fixture player is a check that cannot fail.
+
+## Fixtures are recorded, not written
+
+Every fixture declares where it came from, and `Load` refuses one that does not.
+Write them by hand only when a case genuinely cannot be produced on a live
+provider, and say why in the `source.note` — "hand-written" has to be a decision,
+not an omission.
+
+A fixture written from API documentation describes what the API was *believed*
+to do. A driver that matches it exactly passes every test above it while being
+wrong about the provider, and nothing looks broken. That is a check that can
+fail against the wrong reality, which is harder to notice than one that cannot
+fail at all. It is not hypothetical: the hand-written GitLab fixture said an
+unmergeable change answers 405, so the driver mapped a real 422 conflict to
+`RefusedPipeline` — the wrong refusal, with the suite green.
+
+```console
+$ go run ./cmd/fixturerec --provider gitlab     --base https://gitlab.example.com/api/v4 --project grp/scratch     --token-file ~/.config/token --out internal/scm/gitlab/testdata
+```
+
+It needs a scratch repository it may push branches to and open, merge and close
+changes in. It resets that repository to a known state before every scenario —
+completely, not create-if-missing, because a scenario that merges lands its
+changes on the default branch and the next recording would otherwise describe
+state it did not create.
+
+**Record the error shapes, not just the happy paths.** 404, 403, merge conflicts,
+draft refusals. That is where the drivers make their fail-closed decisions, and
+where a hand-authored body is most likely to be wrong.
+
+Redaction rewrites unmapped identifiers too, deterministically. A redactor that
+only rewrites what it was told about leaks whatever it was not told about, and
+the fixture still looks fine. `Write` refuses to emit a fixture containing a
+declared secret.
 
 ## Merge results
 

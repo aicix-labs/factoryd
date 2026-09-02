@@ -1,14 +1,64 @@
 {
+  "source": {
+    "recorded": true,
+    "provider": "github",
+    "provider_version": "api 2022-11-28",
+    "recorded_at": "2026-09-01T10:00:00Z"
+  },
   "exchanges": [
     {
       "method": "POST",
       "path": "/repos/acme/widgets/issues/42/comments",
       "status": 201,
       "body": {
-        "id": 9001
+        "author_association": "OWNER",
+        "body": "changes-requested: the guard matches the mention, not the command",
+        "created_at": "2026-09-01T10:00:00Z",
+        "html_url": "https://github.com/acme/widgets/pull/42#issuecomment-c96c5acfe8",
+        "id": 1001,
+        "issue_url": "https://api.github.com/repos/acme/widgets/issues/42",
+        "minimized": null,
+        "node_id": "PR_kwDO42",
+        "performed_via_github_app": null,
+        "pin": null,
+        "reactions": {
+          "+1": 0,
+          "-1": 0,
+          "confused": 0,
+          "eyes": 0,
+          "heart": 0,
+          "hooray": 0,
+          "laugh": 0,
+          "rocket": 0,
+          "total_count": 0,
+          "url": "https://api.github.com/repos/acme/widgets/issues/comments/c96c5acfe8/reactions"
+        },
+        "updated_at": "2026-09-01T10:00:00Z",
+        "url": "https://api.github.com/repos/acme/widgets/issues/comments/c96c5acfe8",
+        "user": {
+          "avatar_url": "https://avatars.githubusercontent.com/u/7d65baf34?v=4",
+          "events_url": "https://api.github.com/users/producer-bot/events{/privacy}",
+          "followers_url": "https://api.github.com/users/producer-bot/followers",
+          "following_url": "https://api.github.com/users/producer-bot/following{/other_user}",
+          "gists_url": "https://api.github.com/users/producer-bot/gists{/gist_id}",
+          "gravatar_id": "",
+          "html_url": "https://github.com/producer-bot",
+          "id": 1001,
+          "login": "producer-bot",
+          "node_id": "PR_kwDO42",
+          "organizations_url": "https://api.github.com/users/producer-bot/orgs",
+          "received_events_url": "https://api.github.com/users/producer-bot/received_events",
+          "repos_url": "https://api.github.com/users/producer-bot/repos",
+          "site_admin": false,
+          "starred_url": "https://api.github.com/users/producer-bot/starred{/owner}{/repo}",
+          "subscriptions_url": "https://api.github.com/users/producer-bot/subscriptions",
+          "type": "User",
+          "url": "https://api.github.com/users/producer-bot",
+          "user_view_type": "public"
+        }
       },
       "request_body_contains": [
-        "changes-requested: the guard matches the mention"
+        "\"body\":\"changes-requested: the guard matches the mention, not the command\""
       ]
     }
   ]

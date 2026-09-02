@@ -1,4 +1,8 @@
 {
+  "source": {
+    "recorded": false,
+    "note": "synthetic: no provider will return 200 with a body saying it did not merge on demand. This describes a provider answering inconsistently, which is exactly what a healthy one will not do on request."
+  },
   "exchanges": [
     {
       "method": "GET",

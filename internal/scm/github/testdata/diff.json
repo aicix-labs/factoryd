@@ -1,4 +1,10 @@
 {
+  "source": {
+    "recorded": true,
+    "provider": "github",
+    "provider_version": "api 2022-11-28",
+    "recorded_at": "2026-09-01T10:00:00Z"
+  },
   "exchanges": [
     {
       "method": "GET",
@@ -6,19 +12,28 @@
       "status": 200,
       "body": [
         {
-          "filename": "internal/gate/scope.go",
           "additions": 3,
+          "blob_url": "https://github.com/acme/widgets/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/internal%2Fgate%2Fscope.go",
+          "changes": 4,
+          "contents_url": "https://api.github.com/repos/acme/widgets/contents/internal%2Fgate%2Fscope.go?ref=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
           "deletions": 1,
-          "status": "modified",
-          "patch": "@@ -1,4 +1,6 @@\n context\n-old\n+new1\n+new2\n+new3\n"
+          "filename": "internal/gate/scope.go",
+          "patch": "@@ -1,4 +1,6 @@\n package gate\n \n context\n-old\n+new1\n+new2\n+new3",
+          "raw_url": "https://github.com/acme/widgets/raw/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/internal%2Fgate%2Fscope.go",
+          "sha": "1ecd0fb2779d649889ce28ebfefb3139a99fdbb2",
+          "status": "modified"
         },
         {
+          "additions": 0,
+          "blob_url": "https://github.com/acme/widgets/blob/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/new%2Fname.go",
+          "changes": 0,
+          "contents_url": "https://api.github.com/repos/acme/widgets/contents/new%2Fname.go?ref=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "deletions": 0,
           "filename": "new/name.go",
           "previous_filename": "old/name.go",
-          "additions": 0,
-          "deletions": 0,
-          "status": "renamed",
-          "patch": ""
+          "raw_url": "https://github.com/acme/widgets/raw/aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa/new%2Fname.go",
+          "sha": "fa77e41200a75455eff939e52868d5502725a00c",
+          "status": "renamed"
         }
       ]
     }

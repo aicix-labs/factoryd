@@ -1,43 +1,133 @@
 {
+  "source": {
+    "recorded": true,
+    "provider": "gitlab",
+    "provider_version": "18.8.2",
+    "recorded_at": "2026-09-01T10:00:00Z"
+  },
   "exchanges": [
     {
       "method": "GET",
-      "path": "/api/v4/projects/acme%2Fwidgets/merge_requests/42/notes?page=1&per_page=100",
+      "path": "/api/v4/projects/acme%2Fwidgets/merge_requests/42/notes?page=1\u0026per_page=100",
       "status": 200,
       "body": [
         {
-          "body": "changed title from **Draft: x** to **x**",
+          "author": {
+            "avatar_url": "https://secure.gravatar.com/avatar/ecc55d65ed7cf1a3fe8e030a7880675cf47dabb0f717ec42a9cadf3ec66b53d3?s=80\u0026d=identicon",
+            "id": 1001,
+            "locked": false,
+            "name": "aicix-devops",
+            "public_email": null,
+            "state": "active",
+            "username": "producer-bot",
+            "web_url": "https://gitlab.example.com/producer-bot"
+          },
+          "body": "### adversarial pass — scope-escape — **CLEARED**\n\nPinned to `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`.\n\nAttempted:\n\n- reverted the guard and confirmed the new test goes red\n- fed the guard a path that only mentions the pattern in a comment\n\nno escape found\n\n\u003c!-- factoryd:audit:v1\n{\n  \"lens\": \"scope-escape\",\n  \"verdict\": \"CLEARED\",\n  \"sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"attempts\": [\n    \"reverted the guard and confirmed the new test goes red\",\n    \"fed the guard a path that only mentions the pattern in a comment\"\n  ],\n  \"notes\": \"no escape found\",\n  \"posted_at\": \"2026-09-01T10:00:00Z\"\n}\n--\u003e",
+          "commands_changes": {},
+          "confidential": false,
+          "created_at": "2026-09-01T10:00:00Z",
+          "id": 1001,
+          "imported": false,
+          "imported_from": "none",
+          "internal": false,
+          "noteable_id": 2924,
+          "noteable_iid": 35,
+          "noteable_type": "MergeRequest",
+          "project_id": 1,
+          "resolvable": false,
+          "system": false,
+          "type": null,
+          "updated_at": "2026-09-01T10:00:00Z"
+        },
+        {
+          "author": {
+            "avatar_url": "https://secure.gravatar.com/avatar/ecc55d65ed7cf1a3fe8e030a7880675cf47dabb0f717ec42a9cadf3ec66b53d3?s=80\u0026d=identicon",
+            "id": 1001,
+            "locked": false,
+            "name": "aicix-devops",
+            "public_email": null,
+            "state": "active",
+            "username": "producer-bot",
+            "web_url": "https://gitlab.example.com/producer-bot"
+          },
+          "body": "deleted source branch `producer/fix-thing`",
+          "commands_changes": {},
+          "confidential": false,
+          "created_at": "2026-09-01T10:00:00Z",
+          "id": 1001,
+          "imported": false,
+          "imported_from": "none",
+          "internal": false,
+          "noteable_id": 2924,
+          "noteable_iid": 35,
+          "noteable_type": "MergeRequest",
+          "project_id": 1,
+          "resolvable": false,
           "system": true,
-          "author": {
-            "id": 2002,
-            "username": "factory-reviewer"
-          }
+          "type": null,
+          "updated_at": "2026-09-01T10:00:00Z"
         },
         {
+          "author": {
+            "avatar_url": "https://secure.gravatar.com/avatar/ecc55d65ed7cf1a3fe8e030a7880675cf47dabb0f717ec42a9cadf3ec66b53d3?s=80\u0026d=identicon",
+            "id": 1001,
+            "locked": false,
+            "name": "aicix-devops",
+            "public_email": null,
+            "state": "active",
+            "username": "producer-bot",
+            "web_url": "https://gitlab.example.com/producer-bot"
+          },
+          "body": "### adversarial pass — stale-lens — **CLEARED**\n\nPinned to `cccccccccccccccccccccccccccccccccccccccc`.\n\nAttempted:\n\n- tried the previous head\n\nno escape found\n\n\u003c!-- factoryd:audit:v1\n{\n  \"lens\": \"stale-lens\",\n  \"verdict\": \"CLEARED\",\n  \"sha\": \"cccccccccccccccccccccccccccccccccccccccc\",\n  \"attempts\": [\n    \"tried the previous head\"\n  ],\n  \"notes\": \"no escape found\",\n  \"posted_at\": \"2026-09-01T10:00:00Z\"\n}\n--\u003e",
+          "commands_changes": {},
+          "confidential": false,
+          "created_at": "2026-09-01T10:00:00Z",
+          "id": 1001,
+          "imported": false,
+          "imported_from": "none",
+          "internal": false,
+          "noteable_id": 2924,
+          "noteable_iid": 35,
+          "noteable_type": "MergeRequest",
+          "project_id": 1,
+          "resolvable": false,
+          "system": false,
+          "type": null,
+          "updated_at": "2026-09-01T10:00:00Z"
+        },
+        {
+          "author": {
+            "avatar_url": "https://secure.gravatar.com/avatar/ecc55d65ed7cf1a3fe8e030a7880675cf47dabb0f717ec42a9cadf3ec66b53d3?s=80\u0026d=identicon",
+            "id": 1001,
+            "locked": false,
+            "name": "aicix-devops",
+            "public_email": null,
+            "state": "active",
+            "username": "producer-bot",
+            "web_url": "https://gitlab.example.com/producer-bot"
+          },
           "body": "looks good to me",
+          "commands_changes": {},
+          "confidential": false,
+          "created_at": "2026-09-01T10:00:00Z",
+          "id": 1001,
+          "imported": false,
+          "imported_from": "none",
+          "internal": false,
+          "noteable_id": 2924,
+          "noteable_iid": 35,
+          "noteable_type": "MergeRequest",
+          "project_id": 1,
+          "resolvable": false,
           "system": false,
-          "author": {
-            "id": 3003,
-            "username": "someone"
-          }
-        },
-        {
-          "body": "### adversarial pass \u2014 stale-lens \u2014 **CLEARED**\n\nPinned to `cccccccccccccccccccccccccccccccccccccccc`.\n\nAttempted:\n\n- tried the previous head\n\nno escape found\n\n<!-- factoryd:audit:v1\n{\n  \"lens\": \"stale-lens\",\n  \"verdict\": \"CLEARED\",\n  \"sha\": \"cccccccccccccccccccccccccccccccccccccccc\",\n  \"attempts\": [\n    \"tried the previous head\"\n  ],\n  \"notes\": \"no escape found\",\n  \"posted_by\": \"factory-reviewer\",\n  \"posted_at\": \"2026-09-01T10:05:00Z\"\n}\n-->\n",
-          "system": false,
-          "author": {
-            "id": 2002,
-            "username": "factory-reviewer"
-          }
-        },
-        {
-          "body": "### adversarial pass \u2014 scope-escape \u2014 **CLEARED**\n\nPinned to `aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa`.\n\nAttempted:\n\n- reverted the guard and confirmed the new test goes red\n- fed the guard a path that only mentions the pattern in a comment\n\nno escape found\n\n<!-- factoryd:audit:v1\n{\n  \"lens\": \"scope-escape\",\n  \"verdict\": \"CLEARED\",\n  \"sha\": \"aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa\",\n  \"attempts\": [\n    \"reverted the guard and confirmed the new test goes red\",\n    \"fed the guard a path that only mentions the pattern in a comment\"\n  ],\n  \"notes\": \"no escape found\",\n  \"posted_by\": \"factory-reviewer\",\n  \"posted_at\": \"2026-09-01T10:05:00Z\"\n}\n-->\n",
-          "system": false,
-          "author": {
-            "id": 2002,
-            "username": "factory-reviewer"
-          }
+          "type": null,
+          "updated_at": "2026-09-01T10:00:00Z"
         }
-      ]
+      ],
+      "header": {
+        "Link": "\u003chttps://gitlab.example.com/api/v4/projects/acme%2Fwidgets/merge_requests/42/notes?activity_filter=all_notes\u0026id=acme%2Fwidgets\u0026noteable_id=35\u0026order_by=created_at\u0026page=1\u0026per_page=100\u0026sort=desc\u003e; rel=\"first\", \u003chttps://gitlab.example.com/api/v4/projects/acme%2Fwidgets/merge_requests/42/notes?activity_filter=all_notes\u0026id=acme%2Fwidgets\u0026noteable_id=35\u0026order_by=created_at\u0026page=1\u0026per_page=100\u0026sort=desc\u003e; rel=\"last\"",
+        "X-Total-Pages": "1"
+      }
     }
   ]
 }
