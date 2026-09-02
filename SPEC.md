@@ -133,6 +133,10 @@ and found nothing to do.
 - declared paths exist and are writable; every path in
   `gate.required_writable_paths` is a writable directory **or is absent with a
   writable nearest existing ancestor**, since submit creates it (§4.4);
+- the workdir's local git config carries **only** allowlisted keys, and the
+  clone is one factoryd created (§5.4) — reported here as a preflight, enforced
+  again inside the transport before every operation, because the producer can
+  edit it in between;
 - `gate.env` declares `PATH`, and every `${VAR}` referenced by a declared path
   is set in it — `doctor` resolves those paths against the same fully-declared
   environment `submit` will give the gate, not against its own (§4.4);
@@ -300,9 +304,15 @@ An empty list is legal and means the gate needs nothing beyond its workdir. It i
 a claim the operator makes, and a wrong one shows up as an exit 3 rather than a
 mystery.
 
-**The workdir must be a clone, not a git worktree.** A worktree keeps its refs in the
-parent repository, outside the sandbox, so the producer cannot write them. `doctor`
-must check this.
+**The workdir must be a clone factoryd created, not a git worktree.** A worktree
+keeps its refs in the parent repository, outside the sandbox, so the producer
+cannot write them. `doctor` must check this.
+
+"Factoryd created" is the other half, and it is a §5.4 requirement rather than a
+convenience: a clone made by someone else arrives with a `.git/config` nobody
+owns. The allowlist check would reject it, which is the correct outcome but a
+confusing one to meet for the first time on a live factory — so the ownership is
+stated here, where the workdir is.
 
 ### 4.5 Reconciler / health tick
 
@@ -486,20 +496,50 @@ So the git environment is isolated to the same standard as the credential:
 
 - `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` point at `/dev/null`; only
   configuration submit sets explicitly applies.
-- **The repository's own `.git/config` is not covered by that**, and it is the
-  one an attacker or a confused agent can actually reach: the producer has write
-  access to its workdir by definition, so it can add a `credential.helper` or a
-  `url.*.insteadOf` to the very repository submit is about to push from. Git has
-  no switch to ignore local configuration, so both halves are needed:
-  - what **can** be overridden is: `-c credential.helper=` to clear the
-    inherited list before appending submit's own, and an explicit
-    `-c core.sshCommand`. A `-c` override beats the local file.
-  - what **cannot** be enumerated is refused: if the workdir's `.git/config`
-    declares any of `credential.helper`, `url.*.insteadOf`,
-    `url.*.pushInsteadOf`, `core.sshCommand`, `include.path` or `includeIf.*`,
-    submit **refuses** rather than trying to neutralise it. There is no complete
-    list of `url.<base>.insteadOf` keys to override, and a producer that wrote
-    one is a signal in its own right, not a condition to work around.
+- **The repository's own `.git/config` is owned outright, by allowlist.** It is
+  not covered by the `/dev/null` above, and it is the one file the producer can
+  actually reach: it has write access to its workdir by definition, so it can
+  configure the very repository submit is about to push from.
+
+  A denylist cannot close this. Refusing `credential.helper` and
+  `url.*.insteadOf` leaves `http.<url>.proxy` sending the connection through an
+  interceptor, `http.sslVerify=false` accepting any certificate, and
+  `http.sslCAInfo` swapping the trust store — **none of which change the
+  effective URL**, so the target check passes while the credential is handed to
+  someone else. Nor is that list complete either; it is the next three anyone
+  thought of. You cannot enumerate what you do not own, and every future Git
+  release makes a denylist more wrong.
+
+  So the local configuration is **default-deny**:
+
+  - The workdir is a clone **factoryd created**, whose `.git/config` factoryd
+    wrote. Ownership first; the check below exists because the producer can
+    edit it afterwards.
+  - Before every fetch and every push, submit reads the repository's effective
+    local configuration and **refuses if any key outside this allowlist is
+    present**:
+
+    ```
+    core.repositoryformatversion   core.filemode      core.bare
+    core.logallrefupdates          core.symlinks      core.ignorecase
+    core.precomposeunicode         extensions.objectformat
+    remote.<name>.url              remote.<name>.fetch
+    branch.<name>.merge            branch.<name>.remote
+    ```
+
+    That is what a clone needs to be a clone. Everything else — every `http.*`,
+    every `url.*`, `credential.*`, `core.sshCommand`, `core.worktree`,
+    `include.path`, `includeIf.*` — is absent or submit does not run. A key Git
+    adds next year is refused by default rather than admitted by omission.
+  - `remote.<name>.url` is allowlisted because a clone has one, **and submit
+    does not use it**: pushes and fetches name the URL explicitly, and the
+    effective-URL check below still runs, because `insteadOf` rewrites an
+    explicit URL too.
+
+  This is the "fully owned" corollary applied properly. The earlier draft of
+  this section policed the local config with a denylist, which satisfies the
+  letter of the invariant and not the substance: the verification and the
+  operation still shared configuration that factoryd did not own.
 - Inherited `GIT_*` variables are dropped, not merged. `GIT_TERMINAL_PROMPT=0`
   and an inert `GIT_ASKPASS`, so a missing credential fails rather than waiting
   for a human who is not there.
@@ -678,7 +718,8 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §5.3 `GitCredential` | either driver returns a username its provider will not accept | **both** drivers exercised, each asserting its own convention |
 | §4.4 gate env is owned | any variable reaches the gate that `gate.env` did not declare, or `gate.env` omits `PATH` | the declared environment reaches the gate intact |
 | §4.4 gate env agreement | `doctor` and `submit` resolve a `${VAR}` path to different values — including when run from **different processes with different ambient environments**, which is the case that made an allowlist unworkable | both resolve it to the same path from the same config |
-| §5.4 local git config | the workdir's `.git/config` declares `credential.helper`, `url.*.insteadOf`, `pushInsteadOf`, `core.sshCommand`, `include.path` or `includeIf.*` → refuse | a clean `.git/config` passes |
+| §5.4 local config allowlist | **any** key outside the allowlist is present in the workdir's local config → refuse | a clone carrying only allowlisted keys pushes normally |
+| §5.4 the URL check is not enough | `http.<url>.proxy`, `http.sslVerify=false` or `http.sslCAInfo` is set — the effective URL and project still match, and submit must still refuse | the same push succeeds once the setting is removed |
 | §5.4 rewrite added mid-turn | a rewrite is added to `.git/config` **after** `doctor` passed and before the push — the per-operation check must catch what the preflight could not | the same push succeeds with no rewrite added |
 | §4.4 gate paths | a declared path exists as a non-directory, or cannot be created → exit **3** | a genuinely red gate still exits **5**, and an absent-but-creatable path is created and passes |
 | §4.4 unset `${VAR}` | a referenced variable is unset → refuse | a set variable resolves and passes |
