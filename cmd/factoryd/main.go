@@ -26,8 +26,9 @@ var version = "dev"
 var usage = `factoryd - config-driven code review factories
 
 usage:
-  factoryd doctor  --config <f>            verify a factory could actually run
-  factoryd scm     --config <f> <verb>...  drive the provider directly
+  factoryd doctor    --config <f>                    verify a factory could actually run
+  factoryd supervise --config <f> --role <r>         run one role's loop
+  factoryd scm       --config <f> <verb>...         drive the provider directly
   factoryd version
 
 verbs for scm:
@@ -42,12 +43,16 @@ verbs for scm:
   set-draft <id> true|false       mark draft or ready
   merge <id> <expected-head>      merge, then verify the commit landed
 
+flags for supervise:
+  --role <r>       producer or reviewer (required)
+  --max-turns <n>  stop after n turns; 0 runs until stopped
+
 global flags:
   --config <f>     factory config (required except for version)
   --role <r>       producer or reviewer; selects the credential (default reviewer)
   --json           machine-readable output where supported
 
-not yet implemented in this build: supervise, submit, signal, audit, status.
+not yet implemented in this build: submit, signal, audit, status.
 They exit ` + fmt.Sprint(exitConfig) + ` rather than pretending to work.
 `
 
@@ -63,6 +68,8 @@ func main() {
 	switch cmd {
 	case "doctor":
 		os.Exit(runDoctor(args))
+	case "supervise":
+		os.Exit(runSupervise(args))
 	case "scm":
 		os.Exit(runSCM(args))
 	case "version":
@@ -71,7 +78,7 @@ func main() {
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		os.Exit(exitOK)
-	case "supervise", "submit", "signal", "audit", "status":
+	case "submit", "signal", "audit", "status":
 		// Named explicitly so the failure says what is missing. A subcommand
 		// that silently did nothing would be indistinguishable from one that
 		// ran and found nothing to do.

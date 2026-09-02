@@ -72,7 +72,16 @@ func fixture(t *testing.T) *config.Config {
 			Producer: config.CredentialRef{File: filepath.Join(root, "producer.token")},
 			Reviewer: config.CredentialRef{File: filepath.Join(root, "reviewer.token")},
 		},
-		Gate:   config.Gate{Command: []string{gate}},
+		Gate: config.Gate{Command: []string{gate}},
+		Roles: config.Roles{
+			Producer: config.RoleSpec{Command: []string{gate}},
+			Reviewer: config.RoleSpec{Command: []string{gate}},
+		},
+		Supervisor: config.Supervisor{
+			SpinWarn: config.DefaultSpinWarn, SpinAbort: config.DefaultSpinAbort,
+			PollIntervalSeconds: config.DefaultPollInterval,
+			BackoffSeconds:      config.DefaultBackoffSeconds,
+		},
 		Alerts: []config.Alert{{Kind: "file", Path: filepath.Join(root, "alerts.log")}},
 	}
 	if err := cfg.Validate(); err != nil {
@@ -103,7 +112,7 @@ func TestHealthyFactoryPasses(t *testing.T) {
 	if !r.OK() {
 		t.Fatalf("healthy factory failed %v\n%s", failedNames(r), r)
 	}
-	if len(r.Checks) < 8 {
+	if len(r.Checks) < 12 {
 		t.Fatalf("only %d checks ran; doctor is not asking enough questions", len(r.Checks))
 	}
 }
@@ -184,6 +193,23 @@ func TestIndividualFailuresAreCaught(t *testing.T) {
 			name:     "gate command does not exist",
 			mutate:   func(t *testing.T, c *config.Config) { c.Gate.Command = []string{"definitely-not-a-real-binary-xyz"} },
 			wantName: "gate command",
+		},
+		{
+			name: "a role turn command does not exist",
+			mutate: func(t *testing.T, c *config.Config) {
+				c.Roles.Reviewer.Command = []string{"definitely-not-a-real-binary-xyz"}
+			},
+			wantName: "turn reviewer",
+		},
+		{
+			name: "a halt sentinel is present",
+			mutate: func(t *testing.T, c *config.Config) {
+				if err := os.WriteFile(c.StopPath("producer"),
+					[]byte("reason: spin abort\n"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+			},
+			wantName: "halt sentinel producer",
 		},
 		{
 			name:     "repository unreachable",

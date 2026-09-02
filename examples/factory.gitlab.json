@@ -1,5 +1,5 @@
 {
-  "schema_version": 1,
+  "schema_version": 2,
   "name": "widgets",
   "provider": "gitlab",
   "gitlab": {
@@ -13,14 +13,44 @@
     "producer_workdir": "/var/lib/factoryd/widgets/clone"
   },
   "credentials": {
-    "producer": {"env": "FACTORYD_PRODUCER_TOKEN"},
-    "reviewer": {"file": "/etc/factoryd/widgets/reviewer.token"}
+    "producer": {
+      "env": "FACTORYD_PRODUCER_TOKEN"
+    },
+    "reviewer": {
+      "file": "/etc/factoryd/widgets/reviewer.token"
+    }
   },
   "gate": {
-    "command": ["make", "check"],
+    "command": [
+      "make",
+      "check"
+    ],
     "timeout_seconds": 900
   },
+  "roles": {
+    "producer": {
+      "command": [
+        "/usr/local/bin/factory-producer-turn"
+      ],
+      "timeout_seconds": 3600
+    },
+    "reviewer": {
+      "command": [
+        "/usr/local/bin/factory-reviewer-turn"
+      ],
+      "timeout_seconds": 1800
+    }
+  },
+  "supervisor": {
+    "spin_warn": 3,
+    "spin_abort": 8,
+    "poll_interval_seconds": 2,
+    "backoff_seconds": 15
+  },
   "alerts": [
-    {"kind": "webhook", "url": "https://hooks.example.com/factoryd"}
+    {
+      "kind": "webhook",
+      "url": "https://hooks.example.com/factoryd"
+    }
   ]
 }

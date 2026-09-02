@@ -242,3 +242,98 @@ func TestTurnAge(t *testing.T) {
 		t.Fatal("a nil turn reports running")
 	}
 }
+
+// Both roles' supervisors write this one document. Update is a
+// read-modify-write, so without a lock the later writer silently discards
+// whatever the other recorded in between.
+func TestConcurrentUpdatesDoNotLoseWrites(t *testing.T) {
+	p := tmpPath(t)
+	if err := New("widgets").Save(p); err != nil {
+		t.Fatal(err)
+	}
+
+	const writers = 8
+	const each = 25
+	var wg sync.WaitGroup
+	for i := 0; i < writers; i++ {
+		wg.Add(1)
+		go func() {
+			defer wg.Done()
+			for j := 0; j < each; j++ {
+				if _, err := Update(p, "widgets", func(s *State) error {
+					s.Role(RoleProducer).SpinCount++
+					return nil
+				}); err != nil {
+					t.Errorf("update: %v", err)
+					return
+				}
+			}
+		}()
+	}
+	wg.Wait()
+
+	got, err := Load(p, "widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if want := writers * each; got.Role(RoleProducer).SpinCount != want {
+		t.Fatalf("spin count = %d after %d increments, want %d; %d updates were lost",
+			got.Role(RoleProducer).SpinCount, want, want, want-got.Role(RoleProducer).SpinCount)
+	}
+}
+
+// Two roles writing different fields must not clobber each other. This is the
+// shape the supervisor actually produces: the producer touching its own state
+// while the reviewer touches its own.
+func TestConcurrentRolesKeepBothUpdates(t *testing.T) {
+	p := tmpPath(t)
+	if err := New("widgets").Save(p); err != nil {
+		t.Fatal(err)
+	}
+
+	var wg sync.WaitGroup
+	for _, role := range Roles {
+		wg.Add(1)
+		go func(r Role) {
+			defer wg.Done()
+			for i := 0; i < 50; i++ {
+				if _, err := Update(p, "widgets", func(s *State) error {
+					s.Role(r).SpinCount++
+					return nil
+				}); err != nil {
+					t.Errorf("%s: %v", r, err)
+					return
+				}
+			}
+		}(role)
+	}
+	wg.Wait()
+
+	got, err := Load(p, "widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, r := range Roles {
+		if n := got.Role(r).SpinCount; n != 50 {
+			t.Errorf("role %s recorded %d of its 50 updates; the other role clobbered %d", r, n, 50-n)
+		}
+	}
+}
+
+// The lock must not leave the state file itself behind as a lock artefact, and
+// the lock file must be distinct from the document.
+func TestLockPathIsSeparateFromTheDocument(t *testing.T) {
+	p := tmpPath(t)
+	if _, err := Update(p, "widgets", func(*State) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	if LockPath(p) == p {
+		t.Fatal("the lock file is the state file")
+	}
+	if _, err := os.Stat(LockPath(p)); err != nil {
+		t.Fatalf("no lock file was created: %v", err)
+	}
+	if _, err := Load(p, "widgets"); err != nil {
+		t.Fatalf("the document is unreadable after a locked update: %v", err)
+	}
+}

@@ -77,6 +77,36 @@ unexported, so a `Merged` result nothing confirmed cannot be constructed outside
 Do not add a way to build a verified merge from a driver. A provider cannot
 attest to what landed on a branch; that is the whole point of the split.
 
+## The supervisor
+
+Agent turns are one-shot. They read their trigger, do one unit of work, and
+exit. Nothing in an agent loops, polls, or waits — the supervisor owns all
+continuity. In v1 each agent was told to "run forever" and reliably did not.
+
+Two rules are easy to break by accident:
+
+- **Do not consume a trigger anywhere but in the agent turn.** The spin guard is
+  built on being able to see that a turn did not consume its trigger. A watcher
+  or supervisor that tidied it away would blind the guard.
+- **Reset the spin counter on progress, not on consumption.** A large task
+  legitimately spans turns. A guard that cannot tell "still working" from
+  "achieving nothing" halts real work, which is what the first implementation
+  of this rule did.
+- **Progress means the marker *moved*, not that it exists.** The progress file
+  is durable: once a turn touches it, it is there forever. A guard reading
+  existence sees progress on every subsequent turn, resets the counter every
+  time, and never fires again — so an agent that advanced once and then
+  crash-loops is relaunched indefinitely. That is the exact failure
+  `spin_abort` exists to prevent, and the existence version compiles, reads
+  naturally, and is easier to write. `TestProgressOnceThenStallStillHalts` and
+  `TestStaleProgressFileIsNotProgress` are what stand between the two.
+
+If you add a loop, add a cancellation check at the top of it. A supervisor whose
+trigger is always pending never blocks in `Wait`, so a check only inside `Wait`
+leaves a busy supervisor that cannot be stopped — and a process you cannot stop
+is one you end up killing by command-line pattern, which is where this project
+started.
+
 ## Adding a mutant
 
 If you add behaviour the conformance suite is supposed to police, add a mutant to

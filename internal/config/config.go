@@ -15,7 +15,11 @@ import (
 )
 
 // SchemaVersion is the config schema this build understands.
-const SchemaVersion = 1
+//
+// Bumped to 2 when the supervisor arrived: a factory now has to say what command
+// each role runs, and there is no defensible default for that. An older config
+// is refused by version rather than started with a role that does nothing.
+const SchemaVersion = 2
 
 // Config is one factory.
 type Config struct {
@@ -30,6 +34,11 @@ type Config struct {
 	Paths        Paths       `json:"paths"`
 	Credentials  Credentials `json:"credentials"`
 	Gate         Gate        `json:"gate"`
+	// Roles are the two agent turns. Each is one command that reads its
+	// trigger, does one unit of work, and exits. Neither polls or loops -- the
+	// supervisor owns all continuity.
+	Roles      Roles      `json:"roles"`
+	Supervisor Supervisor `json:"supervisor"`
 	// Alerts must not be empty. A factory that detects a stall and has nowhere
 	// to report it recorded the stall correctly into a journal nobody read --
 	// which is what v1 did for two hours and twenty minutes.
@@ -121,6 +130,53 @@ func (c CredentialRef) Describe() string {
 	}
 }
 
+// Roles configures both agent turns.
+type Roles struct {
+	Producer RoleSpec `json:"producer"`
+	Reviewer RoleSpec `json:"reviewer"`
+}
+
+// RoleSpec is one agent turn.
+type RoleSpec struct {
+	// Command is argv for a single turn. It must exit; a command told to "run
+	// forever" is the v1 arrangement that reliably did not.
+	Command []string `json:"command"`
+	// TimeoutSeconds bounds one turn. Zero means the default.
+	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+	// Workdir overrides where the turn runs. Defaults to the producer workdir
+	// for the producer and to paths.root for the reviewer.
+	Workdir string `json:"workdir,omitempty"`
+}
+
+// Supervisor tunes the spin guard and the watcher.
+type Supervisor struct {
+	// SpinWarn is the number of consecutive turns with no progress after which
+	// the supervisor warns and backs off.
+	SpinWarn int `json:"spin_warn,omitempty"`
+	// SpinAbort is where it halts: writes the stop sentinel, records why, and
+	// exits. Never relaunch indefinitely.
+	SpinAbort int `json:"spin_abort,omitempty"`
+	// PollIntervalSeconds is the watcher poll period, and the periodic
+	// re-check interval even when inotify is in use.
+	PollIntervalSeconds int `json:"poll_interval_seconds,omitempty"`
+	// BackoffSeconds is the base delay applied after a turn that achieved
+	// nothing. It scales with the spin count.
+	BackoffSeconds int `json:"backoff_seconds,omitempty"`
+	// ForcePoll disables inotify. Set it only to reproduce the fallback.
+	ForcePoll bool `json:"force_poll,omitempty"`
+}
+
+// Defaults, applied by Load. They are named rather than inlined so doctor and
+// the docs can quote the same numbers.
+const (
+	DefaultSpinWarn       = 3
+	DefaultSpinAbort      = 8
+	DefaultPollInterval   = 2
+	DefaultBackoffSeconds = 15
+	DefaultTurnTimeout    = 3600
+	DefaultGateTimeout    = 900
+)
+
 // Gate is the build/vet/test command submit runs before pushing anything.
 type Gate struct {
 	// Command is argv, run without a shell unless argv[0] is a shell.
@@ -159,10 +215,38 @@ func Load(path string) (*Config, error) {
 		return nil, err
 	}
 	c.path = abs
+	c.applyDefaults()
 	if err := c.Validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)
 	}
 	return &c, nil
+}
+
+// applyDefaults fills in the optional knobs. It never defaults anything whose
+// wrong value would be silently harmful -- role commands and credentials have no
+// defaults at all.
+func (c *Config) applyDefaults() {
+	if c.Supervisor.SpinWarn == 0 {
+		c.Supervisor.SpinWarn = DefaultSpinWarn
+	}
+	if c.Supervisor.SpinAbort == 0 {
+		c.Supervisor.SpinAbort = DefaultSpinAbort
+	}
+	if c.Supervisor.PollIntervalSeconds == 0 {
+		c.Supervisor.PollIntervalSeconds = DefaultPollInterval
+	}
+	if c.Supervisor.BackoffSeconds == 0 {
+		c.Supervisor.BackoffSeconds = DefaultBackoffSeconds
+	}
+	if c.Gate.TimeoutSeconds == 0 {
+		c.Gate.TimeoutSeconds = DefaultGateTimeout
+	}
+	if c.Roles.Producer.TimeoutSeconds == 0 {
+		c.Roles.Producer.TimeoutSeconds = DefaultTurnTimeout
+	}
+	if c.Roles.Reviewer.TimeoutSeconds == 0 {
+		c.Roles.Reviewer.TimeoutSeconds = DefaultTurnTimeout
+	}
 }
 
 // Validate checks everything decidable without touching the network or the
@@ -253,6 +337,35 @@ func (c *Config) Validate() error {
 		add("gate.timeout_seconds is negative")
 	}
 
+	for role, spec := range map[string]RoleSpec{
+		"producer": c.Roles.Producer,
+		"reviewer": c.Roles.Reviewer,
+	} {
+		if len(spec.Command) == 0 {
+			add("roles.%s.command is empty; the supervisor would have no turn to run", role)
+		}
+		if spec.TimeoutSeconds < 0 {
+			add("roles.%s.timeout_seconds is negative", role)
+		}
+	}
+
+	sv := c.Supervisor
+	switch {
+	case sv.SpinWarn <= 0:
+		add("supervisor.spin_warn must be positive")
+	case sv.SpinAbort <= 0:
+		add("supervisor.spin_abort must be positive")
+	case sv.SpinWarn >= sv.SpinAbort:
+		add("supervisor.spin_warn (%d) must be below spin_abort (%d), or the warning never precedes the halt",
+			sv.SpinWarn, sv.SpinAbort)
+	}
+	if sv.PollIntervalSeconds <= 0 {
+		add("supervisor.poll_interval_seconds must be positive")
+	}
+	if sv.BackoffSeconds < 0 {
+		add("supervisor.backoff_seconds is negative")
+	}
+
 	if len(c.Alerts) == 0 {
 		add("no alert transport is configured; a factory that cannot deliver an alert detects stalls into a journal nobody reads")
 	}
@@ -290,3 +403,40 @@ func (c *Config) StatePath() string { return filepath.Join(c.Paths.Root, "state.
 // InboxDir and OutboxDir are the filesystem handoff channels (SPEC.md §6.2).
 func (c *Config) InboxDir() string  { return filepath.Join(c.Paths.Root, "inbox") }
 func (c *Config) OutboxDir() string { return filepath.Join(c.Paths.Root, "outbox") }
+
+// ProgressPath is where a role touches to say "I advanced". The producer's is
+// named by SPEC.md §6.3; the reviewer gets the symmetric one.
+func (c *Config) ProgressPath(role string) string {
+	return filepath.Join(c.InboxDir(), role+"-progress")
+}
+
+// StopPath is the halt sentinel for a role. Its presence stops the supervisor
+// from starting, and only an operator removes it: a circuit breaker that resets
+// itself is not a circuit breaker.
+func (c *Config) StopPath(role string) string {
+	return filepath.Join(c.Paths.Root, role+".stop")
+}
+
+// RoleSpec returns the turn configuration for a role, and whether the role is
+// one this build knows.
+func (c *Config) RoleSpec(role string) (RoleSpec, bool) {
+	switch role {
+	case "producer":
+		return c.Roles.Producer, true
+	case "reviewer":
+		return c.Roles.Reviewer, true
+	default:
+		return RoleSpec{}, false
+	}
+}
+
+// TurnWorkdir is where a role'"'"'s turn runs.
+func (c *Config) TurnWorkdir(role string) string {
+	if spec, ok := c.RoleSpec(role); ok && spec.Workdir != "" {
+		return spec.Workdir
+	}
+	if role == "producer" {
+		return c.Paths.ProducerWorkdir
+	}
+	return c.Paths.Root
+}

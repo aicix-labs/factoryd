@@ -101,7 +101,30 @@ func Run(ctx context.Context, cfg *config.Config, newDriver DriverBuilder) Repor
 	add("producer workdir", err, fmt.Sprintf("%s (%s)", cfg.Paths.ProducerWorkdir, kind))
 
 	// --- gate ---
-	add("gate command", checkGate(cfg.Gate), strings.Join(cfg.Gate.Command, " "))
+	add("gate command", checkCommand(cfg.Gate.Command, "gate.command",
+		"submit would push code nothing has built"), strings.Join(cfg.Gate.Command, " "))
+
+	// --- role turns ---
+	for _, role := range []string{"producer", "reviewer"} {
+		spec, _ := cfg.RoleSpec(role)
+		add("turn "+role, checkCommand(spec.Command, "roles."+role+".command",
+			"the supervisor would have no turn to run"), strings.Join(spec.Command, " "))
+		add("workdir "+role, checkWritableDir(cfg.TurnWorkdir(role)), cfg.TurnWorkdir(role))
+
+		// The halt sentinel is a stop, not a warning. A supervisor started
+		// against one refuses to run, so doctor has to say it is there.
+		if body, err := os.ReadFile(cfg.StopPath(role)); err == nil {
+			add("halt sentinel "+role,
+				fmt.Errorf("%s is present; %s will not start until it is removed:\n      %s",
+					cfg.StopPath(role), role, strings.ReplaceAll(strings.TrimSpace(string(body)), "\n", "\n      ")),
+				cfg.StopPath(role))
+		} else {
+			add("halt sentinel "+role, nil, "absent")
+		}
+	}
+
+	add("spin guard", nil, fmt.Sprintf("warn at %d turns with no progress, halt at %d; backoff %ds",
+		cfg.Supervisor.SpinWarn, cfg.Supervisor.SpinAbort, cfg.Supervisor.BackoffSeconds))
 
 	// --- alerts ---
 	alertErr := error(nil)
@@ -227,12 +250,15 @@ func workdirKind(dir string) (string, error) {
 		dir, parent)
 }
 
-func checkGate(g config.Gate) error {
-	if len(g.Command) == 0 {
-		return fmt.Errorf("gate.command is empty; submit would push code nothing has built")
+// checkCommand verifies a configured argv is runnable. A command that does not
+// exist fails at the moment it is needed, which for a turn is the moment a
+// trigger arrives and for the gate is the moment a change is ready to push.
+func checkCommand(argv []string, field, consequence string) error {
+	if len(argv) == 0 {
+		return fmt.Errorf("%s is empty; %s", field, consequence)
 	}
-	if _, err := exec.LookPath(g.Command[0]); err != nil {
-		return fmt.Errorf("gate command %q not found: %w", g.Command[0], err)
+	if _, err := exec.LookPath(argv[0]); err != nil {
+		return fmt.Errorf("%s: %q not found: %w", field, argv[0], err)
 	}
 	return nil
 }
