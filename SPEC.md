@@ -117,11 +117,17 @@ factoryd scm <verb> ...        # thin, scriptable access to the driver
 factoryd doctor                # verify a factory's config, credentials, paths, identities
 ```
 
+That is the finished surface, not the current one. §11 gives the order the
+subcommands arrive in; anything not yet built exits non-zero saying so, because a
+subcommand that silently did nothing would be indistinguishable from one that ran
+and found nothing to do.
+
 `doctor` is not optional. It must verify: config parses; both credentials
 authenticate; **producer and reviewer resolve to different identities**; **the
 identity `git` itself would present for the remote is the producer's** (§4.4);
-declared paths exist and are writable; **every directory the gate command
-references exists and is writable by the identity that will run it** (§9.6); the
+declared paths exist and are writable; **every path in
+`gate.required_writable_paths` exists and is writable by the identity that will
+run the gate** (§4.4); the
 target repo is reachable; the workdir is a clone, not a worktree (§4.4). It exits
 non-zero on any failure and names which.
 
@@ -182,8 +188,8 @@ Submit is also **the gate**. In order:
    reviewer's. Refuse if the two resolve to the same identity, naming it.
    This governs **both the API and the git transport** — see below.
 2. materialize: create branch from target, stage, commit
-3. re-check the gate's declared paths (§9.6). A missing one exits **3**, not 5:
-   a misconfigured host is not a red branch.
+3. re-check `gate.required_writable_paths` (below). A missing or unwritable one
+   exits **3**, not 5: a misconfigured host is not a red branch (§9.6).
 4. run the configured gate command (build/vet/test). If red: write a question
    (§6.2), signal, **do not push**
 5. push, create-or-update the Draft PR/MR
@@ -192,8 +198,9 @@ Submit is also **the gate**. In order:
 Exit codes are part of the contract: `0` submitted · `4` nothing to submit ·
 `5` gate failed · `3` configuration/identity failure.
 
-**The producer credential governs the git transport, not only the API.** This is
-stated separately because it is the half an implementer will miss: `fetch` and
+**The producer credential governs the git transport, not only the API.** The
+contract and its verification oracle are in §5.4; this is why it exists, and it
+is stated separately because it is the half an implementer will miss: `fetch` and
 `push` do not take the token you pass to the API. Left alone, git consults the
 ambient credential helper, and the first matching entry wins whoever it belongs
 to.
@@ -206,13 +213,39 @@ the reviewer** and nothing would have said so — a successful push looks identi
 either way — breaking two-party trust at the git layer while every API-level
 check still passed.
 
-Therefore, for every git operation including `fetch`:
+Therefore every git operation, `fetch` as much as `push`, runs through a
+`GitTransport` (§5.4): inherited credential sources suppressed, the producer
+credential supplied explicitly, and never through argv.
 
-- clear inherited credential helpers and supply the producer credential
-  explicitly;
-- **not through argv.** `/proc/<pid>/cmdline` is world-readable, so a token on a
-  command line is readable by anything on the host. Use a `0600` file the process
-  owns and removes, or stdin — never a remote URL with the credential embedded.
+**The gate declares the paths it needs; they are not discovered.**
+
+```json
+"gate": {
+  "command": ["bash", "-c", "go build ./... && go test ./..."],
+  "required_writable_paths": ["${GOCACHE}", "${TMPDIR}", "build/artifacts"],
+  "timeout_seconds": 900
+}
+```
+
+Declared, because a gate command is an opaque argv — often a shell string — and
+the paths a build writes to are set by environment variables, tool defaults and
+the build system itself. Trying to recover them by parsing the command would be a
+guess presented as a check: it would miss paths that matter and invent ones that
+do not, and a check that is sometimes wrong about what it verified is worse than
+no check, because it is believed.
+
+Resolution rules, so the field means one thing:
+
+- A relative path resolves against the gate's working directory.
+- `${VAR}` expands from the environment the gate will be given. **An unset
+  variable is an error, not an empty expansion** — expanding `${GOCACHE}/x` to
+  `/x` would check a path the gate will never touch and pass.
+- No shell, no globbing, no `~`. Anything needing those is a path the operator
+  should write out.
+
+An empty list is legal and means the gate needs nothing beyond its workdir. It is
+a claim the operator makes, and a wrong one shows up as an exit 3 rather than a
+mystery.
 
 **The workdir must be a clone, not a git worktree.** A worktree keeps its refs in the
 parent repository, outside the sandbox, so the producer cannot write them. `doctor`
@@ -289,6 +322,78 @@ Both implementations must pass one shared conformance suite against recorded fix
 v1's two drivers diverged: five verbs the producer half needed existed only in the
 GitHub driver, which silently made the producer daemon GitHub-only. A conformance
 suite makes that a build failure.
+
+### 5.4 Git transport
+
+The provider driver speaks the API. Nothing in it touches git, and the two
+authenticate by different mechanisms — which is exactly how a producer came to
+push under the reviewer's credential while every API check passed (§1, item 11).
+So the git side gets its own contract, and its own identity question:
+
+```go
+// GitIdentity is who a transport authenticates as at the remote.
+type GitIdentity struct {
+    Login string // the account the remote sees
+    // Source names how it was resolved: "credential-helper" or "ssh".
+    Source string
+}
+
+// GitTransport performs submit's git operations under an identity it can state.
+//
+// Identity must resolve using the SAME isolation and credential source that
+// Fetch and Push use. A check performed under different conditions than the
+// operation it vouches for proves nothing about that operation.
+type GitTransport interface {
+    // Identity resolves who this transport would present to the remote. It
+    // returns an error rather than a guess when it cannot: an unresolved
+    // identity is undecided, not satisfied.
+    Identity(ctx context.Context) (GitIdentity, error)
+
+    Fetch(ctx context.Context, refspec string) error
+    Push(ctx context.Context, refspec string) error
+}
+```
+
+**Configuration.** The remote is declared, not discovered. A transport that
+inferred its remote from the workdir would verify one thing and push to another:
+
+```json
+"git": {
+  "remote": "https://gitlab.example.com/acme/widgets.git",
+  "transport": "https",
+  "ssh_key_file": "/etc/factoryd/widgets/producer_ed25519"
+}
+```
+
+`transport` is `https` or `ssh`. For `https` the credential is
+`credentials.producer` — the same one the API uses, and no other. For `ssh` it is
+`ssh_key_file`, which is required for that transport and ignored otherwise.
+
+**Isolation is part of the contract, not a precaution.** Every git invocation
+must run with inherited credential sources suppressed:
+
+- **https:** no ambient `credential.helper` may apply. Submit supplies its own,
+  configured explicitly for this invocation, reading the producer credential from
+  a file the process owns at mode `0600` and removes, or from stdin. **Never a
+  remote URL with the credential embedded, and never argv** —
+  `/proc/<pid>/cmdline` is world-readable, so a token on a command line is
+  readable by anything on the host.
+- **ssh:** `IdentitiesOnly=yes`, `IdentityAgent=none`, and an explicit
+  `IdentityFile`. An agent holding the reviewer's key is the same failure as a
+  credential helper holding the reviewer's token.
+
+**The verification oracle**, so `Identity` is implementable rather than aspirational:
+
+- **https:** run `git credential fill` for the configured remote, under the
+  isolation above. Whatever it returns is what git will use. Resolve that
+  credential through the provider API (`Driver.Whoami`) and report the identity
+  it names. A helper that returns nothing is an error, not an empty identity.
+- **ssh:** run the provider's authentication probe (`ssh -T`) under the isolation
+  above and read the account out of the greeting — GitHub answers `Hi <login>!`,
+  GitLab `Welcome to GitLab, @<login>!`. An unparseable greeting is an error.
+
+Both are read-only and safe to run from `doctor`. Neither infers the answer from
+configuration: they ask the mechanism that will actually be used.
 
 ---
 
@@ -415,6 +520,27 @@ catches things:
    Record fixtures from a live provider, error shapes first; state the provenance
    of every one; and when a case genuinely cannot be provoked, say why in the
    fixture itself.
+
+### 9.1 What must be shown to fail
+
+A requirement with no demonstrated failure is a wish. Each row below is a
+condition an implementation must be able to *produce*, and a check that must go
+red when it does. Nothing here is satisfied by a passing suite alone.
+
+| requirement | must be shown to fail when | positive control |
+|---|---|---|
+| §4.4 git identity (https) | an ambient `credential.helper` resolves the remote to a non-producer account | the same check passes with the producer credential configured |
+| §4.4 git identity (ssh) | an agent or default key authenticates as a non-producer account | passes with `IdentitiesOnly` and the producer key |
+| §4.4 identity is undecidable | the helper returns nothing, or the greeting cannot be parsed | a resolvable transport reports a login |
+| §4.4 credential never in argv | the credential appears in the spawned git process's `/proc/<pid>/cmdline` | **the credential is present in the channel it should use** — otherwise "absent from argv" passes for a submit that never supplied it at all |
+| §4.4 `fetch` is covered too | an ambient credential is used for fetch, not only push | fetch succeeds under the producer credential |
+| §4.4 gate paths | a declared path is missing or unwritable → exit **3** | a genuinely red gate still exits **5** |
+| §4.4 unset `${VAR}` | a referenced variable is unset → refuse | a set variable resolves and passes |
+| §4.1 doctor covers the above | each condition above, reached through `doctor` rather than only through unit tests | a healthy factory passes every check |
+
+The fourth row is the one most likely to be got wrong. "No token in argv" is
+trivially true of an implementation that never passes the token anywhere, so the
+test has to prove the credential reached the intended channel in the same run.
 
 ---
 
