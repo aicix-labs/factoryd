@@ -151,29 +151,94 @@ func isPlaceholderSHA(s string) bool {
 	return true
 }
 
-// Leaks returns any of the given secret or instance-identifying values that
-// still appear in s.
+// secretShapes are credential formats recognisable without being told about
+// them. They are the backstop for the case the explicit list cannot cover: a
+// recording run that forgot to register a token, or registered the wrong one.
 //
-// This is the redactor's own check. Without it, a mapping the recorder forgot
-// to register is invisible: the fixture is still valid JSON, the suite still
-// passes, and the leak ships.
+// Each requires a substantial body after its prefix, so the literal prefix
+// appearing in prose or a documentation URL does not trip it.
+//
+// The list covers what this tool can plausibly meet -- the two providers it
+// drives, plus a generic long Bearer or Basic value -- rather than every vendor
+// format. A pattern with no realistic path into a fixture still needs a test
+// value, and a convincing fake credential in a test file is itself a thing to
+// explain to every scanner that reads the repository.
+var secretShapes = []struct {
+	name string
+	re   *regexp.Regexp
+}{
+	{"gitlab personal access token", regexp.MustCompile(`\bglpat-[A-Za-z0-9_-]{16,}`)},
+	{"gitlab runner token", regexp.MustCompile(`\bglrt-[A-Za-z0-9_-]{16,}`)},
+	{"gitlab deploy token", regexp.MustCompile(`\bgldt-[A-Za-z0-9_-]{16,}`)},
+	{"github token", regexp.MustCompile(`\bgh[pousr]_[A-Za-z0-9]{20,}`)},
+	{"github fine-grained token", regexp.MustCompile(`\bgithub_pat_[A-Za-z0-9_]{20,}`)},
+	{"bearer credential", regexp.MustCompile(`(?i)\bbearer\s+[A-Za-z0-9._~+/=-]{20,}`)},
+	{"basic credential", regexp.MustCompile(`(?i)\bbasic\s+[A-Za-z0-9+/=]{20,}`)},
+}
+
+// looksLikeCredential reports whether v matches a known credential shape.
+func looksLikeCredential(v string) bool {
+	for _, sh := range secretShapes {
+		if sh.re.MatchString(v) {
+			return true
+		}
+	}
+	return false
+}
+
+// mask renders a finding safely. A credential is never printed in full: the
+// error goes to a terminal and, in time, to CI output, and reporting a leak by
+// repeating it is its own small leak. Anything that is not credential-shaped --
+// a hostname, a username -- is named outright, because naming it is the point.
+func mask(v string) string {
+	if !looksLikeCredential(v) {
+		return v
+	}
+	const keep = 6
+	if len(v) <= keep {
+		return "<redacted>"
+	}
+	return fmt.Sprintf("%s...(%d chars)", v[:keep], len(v))
+}
+
+// Leaks returns safe-to-print descriptions of everything in s that must not be
+// committed: the caller's registered values, and anything matching a known
+// credential shape.
+//
+// The shape scan is the half that can fail when the caller is wrong. Comparing
+// only against registered values makes this a check that cannot fail in exactly
+// the case it exists for -- a secret nobody thought to register -- which is the
+// same defect as a coverage list maintained by hand.
 func Leaks(s string, values []string) []string {
 	var found []string
 	seen := map[string]bool{}
+
 	for _, v := range values {
 		if v == "" || seen[v] {
 			continue
 		}
 		seen[v] = true
 		if strings.Contains(s, v) {
-			found = append(found, v)
+			found = append(found, mask(v))
 		}
 	}
+
+	for _, sh := range secretShapes {
+		for _, m := range sh.re.FindAllString(s, -1) {
+			desc := fmt.Sprintf("%s (%s)", sh.name, mask(m))
+			if seen[desc] {
+				continue
+			}
+			seen[desc] = true
+			found = append(found, desc)
+		}
+	}
+
 	sort.Strings(found)
 	return found
 }
 
-// MustNotLeak returns an error naming every value that survived redaction.
+// MustNotLeak returns an error describing every value that survived redaction.
 func MustNotLeak(s string, values []string) error {
 	if found := Leaks(s, values); len(found) > 0 {
 		return fmt.Errorf("redaction left %d value(s) in the fixture: %s",

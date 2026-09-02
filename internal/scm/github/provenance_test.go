@@ -34,3 +34,16 @@ func TestFixtureProvenance(t *testing.T) {
 		}
 	}
 }
+
+// TestNoSecretsInFixtures scans what is committed, with no list of expected
+// values. The recorder's own guard only runs at the moment of writing and only
+// against the values that run registered; this checks the files themselves.
+func TestNoSecretsInFixtures(t *testing.T) {
+	problems, err := conformance.ScanForSecrets("testdata")
+	if err != nil {
+		t.Fatal(err)
+	}
+	for _, p := range problems {
+		t.Errorf("credential-shaped content in a committed fixture: %s", p)
+	}
+}
