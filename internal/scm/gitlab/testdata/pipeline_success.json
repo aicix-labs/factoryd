@@ -1,4 +1,8 @@
 {
+  "source": {
+    "recorded": false,
+    "note": "not yet recorded: needs a green CI run on the scratch project. Record once a runner is attached."
+  },
   "exchanges": [
     {
       "method": "GET",

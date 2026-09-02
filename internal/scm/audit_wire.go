@@ -15,13 +15,16 @@ const AuditMarker = "<!-- factoryd:audit:v1"
 const auditMarkerEnd = "-->"
 
 type auditWire struct {
-	Lens     string    `json:"lens"`
-	Verdict  string    `json:"verdict"`
-	SHA      string    `json:"sha"`
-	Attempts []string  `json:"attempts"`
-	Notes    string    `json:"notes,omitempty"`
-	PostedBy string    `json:"posted_by,omitempty"`
-	PostedAt time.Time `json:"posted_at,omitempty"`
+	Lens     string   `json:"lens"`
+	Verdict  string   `json:"verdict"`
+	SHA      string   `json:"sha"`
+	Attempts []string `json:"attempts"`
+	Notes    string   `json:"notes,omitempty"`
+	PostedBy string   `json:"posted_by,omitempty"`
+	// A pointer, because omitempty does not omit a zero time.Time. An audit
+	// posted without a timestamp was writing "0001-01-01T00:00:00Z" into the
+	// comment, which reads like data and is not.
+	PostedAt *time.Time `json:"posted_at,omitempty"`
 }
 
 func parseVerdict(s string) (AuditVerdict, error) {
@@ -45,8 +48,11 @@ func EncodeAudit(a Audit) (string, error) {
 	}
 	w := auditWire{
 		Lens: a.Lens, Verdict: a.Verdict.String(), SHA: a.SHA,
-		Attempts: a.Attempts, Notes: a.Notes,
-		PostedBy: a.PostedBy, PostedAt: a.PostedAt.UTC().Truncate(time.Second),
+		Attempts: a.Attempts, Notes: a.Notes, PostedBy: a.PostedBy,
+	}
+	if !a.PostedAt.IsZero() {
+		at := a.PostedAt.UTC().Truncate(time.Second)
+		w.PostedAt = &at
 	}
 	blob, err := json.MarshalIndent(w, "", "  ")
 	if err != nil {
@@ -92,7 +98,10 @@ func ParseAudit(body string) (a Audit, ok bool, err error) {
 	}
 	a = Audit{
 		Lens: w.Lens, Verdict: v, SHA: w.SHA, Attempts: w.Attempts,
-		Notes: w.Notes, PostedBy: w.PostedBy, PostedAt: w.PostedAt,
+		Notes: w.Notes, PostedBy: w.PostedBy,
+	}
+	if w.PostedAt != nil {
+		a.PostedAt = *w.PostedAt
 	}
 	if err := a.Validate(); err != nil {
 		return Audit{}, true, err

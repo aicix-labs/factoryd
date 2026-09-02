@@ -15,6 +15,8 @@ func Factory() conformance.Factory {
 	return conformance.Factory{
 		Provider:   "gitlab",
 		FixtureDir: "testdata",
+		// The provider's own wording, taken from the recorded fixture.
+		UnmergeableMessage: "Branch cannot be merged",
 		New: func(hc *http.Client) (scm.Driver, error) {
 			return gitlab.New(gitlab.Config{
 				BaseURL: "https://gitlab.example.com/api/v4",

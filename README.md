@@ -170,6 +170,15 @@ writer silently discards the other'"'"'s changes — measured at 165 of 200 upda
 lost under contention — including a halt reason, which is the one field nobody
 can afford to lose.
 
+**Fixtures are recorded from live providers, not written from documentation.**
+A hand-written fixture describes what the API was believed to do, and a driver
+matching it exactly passes every test above it while being wrong about the
+provider — a check that can fail against the wrong reality. Recording found one
+immediately: GitLab answers a real conflict with 422 `Branch cannot be merged`,
+not the 405 the hand-written fixture claimed, so a conflict was being reported as
+a CI failure. Every fixture states its provenance, and the few that stay
+synthetic say why.
+
 **An audit that lists nothing tried is not a pass.** An adversarial pass with an
 empty `attempts` list is rejected at the type boundary, before it reaches the
 provider.
@@ -195,7 +204,9 @@ internal/scm/          Driver interface, typed results, audit wire format
   conformance/         the one suite both drivers must pass, plus its control test
   github/ gitlab/      the two drivers and their recorded fixtures
   httpfixture/         strict recorded-exchange replay (unrecorded request = failure,
-                       unused exchange = failure)
+                       unused exchange = failure), plus the recorder and its
+                       redaction
+cmd/fixturerec/        records fixtures from a live provider (dev tooling)
   httpjson/            the shared JSON-over-HTTP client
 internal/supervise/    one role loop, parameterised by role: block, run one
                        turn, re-arm; the spin guard and the halt sentinel

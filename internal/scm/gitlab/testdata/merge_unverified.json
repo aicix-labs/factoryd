@@ -1,4 +1,8 @@
 {
+  "source": {
+    "recorded": false,
+    "note": "synthetic: requires a provider to report a merge commit that is not an ancestor of the target branch. Cannot be provoked; the case exists because the API is not the authority on what landed."
+  },
   "exchanges": [
     {
       "method": "GET",

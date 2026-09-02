@@ -44,9 +44,30 @@ type Exchange struct {
 	RequestBodyContains []string `json:"request_body_contains,omitempty"`
 }
 
+// Source records where a bundle came from.
+//
+// It is required. A fixture with no stated provenance is the dangerous case:
+// the suite tests the driver against whatever the fixture says, so a
+// hand-written one that misdescribes the provider produces a driver that
+// matches a fiction and passes every test above it. That failure is invisible
+// unless the fixture says which it is.
+type Source struct {
+	// Recorded is true only for exchanges captured from a live provider.
+	Recorded bool `json:"recorded"`
+	// Provider and ProviderVersion identify what was recorded against, so a
+	// fixture can be re-recorded when a provider changes.
+	Provider        string `json:"provider,omitempty"`
+	ProviderVersion string `json:"provider_version,omitempty"`
+	RecordedAt      string `json:"recorded_at,omitempty"`
+	// Note is required when Recorded is false: say why this cannot be
+	// recorded, so "hand-written" is a decision rather than an omission.
+	Note string `json:"note,omitempty"`
+}
+
 // Bundle is an ordered set of exchanges for one scenario.
 type Bundle struct {
 	Name      string     `json:"name"`
+	Source    *Source    `json:"source"`
 	Exchanges []Exchange `json:"exchanges"`
 }
 
@@ -65,6 +86,15 @@ func Load(dir, name string) (*Bundle, error) {
 	}
 	if len(b.Exchanges) == 0 {
 		return nil, fmt.Errorf("%s: bundle has no exchanges; an empty fixture asserts nothing", p)
+	}
+	if b.Source == nil {
+		return nil, fmt.Errorf("%s: bundle has no source; every fixture must say whether it was recorded from a live provider or written by hand", p)
+	}
+	if !b.Source.Recorded && b.Source.Note == "" {
+		return nil, fmt.Errorf("%s: bundle is hand-written but gives no reason; say why it cannot be recorded", p)
+	}
+	if b.Source.Recorded && b.Source.Provider == "" {
+		return nil, fmt.Errorf("%s: bundle claims to be recorded but names no provider", p)
 	}
 	for i, e := range b.Exchanges {
 		if e.Method == "" || e.Path == "" || e.Status == 0 {
