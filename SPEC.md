@@ -29,7 +29,24 @@ operation, not theorised:
 | 9 | Handoff state spread across 8 ad-hoc files | no schema | §6 one typed, versioned state document |
 | 10 | Producer could not commit at all under its sandbox | `.git` is read-only in `workspace-write` | §4.4 sandbox-aware submit |
 
-**Design rule derived from all ten:** *a check that cannot fail is not a check.* Before
+### Found since, and load-bearing for the same reason
+
+Later observations, from continued operation of v1 and from building v2. Kept
+separate because the table above is one day’s evidence and should stay that way,
+but these carry the same weight.
+
+| # | Failure | Root cause | v2 requirement |
+|---|---|---|---|
+| 11 | The producer’s `git push` went out under the **reviewer’s** credential | `fetch`/`push` ignore the API token and consult the ambient credential helper; the first matching entry won | §4.4 the producer credential governs the git transport |
+| 12 | `doctor` reported healthy while the git and API identities disagreed | only the API identity was ever resolved | §4.1 verify the git transport identity |
+| 13 | A missing cache directory was reported as `gate FAILED`, exit 5 | a build that cannot write and a build that found a defect both exit non-zero | §9.6 environmental failure is not a red gate |
+| 14 | A real GitLab merge conflict was reported as a CI failure | the fixture was hand-written from documentation and said 405; the provider answers 422 | §9.7 fixtures are recorded, not written |
+
+Item 11 failed closed only because the reviewer credential happened to lack
+repository write scope. With it, the push would have succeeded as the wrong
+identity and nothing would have said so.
+
+**Design rule derived from all of them:** *a check that cannot fail is not a check.* Before
 trusting any green signal, state what would have to break for it to go red. If you
 cannot, it is decoration. This rule is normative throughout this spec.
 
@@ -101,9 +118,19 @@ factoryd doctor                # verify a factory's config, credentials, paths, 
 ```
 
 `doctor` is not optional. It must verify: config parses; both credentials
-authenticate; **producer and reviewer resolve to different identities**; declared
-paths exist and are writable; the target repo is reachable; the workdir is a clone,
-not a worktree (§4.4). It exits non-zero on any failure and names which.
+authenticate; **producer and reviewer resolve to different identities**; **the
+identity `git` itself would present for the remote is the producer's** (§4.4);
+declared paths exist and are writable; **every directory the gate command
+references exists and is writable by the identity that will run it** (§9.6); the
+target repo is reachable; the workdir is a clone, not a worktree (§4.4). It exits
+non-zero on any failure and names which.
+
+The git-transport check is separate from the API one because the two identities
+are resolved by different mechanisms — one from an explicit header, the other
+from whatever the ambient credential helper returns first — and they can
+disagree. Observed in production: they did, and every API-level check still
+reported healthy. "Could not determine" fails, on the same standard as
+distinctness: undecided is not satisfied.
 
 ### 4.2 Supervisor
 
@@ -153,14 +180,39 @@ Submit is also **the gate**. In order:
 
 1. resolve the **producer** credential; **fail closed** — never fall back to the
    reviewer's. Refuse if the two resolve to the same identity, naming it.
+   This governs **both the API and the git transport** — see below.
 2. materialize: create branch from target, stage, commit
-3. run the configured gate command (build/vet/test). If red: write a question
+3. re-check the gate's declared paths (§9.6). A missing one exits **3**, not 5:
+   a misconfigured host is not a red branch.
+4. run the configured gate command (build/vet/test). If red: write a question
    (§6.2), signal, **do not push**
-4. push, create-or-update the Draft PR/MR
-5. signal the reviewer
+5. push, create-or-update the Draft PR/MR
+6. signal the reviewer
 
 Exit codes are part of the contract: `0` submitted · `4` nothing to submit ·
 `5` gate failed · `3` configuration/identity failure.
+
+**The producer credential governs the git transport, not only the API.** This is
+stated separately because it is the half an implementer will miss: `fetch` and
+`push` do not take the token you pass to the API. Left alone, git consults the
+ambient credential helper, and the first matching entry wins whoever it belongs
+to.
+
+Observed in production, 2026-09-01: the first entry in the host's
+`~/.git-credentials` was the **reviewer's**, so the producer's push went out
+under it. It failed closed only because that credential happened to lack
+repository write scope. Had it carried write, the push would have **succeeded as
+the reviewer** and nothing would have said so — a successful push looks identical
+either way — breaking two-party trust at the git layer while every API-level
+check still passed.
+
+Therefore, for every git operation including `fetch`:
+
+- clear inherited credential helpers and supply the producer credential
+  explicitly;
+- **not through argv.** `/proc/<pid>/cmdline` is world-readable, so a token on a
+  command line is readable by anything on the host. Use a `0600` file the process
+  owns and removes, or stdin — never a remote URL with the credential embedded.
 
 **The workdir must be a clone, not a git worktree.** A worktree keeps its refs in the
 parent repository, outside the sandbox, so the producer cannot write them. `doctor`
@@ -346,6 +398,24 @@ catches things:
 5. **Match command position, not the mention.** Guards that grep for a string fire on
    comments, on string literals, and on their own fixtures. Parse, or anchor.
 
+6. **An environmental failure must not present as a failed check.** A gate whose
+   build cannot write its cache directory exits non-zero exactly like a gate that
+   found a real defect, and submit cannot tell them apart afterwards — so the
+   discrimination has to happen *before* the gate runs. Observed in production: a
+   missing directory was reported as `gate FAILED`, exit 5, and the producer would
+   have been sent a `changes-requested` for someone else’s mistake. The cost is
+   not the wasted cycle. A gate that cries red for environmental reasons trains the
+   operator to disbelieve red gates, and the whole value of refusing to push on red
+   depends on red meaning what it says.
+7. **A fixture is evidence only if it came from the thing it describes.** A fixture
+   written from documentation records what the API was *believed* to do. A driver
+   matching it exactly passes every test above it while being wrong about the
+   provider — a check that can fail against the wrong reality, which is harder to
+   notice than one that cannot fail, because everything looks like it is working.
+   Record fixtures from a live provider, error shapes first; state the provenance
+   of every one; and when a case genuinely cannot be provoked, say why in the
+   fixture itself.
+
 ---
 
 ## 10. Non-goals
@@ -370,7 +440,8 @@ contract so the two are swappable one verb at a time.
    with a known v1 bug.
 3. **State document + `doctor`.**
 4. **Supervisor** (both roles, one implementation) with spin/abort and progress.
-5. **Submit** with the gate, identity check, and sandbox-aware materialization.
+5. **Submit** with the gate, identity check — API *and* git transport (§4.4) —
+   and sandbox-aware materialization.
 6. **Health, alerts, resource guards.**
 7. **Status page.**
 
@@ -380,5 +451,5 @@ v2 is done when, for one real factory: an operator drops a brief; a sandboxed pr
 with no network and no git writes produces a change; submit gates and opens it; a
 reviewer of a *different identity* reviews, runs an adversarial pass on an
 escalate-class path, and merges; the merge is verified by ancestry; **and every one of
-the ten failures in §1 is either impossible by construction or caught by a test that
-has been shown to fail.**
+the failures in §1 is either impossible by construction or caught by a test that has
+been shown to fail.**
