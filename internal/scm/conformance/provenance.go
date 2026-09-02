@@ -74,3 +74,33 @@ func ReadProvenance(dir string) (Provenance, error) {
 	sort.Strings(p.Recorded)
 	return p, nil
 }
+
+// ScanForSecrets reads every fixture in dir and reports anything that looks
+// like a credential.
+//
+// The recorder already refuses to write a leak, but only against the values
+// that run registered. This scans what is actually committed, with no list at
+// all, so a fixture added by hand -- or recorded before the guard existed -- is
+// still checked. A backstop that only runs at the moment of writing is not a
+// backstop.
+func ScanForSecrets(dir string) ([]string, error) {
+	entries, err := os.ReadDir(dir)
+	if err != nil {
+		return nil, err
+	}
+	var problems []string
+	for _, e := range entries {
+		if e.IsDir() || !strings.HasSuffix(e.Name(), ".json") {
+			continue
+		}
+		raw, err := os.ReadFile(filepath.Join(dir, e.Name()))
+		if err != nil {
+			return nil, err
+		}
+		for _, f := range httpfixture.Leaks(string(raw), nil) {
+			problems = append(problems, fmt.Sprintf("%s: %s", e.Name(), f))
+		}
+	}
+	sort.Strings(problems)
+	return problems, nil
+}

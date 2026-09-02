@@ -82,12 +82,67 @@ func TestLeakDetection(t *testing.T) {
 	if got := httpfixture.Leaks(`{"ok":true}`, secrets); len(got) != 0 {
 		t.Fatalf("Leaks reported %v on clean text", got)
 	}
-	got := httpfixture.Leaks(`{"auth":"`+liveToken+`"}`, secrets)
-	if len(got) != 1 || got[0] != liveToken {
-		t.Fatalf("Leaks returned %v, want the token", got)
+	if got := httpfixture.Leaks(`{"auth":"`+liveToken+`"}`, secrets); len(got) == 0 {
+		t.Fatal("Leaks missed a registered secret")
 	}
 	if err := httpfixture.MustNotLeak(`{"h":"`+liveHost+`"}`, secrets); err == nil {
 		t.Fatal("MustNotLeak passed text containing a secret")
+	}
+	// A hostname is not a credential, so naming it outright is the point.
+	if err := httpfixture.MustNotLeak(`{"h":"`+liveHost+`"}`, secrets); !strings.Contains(err.Error(), liveHost) {
+		t.Fatalf("the error does not name the leaked host: %v", err)
+	}
+}
+
+// The case the guard exists for: a secret the caller did not register.
+//
+// Comparing only against registered values makes this a check that cannot fail
+// in exactly the situation a human gets wrong -- forgetting to register a
+// token, or registering the wrong one.
+func TestUnregisteredCredentialIsCaught(t *testing.T) {
+	payloads := map[string]string{
+		"gitlab pat":     `{"token":"glpat-AAAAAAAAAAAAAAAAAAAA"}`,
+		"github classic": `{"token":"ghp_AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA"}`,
+		"github fine":    `{"token":"github_pat_11ABCDEFG0abcdefghijklmnop"}`,
+		"bearer header":  `{"h":"Bearer eyJhbGciOiJIUzI1NiIsInR5cCI6IkpXVCJ9"}`,
+		"basic header":   `{"h":"Basic ZmFjdG9yeWQ6bm90LWEtcmVhbC1wYXNzd29yZA=="}`,
+	}
+	for name, body := range payloads {
+		t.Run(name, func(t *testing.T) {
+			// No registered values at all, and a wrong one, must both refuse.
+			for _, values := range [][]string{nil, {"something-else"}} {
+				err := httpfixture.MustNotLeak(body, values)
+				if err == nil {
+					t.Fatalf("a credential-shaped string passed with values=%v", values)
+				}
+				// The report must not repeat the credential in full: it goes to
+				// a terminal and, in time, to CI output.
+				for _, tok := range strings.Fields(strings.NewReplacer(`"`, " ", "{", " ", "}", " ", ":", " ").Replace(body)) {
+					if len(tok) > 20 && strings.Contains(err.Error(), tok) {
+						t.Fatalf("the error repeats the credential in full: %v", err)
+					}
+				}
+			}
+		})
+	}
+}
+
+// The control the backstop needs. A pattern that fired on ordinary fixture
+// content would be removed within a week, so it must be shown not to.
+func TestBenignContentIsNotFlagged(t *testing.T) {
+	benign := map[string]string{
+		"a commit sha":     `{"sha":"9f3c1a77bb2e4d5061f0a8c3e2b1d9a4f7c6e5b0"}`,
+		"a placeholder":    `{"sha":"` + strings.Repeat("a", 40) + `"}`,
+		"a gravatar hash":  `{"avatar_url":"https://secure.gravatar.com/avatar/ecc0f2b48d0d4f6b8b0e6a2d1c3f5a7b"}`,
+		"a branch name":    `{"ref":"producer/fix-thing"}`,
+		"prose mentioning": `{"note":"set a ghp_ token in the environment"}`,
+		"a base64 body":    `{"content":"cGFja2FnZSBnYXRlCg=="}`,
+		"an ordinary body": `{"message":"Branch cannot be merged"}`,
+	}
+	for name, body := range benign {
+		if got := httpfixture.Leaks(body, nil); len(got) != 0 {
+			t.Errorf("%s was flagged as a credential: %v", name, got)
+		}
 	}
 }
 
@@ -243,6 +298,32 @@ func TestRecorderRefusesToWriteASecret(t *testing.T) {
 		t.Fatalf("the error does not name the leaked value: %v", err)
 	}
 	if _, statErr := os.Stat(filepath.Join(dir, "whoami.json")); statErr == nil {
+		t.Fatal("the fixture was written anyway")
+	}
+}
+
+// End to end for the case issue #9 named: the operator registered nothing, and
+// a credential came back in a response body anyway.
+func TestWriteRefusesAnUnregisteredCredential(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		_, _ = w.Write([]byte(`{"runners_token":"glpat-AAAAAAAAAAAAAAAAAAAA"}`))
+	}))
+	defer srv.Close()
+
+	// Secrets deliberately empty.
+	rec := httpfixture.NewRecorder(httpfixture.NewRedactor(), nil)
+	resp, err := rec.Client().Get(srv.URL + "/x")
+	if err != nil {
+		t.Fatal(err)
+	}
+	_ = resp.Body.Close()
+
+	dir := t.TempDir()
+	err = rec.Write(dir, "probe", httpfixture.Source{Recorded: true, Provider: "gitlab"})
+	if err == nil {
+		t.Fatal("Write committed a fixture containing an unregistered credential")
+	}
+	if _, statErr := os.Stat(filepath.Join(dir, "probe.json")); statErr == nil {
 		t.Fatal("the fixture was written anyway")
 	}
 }

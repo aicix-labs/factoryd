@@ -96,8 +96,20 @@ where a hand-authored body is most likely to be wrong.
 
 Redaction rewrites unmapped identifiers too, deterministically. A redactor that
 only rewrites what it was told about leaks whatever it was not told about, and
-the fixture still looks fine. `Write` refuses to emit a fixture containing a
-declared secret.
+the fixture still looks fine.
+
+The leak guard works the same way, and for the same reason. `Write` refuses to
+emit a fixture containing a value the run registered as a secret **or** anything
+matching a known credential shape — `glpat-`, `ghp_`, `github_pat_`, a long
+`Bearer`. Registered values alone would make it a check that cannot fail in
+exactly the case it exists for: a token nobody thought to register.
+`TestNoSecretsInFixtures` applies the same scan to what is already committed,
+with no list at all, because a guard that only runs at the moment of writing
+does not cover a fixture added by hand.
+
+If you extend the shape list, pair it with a benign control. A pattern that
+fires on ordinary content — a 40-hex commit id, a base64 blob — gets deleted
+within a week, and then the backstop is gone.
 
 ## Merge results
 
