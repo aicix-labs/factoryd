@@ -133,8 +133,9 @@ and found nothing to do.
 - declared paths exist and are writable; every path in
   `gate.required_writable_paths` is a writable directory **or is absent with a
   writable nearest existing ancestor**, since submit creates it (§4.4);
-- every name in `gate.inherit_env` is set in the environment `doctor` is running
-  in (§4.4);
+- `gate.env` declares `PATH`, and every `${VAR}` referenced by a declared path
+  is set in it — `doctor` resolves those paths against the same fully-declared
+  environment `submit` will give the gate, not against its own (§4.4);
 - the target repo is reachable;
 - the workdir is a clone, not a worktree (§4.4).
 
@@ -231,8 +232,12 @@ credential supplied explicitly, and never through argv.
 ```json
 "gate": {
   "command": ["bash", "-c", "go build ./... && go test ./..."],
-  "env": {"GOCACHE": "/var/cache/factoryd/widgets/go", "GOFLAGS": "-count=1"},
-  "inherit_env": ["PATH", "HOME"],
+  "env": {
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "HOME": "/var/lib/factoryd/widgets",
+    "GOCACHE": "/var/cache/factoryd/widgets/go",
+    "GOFLAGS": "-count=1"
+  },
   "required_writable_paths": ["${GOCACHE}", "build/artifacts"],
   "timeout_seconds": 900
 }
@@ -245,22 +250,28 @@ guess presented as a check: it would miss paths that matter and invent ones that
 do not, and a check that is sometimes wrong about what it verified is worse than
 no check, because it is believed.
 
-**The gate's environment is constructed, not inherited.** It has to be, or
-`${GOCACHE}` means one thing when `doctor` reads it and another when `submit`
-runs — two checks of two different paths, both reporting on the third. The gate
-environment is, in order:
+**The gate's environment is declared in full, and nothing is inherited.** The
+gate environment is exactly the `FACTORYD_*` variables submit sets, plus
+`gate.env`. There is no allowlist and no pass-through. `PATH` is required in
+`gate.env`; a gate with no `PATH` cannot run anything, and inheriting one would
+reintroduce the whole problem.
 
-1. the `FACTORYD_*` variables submit sets;
-2. the variables named in `gate.inherit_env`, taken from the supervisor's
-   environment — **an allowlist, so nothing arrives unnoticed**; a name in the
-   list that is unset in the supervisor's environment is an error, not an
-   omission;
-3. `gate.env`, which wins over both.
+An earlier draft allowed an `inherit_env` allowlist, on the reasoning that
+naming the variables made them accountable. It does not. `doctor` is run from a
+terminal and `submit` runs as a service; even with identical *names* the
+**values** differ — a different `PATH`, a different `HOME`, a proxy set in one
+and not the other. `doctor` would go green having resolved `${GOCACHE}` against
+an environment `submit` never sees. Naming a variable does not make its value
+the same in two processes, and no check inside `doctor` can establish that it is.
 
-Nothing else is passed through. Anything the gate needs is named by the
-operator, which is what makes the environment the same in `doctor` and in
-`submit`: both compute it from the same configuration rather than reading
-whatever the process happened to be started with.
+This is the "same environment" corollary of §5.4: the environment has to be
+*owned*, not agreed upon. Declared in full, both commands compute the identical
+environment from the identical file, and the question of whose process it came
+from does not arise.
+
+Submit records the resolved paths — after `${VAR}` expansion — in the state
+document, so what was checked and what actually ran can be compared afterwards
+rather than assumed equal.
 
 Resolution rules, so the field means one thing:
 
@@ -447,6 +458,23 @@ must run with inherited credential sources suppressed:
   `IdentityFile`. An agent holding the reviewer's key is the same failure as a
   credential helper holding the reviewer's token.
 
+**The invariant.** *A verification is valid only for an operation it shares an
+environment with, and only while nothing can change that environment in
+between.*
+
+Everything below is an instance of it, and so was every gap found reviewing this
+section: the credential was pinned but not the target, the token was pinned but
+not the username, the path was pinned but not the environment it resolved in.
+Each time, the check verified the thing next to the thing that actually decided.
+Two corollaries do the work:
+
+- **Same environment.** The environment must be fully owned by factoryd, so that
+  "the environment `doctor` saw" and "the environment `submit` used" are the
+  same object rather than two processes' ambient state that happen to agree.
+- **No window.** A check that ran earlier vouches for nothing if what it checked
+  can change afterwards. Where the gap cannot be closed, the check moves next to
+  the operation.
+
 **Pinning the credential is not enough; the target must be pinned too.** A
 correct `remote` proves nothing on its own. `url.<base>.insteadOf` and
 `pushInsteadOf` rewrite it, `core.sshCommand` and `GIT_SSH_COMMAND` replace the
@@ -458,12 +486,30 @@ So the git environment is isolated to the same standard as the credential:
 
 - `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` point at `/dev/null`; only
   configuration submit sets explicitly applies.
+- **The repository's own `.git/config` is not covered by that**, and it is the
+  one an attacker or a confused agent can actually reach: the producer has write
+  access to its workdir by definition, so it can add a `credential.helper` or a
+  `url.*.insteadOf` to the very repository submit is about to push from. Git has
+  no switch to ignore local configuration, so both halves are needed:
+  - what **can** be overridden is: `-c credential.helper=` to clear the
+    inherited list before appending submit's own, and an explicit
+    `-c core.sshCommand`. A `-c` override beats the local file.
+  - what **cannot** be enumerated is refused: if the workdir's `.git/config`
+    declares any of `credential.helper`, `url.*.insteadOf`,
+    `url.*.pushInsteadOf`, `core.sshCommand`, `include.path` or `includeIf.*`,
+    submit **refuses** rather than trying to neutralise it. There is no complete
+    list of `url.<base>.insteadOf` keys to override, and a producer that wrote
+    one is a signal in its own right, not a condition to work around.
 - Inherited `GIT_*` variables are dropped, not merged. `GIT_TERMINAL_PROMPT=0`
   and an inert `GIT_ASKPASS`, so a missing credential fails rather than waiting
   for a human who is not there.
 - The transport is set explicitly, never inherited.
 
-And the effective target is checked, not the configured one:
+And the effective target is checked, not the configured one — **inside the
+transport, immediately before every fetch and every push**, not once as a
+`doctor` preflight. This is the "no window" corollary: `doctor` runs before the
+producer's turn, and the producer can edit `.git/config` during it. A preflight
+answer about the target is stale by the time the push happens.
 
 - **the URL git will actually use** — `git remote get-url` and
   `git remote get-url --push`, both after rewriting — must equal the configured
@@ -630,8 +676,10 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §5.4 config isolation | a global or system git config that would redirect or re-credential is **not** in force during any git operation | the explicit configuration submit sets *is* in force |
 | §5.4 remote vs project | `git.remote` addresses a different repository than the provider block names → refuse | matching remote and provider block passes |
 | §5.3 `GitCredential` | either driver returns a username its provider will not accept | **both** drivers exercised, each asserting its own convention |
-| §4.4 gate env | a name in `inherit_env` is unset in the supervisor's environment → refuse | a set name resolves and passes |
-| §4.4 gate env agreement | `doctor` and `submit` resolve a `${VAR}` path to different values | both resolve it to the same path from the same config |
+| §4.4 gate env is owned | any variable reaches the gate that `gate.env` did not declare, or `gate.env` omits `PATH` | the declared environment reaches the gate intact |
+| §4.4 gate env agreement | `doctor` and `submit` resolve a `${VAR}` path to different values — including when run from **different processes with different ambient environments**, which is the case that made an allowlist unworkable | both resolve it to the same path from the same config |
+| §5.4 local git config | the workdir's `.git/config` declares `credential.helper`, `url.*.insteadOf`, `pushInsteadOf`, `core.sshCommand`, `include.path` or `includeIf.*` → refuse | a clean `.git/config` passes |
+| §5.4 rewrite added mid-turn | a rewrite is added to `.git/config` **after** `doctor` passed and before the push — the per-operation check must catch what the preflight could not | the same push succeeds with no rewrite added |
 | §4.4 gate paths | a declared path exists as a non-directory, or cannot be created → exit **3** | a genuinely red gate still exits **5**, and an absent-but-creatable path is created and passes |
 | §4.4 unset `${VAR}` | a referenced variable is unset → refuse | a set variable resolves and passes |
 | §4.1 doctor covers the above | each condition above, reached through `doctor` rather than only through unit tests | a healthy factory passes every check |
