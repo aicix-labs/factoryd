@@ -17,6 +17,7 @@ func Factory() conformance.Factory {
 		Provider:   "github",
 		FixtureDir: "testdata",
 		// The provider's own wording, taken from the recorded fixture.
+		GitUsername:        "x-access-token",
 		UnmergeableMessage: "Pull Request has merge conflicts",
 		New: func(hc *http.Client) (scm.Driver, error) {
 			return github.New(github.Config{

@@ -9,8 +9,11 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/url"
 	"os"
 	"path/filepath"
+	"regexp"
+	"sort"
 	"strings"
 )
 
@@ -19,7 +22,12 @@ import (
 // Bumped to 2 when the supervisor arrived: a factory now has to say what command
 // each role runs, and there is no defensible default for that. An older config
 // is refused by version rather than started with a role that does nothing.
-const SchemaVersion = 2
+//
+// Bumped to 3 for submit (SPEC.md §4.4, §5.4): the git transport, the
+// factoryd-owned submit repository, the fully declared gate environment, and
+// the producer's separate identity are all required and none has a default
+// that would be safe to assume.
+const SchemaVersion = 3
 
 // Config is one factory.
 type Config struct {
@@ -30,10 +38,14 @@ type Config struct {
 	GitHub   *GitHub `json:"github,omitempty"`
 	GitLab   *GitLab `json:"gitlab,omitempty"`
 	// TargetBranch is the branch changes are merged into.
-	TargetBranch string      `json:"target_branch"`
-	Paths        Paths       `json:"paths"`
-	Credentials  Credentials `json:"credentials"`
-	Gate         Gate        `json:"gate"`
+	TargetBranch string `json:"target_branch"`
+	// Git is the transport submit pushes through (§5.4). Declared, not
+	// discovered: a transport that inferred its remote from a workdir would
+	// verify one thing and push to another.
+	Git         Git         `json:"git"`
+	Paths       Paths       `json:"paths"`
+	Credentials Credentials `json:"credentials"`
+	Gate        Gate        `json:"gate"`
 	// Roles are the two agent turns. Each is one command that reads its
 	// trigger, does one unit of work, and exits. Neither polls or loops -- the
 	// supervisor owns all continuity.
@@ -68,10 +80,31 @@ type GitLab struct {
 type Paths struct {
 	// Root holds state.json, inbox/ and outbox/.
 	Root string `json:"root"`
-	// ProducerWorkdir is the clone the producer edits. It must be a clone,
-	// not a git worktree: a worktree keeps its refs in the parent repository,
-	// outside the producer's sandbox, so the producer cannot write them.
+	// ProducerWorkdir is where the producer edits source. Its .git, if any, is
+	// ignored entirely: git never runs in a directory the producer can write.
 	ProducerWorkdir string `json:"producer_workdir"`
+	// SubmitRepo is the factoryd-owned clone every git command runs in. The
+	// producer must not be able to write it; doctor proves that by probe, as
+	// the producer, rather than assuming it (§4.4).
+	SubmitRepo string `json:"submit_repo"`
+}
+
+// Git configures the transport (SPEC.md §5.4).
+type Git struct {
+	// Remote is the URL git will be given explicitly for every fetch and
+	// push. It must address the same project the provider block names.
+	Remote string `json:"remote"`
+	// Transport is https or ssh. Only https is implemented in this build;
+	// ssh is refused at load rather than silently falling back.
+	Transport string `json:"transport"`
+	// SSHKeyFile and KnownHostsFile are required for ssh and ignored otherwise.
+	SSHKeyFile     string `json:"ssh_key_file,omitempty"`
+	KnownHostsFile string `json:"known_hosts_file,omitempty"`
+	// Proxy and CAFile are the ONLY way a proxy or an alternative trust store
+	// reaches the transport. Empty means a direct connection and the system
+	// store; nothing ambient can widen either.
+	Proxy  string `json:"proxy,omitempty"`
+	CAFile string `json:"ca_file,omitempty"`
 }
 
 // Credentials are the two role credentials. They must resolve to different
@@ -146,6 +179,19 @@ type RoleSpec struct {
 	// Workdir overrides where the turn runs. Defaults to the producer workdir
 	// for the producer and to paths.root for the reviewer.
 	Workdir string `json:"workdir,omitempty"`
+	// RunAs is the OS identity the turn runs under. Required for the
+	// producer: it is the principal the submit repository must be unwritable
+	// by, and doctor's write probe runs as it. factoryd needs the privilege to
+	// switch to it (root or CAP_SETUID); doctor fails if it does not have it,
+	// because a separation that cannot be enforced must not be recorded as
+	// enforced.
+	RunAs *RunAs `json:"run_as,omitempty"`
+}
+
+// RunAs names an OS user by name, resolved at doctor time so a deleted user
+// fails loudly rather than as a numeric id nobody recognises.
+type RunAs struct {
+	User string `json:"user"`
 }
 
 // Supervisor tunes the spin guard and the watcher.
@@ -189,6 +235,18 @@ const (
 type Gate struct {
 	// Command is argv, run without a shell unless argv[0] is a shell.
 	Command []string `json:"command"`
+	// Env is the gate's WHOLE environment beyond the FACTORYD_* variables.
+	// Nothing is inherited: doctor from a terminal and submit as a service
+	// would otherwise resolve the same ${VAR} to different paths. PATH is
+	// required, because a gate with no PATH runs nothing and inheriting one
+	// reintroduces the whole problem.
+	Env map[string]string `json:"env"`
+	// RequiredWritablePaths are directories the gate writes to, declared
+	// because they cannot be discovered from an opaque argv. Relative paths
+	// resolve against the gate workdir; ${VAR} expands from Env, and an unset
+	// variable is an error, not an empty expansion. Submit creates any that
+	// are absent.
+	RequiredWritablePaths []string `json:"required_writable_paths"`
 	// TimeoutSeconds bounds the gate. Zero means the default.
 	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
 }
@@ -324,6 +382,46 @@ func (c *Config) Validate() error {
 	}
 	if c.Paths.ProducerWorkdir == "" {
 		add("paths.producer_workdir is empty")
+	}
+	if c.Paths.SubmitRepo == "" {
+		add("paths.submit_repo is empty; git must run in a repository the producer cannot write")
+	}
+	if c.Paths.SubmitRepo != "" && c.Paths.SubmitRepo == c.Paths.ProducerWorkdir {
+		add("paths.submit_repo is the producer workdir; the two-directory boundary requires them to differ")
+	}
+
+	switch c.Git.Transport {
+	case "https":
+	case "ssh":
+		// Refused rather than degraded. A config asking for ssh and getting
+		// https would push over a transport it did not ask for.
+		add("git.transport ssh is not implemented in this build; use https")
+	case "":
+		add("git.transport is empty; expected https")
+	default:
+		add("git.transport %q is not https or ssh", c.Git.Transport)
+	}
+	if c.Git.Remote == "" {
+		add("git.remote is empty; the transport target is declared, not discovered")
+	} else if err := c.remoteMatchesProject(); err != nil {
+		add("%v", err)
+	}
+
+	if c.Roles.Producer.RunAs == nil || c.Roles.Producer.RunAs.User == "" {
+		add("roles.producer.run_as.user is empty; the producer must run as a principal the submit repository is unwritable by")
+	}
+
+	if _, ok := c.Gate.Env["PATH"]; !ok {
+		add("gate.env has no PATH; a gate with no PATH runs nothing, and inheriting one is what this field exists to prevent")
+	}
+	for _, p := range c.Gate.RequiredWritablePaths {
+		if p == "" {
+			add("gate.required_writable_paths contains an empty entry")
+			continue
+		}
+		if _, err := c.ResolveGatePath(p); err != nil {
+			add("gate.required_writable_paths: %v", err)
+		}
 	}
 
 	for role, ref := range map[string]CredentialRef{
@@ -463,3 +561,95 @@ func (c *Config) TurnWorkdir(role string) string {
 	}
 	return c.Paths.Root
 }
+
+// remoteMatchesProject checks that git.remote addresses the repository the
+// provider block names. A remote pointing at a different project is the right
+// account pushing to the wrong place, and no identity check would catch it.
+func (c *Config) remoteMatchesProject() error {
+	u, err := url.Parse(c.Git.Remote)
+	if err != nil {
+		return fmt.Errorf("git.remote %q does not parse: %w", c.Git.Remote, err)
+	}
+	if u.Scheme != "https" {
+		return fmt.Errorf("git.remote %q must be an https URL for the https transport", c.Git.Remote)
+	}
+	if u.User != nil {
+		return fmt.Errorf("git.remote carries credentials in the URL; the credential is supplied separately and never through a URL")
+	}
+	path := strings.TrimSuffix(strings.Trim(u.Path, "/"), ".git")
+
+	var want string
+	switch c.Provider {
+	case "github":
+		if c.GitHub != nil {
+			want = c.GitHub.Owner + "/" + c.GitHub.Repo
+		}
+	case "gitlab":
+		if c.GitLab != nil {
+			want = strings.Trim(c.GitLab.Project, "/")
+		}
+	}
+	if want != "" && !strings.EqualFold(path, want) {
+		return fmt.Errorf("git.remote addresses %q but the provider block names %q; the transport would push to a different repository than the one being reviewed", path, want)
+	}
+	return nil
+}
+
+// GateEnv is the gate's complete environment: FACTORYD_* first, then gate.env.
+// Nothing else. Built from configuration alone, so doctor and submit compute
+// the identical environment from the identical file.
+func (c *Config) GateEnv(factoryd map[string]string) []string {
+	keys := make([]string, 0, len(c.Gate.Env)+len(factoryd))
+	seen := map[string]bool{}
+	env := map[string]string{}
+	for k, v := range factoryd {
+		env[k] = v
+	}
+	for k, v := range c.Gate.Env {
+		env[k] = v // gate.env wins
+	}
+	for k := range env {
+		if !seen[k] {
+			seen[k] = true
+			keys = append(keys, k)
+		}
+	}
+	sort.Strings(keys)
+	out := make([]string, 0, len(keys))
+	for _, k := range keys {
+		out = append(out, k+"="+env[k])
+	}
+	return out
+}
+
+var gateVarRef = regexp.MustCompile(`\$\{([A-Za-z_][A-Za-z0-9_]*)\}`)
+
+// ResolveGatePath expands ${VAR} from gate.env and resolves a relative path
+// against the gate workdir. An unset variable is an error: expanding
+// ${GOCACHE}/x to /x would check a path the gate never touches and pass.
+func (c *Config) ResolveGatePath(p string) (string, error) {
+	var missing []string
+	expanded := gateVarRef.ReplaceAllStringFunc(p, func(m string) string {
+		name := gateVarRef.FindStringSubmatch(m)[1]
+		v, ok := c.Gate.Env[name]
+		if !ok {
+			missing = append(missing, name)
+			return m
+		}
+		return v
+	})
+	if len(missing) > 0 {
+		return "", fmt.Errorf("path %q references ${%s}, which gate.env does not set", p, strings.Join(missing, "}, ${"))
+	}
+	if strings.ContainsAny(expanded, "*?[") || strings.HasPrefix(expanded, "~") {
+		return "", fmt.Errorf("path %q: no globbing and no ~; write the path out", p)
+	}
+	if !filepath.IsAbs(expanded) {
+		expanded = filepath.Join(c.GateWorkdir(), expanded)
+	}
+	return filepath.Clean(expanded), nil
+}
+
+// GateWorkdir is where the gate runs: the submit repository, since that is
+// where the materialised change lives.
+func (c *Config) GateWorkdir() string { return c.Paths.SubmitRepo }

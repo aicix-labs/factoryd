@@ -128,6 +128,8 @@ func (f *fakeDriver) Comment(context.Context, ChangeID, string) error           
 func (f *fakeDriver) SetDraft(context.Context, ChangeID, bool) error             { panic("unused") }
 func (f *fakeDriver) PostAudit(context.Context, ChangeID, string, Audit) error   { panic("unused") }
 func (f *fakeDriver) Audits(context.Context, ChangeID, string) ([]Audit, error)  { panic("unused") }
+func (f *fakeDriver) WhoamiWith(context.Context, string) (Identity, error)       { panic("unused") }
+func (f *fakeDriver) GitCredential(string) GitCredential                         { panic("unused") }
 func (f *fakeDriver) Whoami(context.Context) (Identity, error)                   { panic("unused") }
 
 func TestMergeVerified(t *testing.T) {

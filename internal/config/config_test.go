@@ -10,19 +10,28 @@ import (
 )
 
 const good = `{
-  "schema_version": 2,
+  "schema_version": 3,
   "name": "widgets",
   "provider": "github",
   "github": {"owner": "acme", "repo": "widgets"},
   "target_branch": "main",
-  "paths": {"root": "/var/lib/factoryd/widgets", "producer_workdir": "/var/lib/factoryd/widgets/work"},
+  "git": {"remote": "https://github.com/acme/widgets.git", "transport": "https"},
+  "paths": {
+    "root": "/var/lib/factoryd/widgets",
+    "producer_workdir": "/var/lib/factoryd/widgets/work",
+    "submit_repo": "/var/lib/factoryd/widgets/submit"
+  },
   "credentials": {
     "producer": {"file": "/etc/factoryd/producer.token"},
     "reviewer": {"env": "FACTORYD_REVIEWER_TOKEN"}
   },
-  "gate": {"command": ["go", "test", "./..."]},
+  "gate": {
+    "command": ["go", "test", "./..."],
+    "env": {"PATH": "/usr/local/go/bin:/usr/bin:/bin", "HOME": "/var/lib/factoryd/widgets", "GOCACHE": "/var/cache/factoryd/go"},
+    "required_writable_paths": ["${GOCACHE}", "build/out"]
+  },
   "roles": {
-    "producer": {"command": ["claude", "-p", "producer-brief"]},
+    "producer": {"command": ["claude", "-p", "producer-brief"], "run_as": {"user": "factoryd-producer"}},
     "reviewer": {"command": ["claude", "-p", "reviewer-playbook"]}
   },
   "alerts": [{"kind": "file", "path": "/var/log/factoryd/alerts.log"}]
@@ -65,10 +74,10 @@ func TestUnknownKeyIsRefused(t *testing.T) {
 
 func TestValidationFailures(t *testing.T) {
 	cases := map[string]struct{ from, to, want string }{
-		"missing schema version":  {`"schema_version": 2,`, ``, "schema_version"},
-		"future schema version":   {`"schema_version": 2`, `"schema_version": 99`, "schema_version"},
-		"previous schema version": {`"schema_version": 2`, `"schema_version": 1`, "schema_version"},
-		"no producer turn":        {`"producer": {"command": ["claude", "-p", "producer-brief"]}`, `"producer": {"command": []}`, "roles.producer.command"},
+		"missing schema version":  {`"schema_version": 3,`, ``, "schema_version"},
+		"future schema version":   {`"schema_version": 3`, `"schema_version": 99`, "schema_version"},
+		"previous schema version": {`"schema_version": 3`, `"schema_version": 2`, "schema_version"},
+		"no producer turn":        {`"command": ["claude", "-p", "producer-brief"], `, `"command": [], `, "roles.producer.command"},
 		"warn at or above abort":  {`"gate":`, `"supervisor": {"spin_warn": 9, "spin_abort": 4}, "gate":`, "spin_warn"},
 		"negative fail abort":     {`"gate":`, `"supervisor": {"fail_abort": -1}, "gate":`, "fail_abort"},
 		"empty name":              {`"name": "widgets"`, `"name": ""`, "name"},
@@ -93,6 +102,53 @@ func TestValidationFailures(t *testing.T) {
 				t.Fatalf("error does not mention %q: %v", c.want, err)
 			}
 		})
+	}
+}
+
+func TestGatePathResolution(t *testing.T) {
+	c, err := config.Load(write(t, good))
+	if err != nil {
+		t.Fatal(err)
+	}
+	got, err := c.ResolveGatePath("${GOCACHE}")
+	if err != nil || got != "/var/cache/factoryd/go" {
+		t.Fatalf("ResolveGatePath(${GOCACHE}) = %q, %v", got, err)
+	}
+	// Relative paths resolve against the gate workdir -- the submit repo.
+	got, err = c.ResolveGatePath("build/out")
+	if err != nil || got != "/var/lib/factoryd/widgets/submit/build/out" {
+		t.Fatalf("ResolveGatePath(build/out) = %q, %v", got, err)
+	}
+	// An unset variable is an error, never an empty expansion.
+	if got, err := c.ResolveGatePath("${NOPE}/x"); err == nil {
+		t.Fatalf("an unset variable expanded to %q instead of failing", got)
+	}
+}
+
+// The gate environment is built from configuration alone. Whatever the process
+// was started with must not reach it.
+func TestGateEnvIsConstructedNotInherited(t *testing.T) {
+	c, err := config.Load(write(t, good))
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Setenv("https_proxy", "http://interceptor.example:3128")
+	t.Setenv("GOFLAGS", "-ambient")
+	env := c.GateEnv(map[string]string{"FACTORYD_ROLE": "producer"})
+	joined := strings.Join(env, "\n")
+	for _, leaked := range []string{"https_proxy", "GOFLAGS", "interceptor"} {
+		if strings.Contains(joined, leaked) {
+			t.Errorf("the ambient %s reached the gate environment:\n%s", leaked, joined)
+		}
+	}
+	for _, want := range []string{"PATH=/usr/local/go/bin:/usr/bin:/bin", "GOCACHE=/var/cache/factoryd/go", "FACTORYD_ROLE=producer"} {
+		if !strings.Contains(joined, want) {
+			t.Errorf("declared %s is missing from the gate environment:\n%s", want, joined)
+		}
+	}
+	// And it is deterministic, since two commands must agree on it.
+	if again := strings.Join(c.GateEnv(map[string]string{"FACTORYD_ROLE": "producer"}), "\n"); again != joined {
+		t.Fatal("GateEnv is not deterministic")
 	}
 }
 

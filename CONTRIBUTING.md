@@ -121,6 +121,28 @@ If you extend the shape list, pair it with a benign control. A pattern that
 fires on ordinary content — a 40-hex commit id, a base64 blob — gets deleted
 within a week, and then the backstop is gone.
 
+## The transport boundary
+
+Git runs only in `paths.submit_repo`, which the producer must not be able to
+write. Do not add a code path that runs git in the producer'"'"'s workdir, and do
+not "validate" the producer'"'"'s `.git` instead of ignoring it — that is a
+check-then-exec race, and it was the design once.
+
+The producer turn runs as `roles.producer.run_as.user`, by the same setuid
+mechanism `doctor`'"'"'s write probe uses, so what the probe verified is what the
+turn runs as. When factoryd cannot switch to that user, the turn **fails to
+start** — it must never start as factoryd instead.
+
+Every git invocation goes through `internal/gittransport`, which builds the
+environment from configuration and runs the guard (allowlist + effective URL)
+immediately before each fetch and push. If you add a git call, add it there. If
+you find yourself passing a credential on a command line, stop:
+`/proc/<pid>/cmdline` is world-readable.
+
+If you extend the local-config allowlist, the bar is "a clone cannot be a clone
+without it". `remote.<name>.url` is on it because a clone has one — and submit
+does not use it; pushes name the URL explicitly.
+
 ## Merge results
 
 `Driver.Merge` returns `ProviderMerge` — what the provider said. Only

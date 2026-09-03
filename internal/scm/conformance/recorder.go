@@ -112,6 +112,16 @@ func (r *recorder) Whoami(ctx context.Context) (scm.Identity, error) {
 	return r.inner.Whoami(ctx)
 }
 
+func (r *recorder) WhoamiWith(ctx context.Context, secret string) (scm.Identity, error) {
+	r.note("WhoamiWith")
+	return r.inner.WhoamiWith(ctx, secret)
+}
+
+func (r *recorder) GitCredential(secret string) scm.GitCredential {
+	r.note("GitCredential")
+	return r.inner.GitCredential(secret)
+}
+
 // interfaceVerbs is every method of scm.Driver, read from the interface itself.
 // Adding a method to Driver adds it here with no edit anywhere.
 func interfaceVerbs() []string {

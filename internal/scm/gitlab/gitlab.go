@@ -308,8 +308,31 @@ func (d *Driver) Pipeline(ctx context.Context, id scm.ChangeID) (scm.PipelineSta
 }
 
 func (d *Driver) Whoami(ctx context.Context) (scm.Identity, error) {
+	return d.whoami(ctx, d.c)
+}
+
+// WhoamiWith answers for a different secret through a client that shares
+// everything but the PRIVATE-TOKEN header.
+func (d *Driver) WhoamiWith(ctx context.Context, secret string) (scm.Identity, error) {
+	if secret == "" {
+		return scm.Identity{}, fmt.Errorf("gitlab whoami: empty secret; identity is undecided")
+	}
+	h := d.c.Header.Clone()
+	h.Set("PRIVATE-TOKEN", secret)
+	return d.whoami(ctx, &httpjson.Client{Base: d.c.Base, HTTP: d.c.HTTP, Header: h})
+}
+
+// GitCredential: GitLab's convention for a personal, project or group access
+// token over HTTPS is the literal username "oauth2" with the token as the
+// password. The host in the incident behind SPEC.md §1 item 11 had entries
+// under both "oauth2" and a bot username; this is the one that is documented.
+func (d *Driver) GitCredential(secret string) scm.GitCredential {
+	return scm.GitCredential{Username: "oauth2", Secret: secret}
+}
+
+func (d *Driver) whoami(ctx context.Context, c *httpjson.Client) (scm.Identity, error) {
 	var u glUser
-	if _, err := d.c.Do(ctx, http.MethodGet, "/user", nil, &u); err != nil {
+	if _, err := c.Do(ctx, http.MethodGet, "/user", nil, &u); err != nil {
 		return scm.Identity{}, fmt.Errorf("gitlab whoami: %w", err)
 	}
 	if u.ID == 0 || u.Username == "" {

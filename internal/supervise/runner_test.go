@@ -3,12 +3,14 @@ package supervise_test
 import (
 	"bytes"
 	"context"
+	"io"
 	"os"
 	"path/filepath"
 	"strings"
 	"testing"
 	"time"
 
+	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/supervise"
 	"github.com/aicix-labs/factoryd/internal/watch"
@@ -199,5 +201,33 @@ func TestExecRunnerRejectsAnUnrunnableTurn(t *testing.T) {
 	fx2.cfg.Roles.Reviewer = spec
 	if _, err := r2.Run(context.Background(), turn(fx2, 0), nil); err == nil {
 		t.Fatal("an empty command ran without error")
+	}
+}
+
+// A producer turn runs as its own OS identity, by the same mechanism doctor's
+// write probe uses. When factoryd cannot switch to that identity, the turn must
+// NOT start as factoryd instead -- that would be the two-party separation on
+// paper with nothing holding it up. It fails to start, and says why.
+func TestProducerTurnRefusesToStartAsTheWrongIdentity(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("root can switch to any user; this test needs an unprivileged process")
+	}
+	fx, _, _ := execFixture(t, []string{"true"}, 30)
+	fx.cfg.Roles.Producer.Command = []string{"true"}
+	fx.cfg.Roles.Producer.RunAs = &config.RunAs{User: "root"} // cannot switch to it unprivileged
+	r := &supervise.ExecRunner{Config: fx.cfg, Role: "producer", Stdout: io.Discard, Stderr: io.Discard}
+
+	res, err := r.Run(context.Background(), turn(fx, 0), nil)
+	if err == nil {
+		t.Fatalf("the producer turn started (exit %d) despite factoryd being unable to switch to its identity", res.ExitCode)
+	}
+	if !strings.Contains(err.Error(), "operation not permitted") && !strings.Contains(err.Error(), "run_as") {
+		t.Fatalf("the failure does not say why: %v", err)
+	}
+
+	// And a user that does not exist is named, not reduced to a number.
+	fx.cfg.Roles.Producer.RunAs = &config.RunAs{User: "no-such-factoryd-user"}
+	if _, err := r.Run(context.Background(), turn(fx, 0), nil); err == nil || !strings.Contains(err.Error(), "no-such-factoryd-user") {
+		t.Fatalf("a missing run_as user was not named: %v", err)
 	}
 }

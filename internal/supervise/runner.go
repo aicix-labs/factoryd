@@ -6,6 +6,8 @@ import (
 	"io"
 	"os"
 	"os/exec"
+	"os/user"
+	"strconv"
 	"strings"
 	"syscall"
 	"time"
@@ -56,6 +58,17 @@ func (r *ExecRunner) Run(ctx context.Context, t Turn, started func(proc.Ref)) (T
 	// takes its children too. A turn that spawns a build and times out would
 	// otherwise leave the build running and the next turn racing it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// The producer runs as its own OS identity -- the same mechanism doctor's
+	// write probe uses, so what the probe verified is what the turn runs as.
+	// Without the privilege to switch, the turn must not start as factoryd
+	// instead: that would be the separation on paper with nothing holding it.
+	if spec.RunAs != nil && spec.RunAs.User != "" {
+		cred, err := credentialFor(spec.RunAs.User)
+		if err != nil {
+			return TurnResult{ExitCode: -1}, fmt.Errorf("exec: %s turn: %w", r.Role, err)
+		}
+		cmd.SysProcAttr.Credential = cred
+	}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
 			return nil
@@ -130,4 +143,23 @@ func (r *ExecRunner) env(t Turn) []string {
 		"FACTORYD_TRIGGERS="+labels(t.Triggers),
 		"FACTORYD_TRIGGER_PATHS="+strings.Join(trigPaths, string(os.PathListSeparator)),
 	)
+}
+
+// credentialFor resolves an OS user to the credential the turn is started
+// with. Resolved at launch, not at load, so a user deleted since doctor ran
+// fails here by name.
+func credentialFor(name string) (*syscall.Credential, error) {
+	u, err := user.Lookup(name)
+	if err != nil {
+		return nil, fmt.Errorf("run_as user %q: %w", name, err)
+	}
+	uid, err := strconv.ParseUint(u.Uid, 10, 32)
+	if err != nil {
+		return nil, err
+	}
+	gid, err := strconv.ParseUint(u.Gid, 10, 32)
+	if err != nil {
+		return nil, err
+	}
+	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), NoSetGroups: true}, nil
 }

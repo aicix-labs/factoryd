@@ -295,8 +295,29 @@ func (d *Driver) Pipeline(ctx context.Context, id scm.ChangeID) (scm.PipelineSta
 }
 
 func (d *Driver) Whoami(ctx context.Context) (scm.Identity, error) {
+	return d.whoami(ctx, d.c)
+}
+
+// WhoamiWith answers for a different secret through a client that shares
+// everything but the Authorization header.
+func (d *Driver) WhoamiWith(ctx context.Context, secret string) (scm.Identity, error) {
+	if secret == "" {
+		return scm.Identity{}, fmt.Errorf("github whoami: empty secret; identity is undecided")
+	}
+	h := d.c.Header.Clone()
+	h.Set("Authorization", "Bearer "+secret)
+	return d.whoami(ctx, &httpjson.Client{Base: d.c.Base, HTTP: d.c.HTTP, Header: h})
+}
+
+// GitCredential: GitHub accepts any username with a token as the password;
+// x-access-token is the documented convention and is what GitHub Apps use.
+func (d *Driver) GitCredential(secret string) scm.GitCredential {
+	return scm.GitCredential{Username: "x-access-token", Secret: secret}
+}
+
+func (d *Driver) whoami(ctx context.Context, c *httpjson.Client) (scm.Identity, error) {
 	var u ghUser
-	if _, err := d.c.Do(ctx, http.MethodGet, "/user", nil, &u); err != nil {
+	if _, err := c.Do(ctx, http.MethodGet, "/user", nil, &u); err != nil {
 		return scm.Identity{}, fmt.Errorf("github whoami: %w", err)
 	}
 	if u.ID == 0 || u.Login == "" {

@@ -37,18 +37,51 @@ func builder(listErr error) doctor.DriverBuilder {
 	}
 }
 
+// fakeProber answers the boundary question from a table: which directories
+// the "producer" can write. Never touches privilege.
+type fakeProber struct {
+	writable map[string]bool
+	err      error
+}
+
+func (f fakeProber) Describe() string { return "fake-producer (uid 4242)" }
+func (f fakeProber) CanWrite(_ context.Context, dir string) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.writable[dir], nil
+}
+
+// healthyDeps wires fakes for a healthy factory: the producer can write its
+// workdir and not the submit repo, git pushes as the producer, the local
+// config is clean. Tests mutate what they need.
+func healthyDeps(cfg *config.Config, listErr error) doctor.Deps {
+	return doctor.Deps{
+		NewDriver: builder(listErr),
+		NewProber: func(*config.RunAs) (doctor.Prober, error) {
+			return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+		},
+		GitIdentity: func(_ context.Context, _ *config.Config, _ scm.Driver, secret string) (string, error) {
+			return secret, nil // the fake driver's login IS the token
+		},
+		GitGuard: func(*config.Config, scm.Driver, string) error { return nil },
+	}
+}
+
 // fixture writes a complete, healthy factory and returns its config.
 func fixture(t *testing.T) *config.Config {
 	t.Helper()
 	root := t.TempDir()
-	for _, d := range []string{"inbox", "outbox", "work"} {
+	for _, d := range []string{"inbox", "outbox", "work", "submit"} {
 		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
 			t.Fatal(err)
 		}
 	}
-	// A clone: .git is a directory.
-	if err := os.MkdirAll(filepath.Join(root, "work", ".git"), 0o755); err != nil {
-		t.Fatal(err)
+	// Clones: .git is a directory.
+	for _, d := range []string{"work", "submit"} {
+		if err := os.MkdirAll(filepath.Join(root, d, ".git"), 0o755); err != nil {
+			t.Fatal(err)
+		}
 	}
 	writeToken(t, filepath.Join(root, "producer.token"), "producer-bot")
 	writeToken(t, filepath.Join(root, "reviewer.token"), "factory-reviewer")
@@ -64,17 +97,19 @@ func fixture(t *testing.T) *config.Config {
 		Provider:      "github",
 		GitHub:        &config.GitHub{Owner: "acme", Repo: "widgets"},
 		TargetBranch:  "main",
+		Git:           config.Git{Remote: "https://github.com/acme/widgets.git", Transport: "https"},
 		Paths: config.Paths{
 			Root:            root,
 			ProducerWorkdir: filepath.Join(root, "work"),
+			SubmitRepo:      filepath.Join(root, "submit"),
 		},
 		Credentials: config.Credentials{
 			Producer: config.CredentialRef{File: filepath.Join(root, "producer.token")},
 			Reviewer: config.CredentialRef{File: filepath.Join(root, "reviewer.token")},
 		},
-		Gate: config.Gate{Command: []string{gate}},
+		Gate: config.Gate{Command: []string{gate}, Env: map[string]string{"PATH": "/usr/bin:/bin"}},
 		Roles: config.Roles{
-			Producer: config.RoleSpec{Command: []string{gate}},
+			Producer: config.RoleSpec{Command: []string{gate}, RunAs: &config.RunAs{User: "nobody"}},
 			Reviewer: config.RoleSpec{Command: []string{gate}},
 		},
 		Supervisor: config.Supervisor{
@@ -109,7 +144,8 @@ func failedNames(r doctor.Report) []string {
 // TestHealthyFactoryPasses is the positive control for every case below. If a
 // healthy factory does not pass, a failure elsewhere proves nothing.
 func TestHealthyFactoryPasses(t *testing.T) {
-	r := doctor.Run(context.Background(), fixture(t), builder(nil))
+	cfg := fixture(t)
+	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
 	if !r.OK() {
 		t.Fatalf("healthy factory failed %v\n%s", failedNames(r), r)
 	}
@@ -123,7 +159,7 @@ func TestSharedIdentityIsCaught(t *testing.T) {
 	cfg := fixture(t)
 	writeToken(t, cfg.Credentials.Producer.File, "factory-reviewer")
 
-	r := doctor.Run(context.Background(), cfg, builder(nil))
+	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
 	if r.OK() {
 		t.Fatal("doctor passed a factory whose producer and reviewer are the same identity")
 	}
@@ -136,7 +172,7 @@ func TestSharedIdentityIsCaught(t *testing.T) {
 // commit, and it is indistinguishable from a clone by casual inspection.
 func TestWorktreeWorkdirIsCaught(t *testing.T) {
 	cfg := fixture(t)
-	gitPath := filepath.Join(cfg.Paths.ProducerWorkdir, ".git")
+	gitPath := filepath.Join(cfg.Paths.SubmitRepo, ".git")
 	if err := os.RemoveAll(gitPath); err != nil {
 		t.Fatal(err)
 	}
@@ -144,9 +180,9 @@ func TestWorktreeWorkdirIsCaught(t *testing.T) {
 		t.Fatal(err)
 	}
 
-	r := doctor.Run(context.Background(), cfg, builder(nil))
+	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
 	if r.OK() {
-		t.Fatal("doctor passed a producer workdir that is a worktree, not a clone")
+		t.Fatal("doctor passed a submit repository that is a worktree, not a clone")
 	}
 	if !strings.Contains(r.String(), "worktree") {
 		t.Fatalf("failure does not name the worktree:\n%s", r)
@@ -171,9 +207,9 @@ func TestIndividualFailuresAreCaught(t *testing.T) {
 			wantName: "credential producer",
 		},
 		{
-			name:     "workdir is not a git repository",
-			mutate:   func(t *testing.T, c *config.Config) { os.RemoveAll(filepath.Join(c.Paths.ProducerWorkdir, ".git")) },
-			wantName: "producer workdir",
+			name:     "submit repo is not a git repository",
+			mutate:   func(t *testing.T, c *config.Config) { os.RemoveAll(filepath.Join(c.Paths.SubmitRepo, ".git")) },
+			wantName: "submit repo",
 		},
 		{
 			name:     "workdir does not exist",
@@ -224,7 +260,7 @@ func TestIndividualFailuresAreCaught(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			cfg := fixture(t)
 			c.mutate(t, cfg)
-			r := doctor.Run(context.Background(), cfg, builder(c.listErr))
+			r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, c.listErr))
 			if r.OK() {
 				t.Fatalf("doctor passed:\n%s", r)
 			}
@@ -249,7 +285,7 @@ func TestUnresolvableIdentityDoesNotPassDistinctness(t *testing.T) {
 	if err := os.Remove(cfg.Credentials.Reviewer.File); err != nil {
 		t.Fatal(err)
 	}
-	r := doctor.Run(context.Background(), cfg, builder(nil))
+	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
 	for _, c := range r.Checks {
 		if c.Name == "distinct identities" && c.OK {
 			t.Fatal("distinctness passed while one identity was never resolved")
@@ -261,11 +297,155 @@ func TestReportNamesEveryFailure(t *testing.T) {
 	cfg := fixture(t)
 	cfg.Alerts = nil
 	cfg.Gate.Command = []string{"definitely-not-a-real-binary-xyz"}
-	r := doctor.Run(context.Background(), cfg, builder(nil))
+	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
 	out := r.String()
 	for _, want := range []string{"alert transports", "gate command", "FAILED"} {
 		if !strings.Contains(out, want) {
 			t.Errorf("report does not mention %q:\n%s", want, out)
 		}
+	}
+}
+
+// ---------- the boundary, the transport, the gate ----------
+
+// Each row breaks one of the new checks and asserts doctor names it. The
+// healthy fixture above is the positive control for all of them.
+func TestBoundaryTransportAndGateFailuresAreCaught(t *testing.T) {
+	cases := []struct {
+		name     string
+		mutate   func(t *testing.T, cfg *config.Config, d *doctor.Deps)
+		wantName string
+		wantText string
+	}{
+		{
+			name: "the producer can write the submit repo",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				d.NewProber = func(*config.RunAs) (doctor.Prober, error) {
+					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.Paths.SubmitRepo: true}}, nil
+				}
+			},
+			wantName: "boundary", wantText: "CAN write",
+		},
+		{
+			name: "the probe cannot run (no privilege)",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				d.NewProber = func(*config.RunAs) (doctor.Prober, error) {
+					return fakeProber{err: errors.New("setuid: operation not permitted")}, nil
+				}
+			},
+			wantName: "boundary", wantText: "undecided",
+		},
+		{
+			// "Cannot write" must not pass on a probe that cannot write anything.
+			name: "the control probe fails too",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				d.NewProber = func(*config.RunAs) (doctor.Prober, error) {
+					return fakeProber{writable: map[string]bool{}}, nil
+				}
+			},
+			wantName: "boundary", wantText: "proves nothing",
+		},
+		{
+			name: "the producer user does not exist",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				d.NewProber = func(ra *config.RunAs) (doctor.Prober, error) {
+					return nil, errors.New("user: unknown user " + ra.User)
+				}
+			},
+			wantName: "producer identity", wantText: "unknown user",
+		},
+		{
+			// The incident: git resolves to someone other than the API does.
+			name: "git would push as a different identity",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				d.GitIdentity = func(context.Context, *config.Config, scm.Driver, string) (string, error) {
+					return "factory-reviewer", nil
+				}
+			},
+			wantName: "git identity", wantText: "disagree",
+		},
+		{
+			name: "git identity cannot be resolved",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				d.GitIdentity = func(context.Context, *config.Config, scm.Driver, string) (string, error) {
+					return "", errors.New("credential fill returned nothing")
+				}
+			},
+			wantName: "git identity", wantText: "undecided",
+		},
+		{
+			name: "the submit repo's local config carries a proxy",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				d.GitGuard = func(*config.Config, scm.Driver, string) error {
+					return errors.New("keys outside the allowlist: http.proxy")
+				}
+			},
+			wantName: "git config allowlist", wantText: "http.proxy",
+		},
+		{
+			name: "a gate path references an unset variable",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				cfg.Gate.RequiredWritablePaths = []string{"${NOPE}/cache"}
+			},
+			wantName: "gate path ${NOPE}/cache", wantText: "does not set",
+		},
+		{
+			name: "a gate path exists as a file",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				f := filepath.Join(cfg.Paths.SubmitRepo, "notadir")
+				if err := os.WriteFile(f, []byte("x"), 0o644); err != nil {
+					t.Fatal(err)
+				}
+				cfg.Gate.RequiredWritablePaths = []string{"notadir"}
+			},
+			wantName: "gate path notadir", wantText: "not a directory",
+		},
+		{
+			name: "a gate path cannot be created",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				cfg.Gate.RequiredWritablePaths = []string{"/proc/factoryd-cannot-create/x"}
+			},
+			wantName: "gate path /proc/factoryd-cannot-create/x", wantText: "cannot be created",
+		},
+	}
+	for _, c := range cases {
+		t.Run(c.name, func(t *testing.T) {
+			cfg := fixture(t)
+			d := healthyDeps(cfg, nil)
+			c.mutate(t, cfg, &d)
+			r := doctor.RunWith(context.Background(), cfg, d)
+			if r.OK() {
+				t.Fatalf("doctor passed:\n%s", r)
+			}
+			var hit *doctor.Check
+			for i := range r.Checks {
+				if r.Checks[i].Name == c.wantName && !r.Checks[i].OK {
+					hit = &r.Checks[i]
+				}
+			}
+			if hit == nil {
+				t.Fatalf("no failing check named %q; failures were %v\n%s", c.wantName, failedNames(r), r)
+			}
+			if hit.Err == nil || !strings.Contains(hit.Err.Error(), c.wantText) {
+				t.Fatalf("%s failed but does not say %q: %v", c.wantName, c.wantText, hit.Err)
+			}
+		})
+	}
+}
+
+// An absent-but-creatable gate path is accepted and said to be creatable,
+// since submit creates it. This is the other half of the "exists as a file"
+// row: the check must distinguish the two, not fail everything absent.
+func TestAbsentButCreatableGatePathIsAccepted(t *testing.T) {
+	cfg := fixture(t)
+	cfg.Gate.RequiredWritablePaths = []string{"build/out"}
+	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
+	for _, c := range r.Checks {
+		if c.Name == "gate path build/out" && !c.OK {
+			t.Fatalf("an absent, creatable gate path was refused: %v", c.Err)
+		}
+	}
+	if !r.OK() {
+		t.Fatalf("unrelated failures: %v", failedNames(r))
 	}
 }

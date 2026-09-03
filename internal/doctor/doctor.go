@@ -13,9 +13,11 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/factory"
+	"github.com/aicix-labs/factoryd/internal/gittransport"
 	"github.com/aicix-labs/factoryd/internal/scm"
 )
 
@@ -77,11 +79,39 @@ func (r Report) String() string {
 // tests do not need a provider.
 type DriverBuilder func(cfg *config.Config, token string) (scm.Driver, error)
 
-// Run performs every check. newDriver may be nil, in which case the real
-// provider drivers are used.
+// Deps are the pieces of doctor that touch the outside world, injectable so
+// the package can be tested without a provider, privilege, or git remote.
+// Nil fields mean the real thing.
+type Deps struct {
+	NewDriver DriverBuilder
+	// NewProber builds the write probe for the producer's OS identity.
+	NewProber func(*config.RunAs) (Prober, error)
+	// GitIdentity resolves who git would push as, using the producer's
+	// driver and secret. Nil uses the real transport.
+	GitIdentity func(ctx context.Context, cfg *config.Config, d scm.Driver, secret string) (string, error)
+	// GitGuard runs the transport's pre-operation guard on submit_repo.
+	GitGuard func(cfg *config.Config, d scm.Driver, secret string) error
+}
+
+// Run performs every check with the real dependencies.
 func Run(ctx context.Context, cfg *config.Config, newDriver DriverBuilder) Report {
+	return RunWith(ctx, cfg, Deps{NewDriver: newDriver})
+}
+
+// RunWith performs every check with the given dependencies.
+func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
+	newDriver := deps.NewDriver
 	if newDriver == nil {
 		newDriver = factory.NewDriver
+	}
+	if deps.NewProber == nil {
+		deps.NewProber = NewProber
+	}
+	if deps.GitIdentity == nil {
+		deps.GitIdentity = realGitIdentity
+	}
+	if deps.GitGuard == nil {
+		deps.GitGuard = realGitGuard
 	}
 	var r Report
 	add := func(name string, err error, detail string) {
@@ -97,8 +127,61 @@ func Run(ctx context.Context, cfg *config.Config, newDriver DriverBuilder) Repor
 		add("handoff "+filepath.Base(d), checkWritableDir(d), d)
 	}
 
-	kind, err := workdirKind(cfg.Paths.ProducerWorkdir)
-	add("producer workdir", err, fmt.Sprintf("%s (%s)", cfg.Paths.ProducerWorkdir, kind))
+	if err := checkWritableDir(cfg.Paths.ProducerWorkdir); err != nil {
+		add("producer workdir", err, cfg.Paths.ProducerWorkdir)
+	} else {
+		add("producer workdir", nil, cfg.Paths.ProducerWorkdir)
+	}
+	kind, err := workdirKind(cfg.Paths.SubmitRepo)
+	add("submit repo", err, fmt.Sprintf("%s (%s)", cfg.Paths.SubmitRepo, kind))
+	// Owned by factoryd's own identity, not merely unwritable by the producer.
+	// Found live: with factoryd running as root (which switching to the
+	// producer's uid requires) and the clone owned by someone else, git refuses
+	// the repository outright -- and the honest reading of that refusal is
+	// that the repository is not ours, not that git should be told to trust it.
+	add("submit repo owner", checkOwnedByMe(cfg.Paths.SubmitRepo), cfg.Paths.SubmitRepo)
+
+	// --- the boundary, by probe ---
+	// "The producer cannot write submit_repo" is established by trying, as
+	// the producer, and having it fail -- with the same probe succeeding
+	// against the producer's own workdir, or "cannot write" is just a probe
+	// that cannot write anything.
+	prober, perr := deps.NewProber(cfg.Roles.Producer.RunAs)
+	if perr != nil {
+		add("producer identity", perr, "")
+		add("boundary", fmt.Errorf("undecided: no producer identity to probe as"), "")
+	} else {
+		add("producer identity", nil, prober.Describe())
+		canSubmit, err1 := prober.CanWrite(ctx, cfg.Paths.SubmitRepo)
+		canWork, err2 := prober.CanWrite(ctx, cfg.Paths.ProducerWorkdir)
+		switch {
+		case err1 != nil:
+			add("boundary", fmt.Errorf("undecided, which is not the same as satisfied: %v", err1), "")
+		case err2 != nil:
+			add("boundary", fmt.Errorf("the control probe could not run: %v", err2), "")
+		case canSubmit:
+			add("boundary", fmt.Errorf("%s CAN write %s; the submit repository is not separated from the producer", prober.Describe(), cfg.Paths.SubmitRepo), "")
+		case !canWork:
+			add("boundary", fmt.Errorf("%s cannot write its own workdir %s either; the probe proves nothing", prober.Describe(), cfg.Paths.ProducerWorkdir), "")
+		default:
+			add("boundary", nil, fmt.Sprintf("%s: refused at %s, allowed at %s", prober.Describe(), cfg.Paths.SubmitRepo, cfg.Paths.ProducerWorkdir))
+		}
+	}
+
+	// --- gate environment and paths ---
+	if _, ok := cfg.Gate.Env["PATH"]; !ok {
+		add("gate env", fmt.Errorf("gate.env declares no PATH"), "")
+	} else {
+		add("gate env", nil, fmt.Sprintf("%d variables declared, nothing inherited", len(cfg.Gate.Env)))
+	}
+	for _, p := range cfg.Gate.RequiredWritablePaths {
+		resolved, err := cfg.ResolveGatePath(p)
+		if err != nil {
+			add("gate path "+p, err, "")
+			continue
+		}
+		add("gate path "+p, checkWritableOrCreatable(resolved), resolved)
+	}
 
 	// --- gate ---
 	add("gate command", checkCommand(cfg.Gate.Command, "gate.command",
@@ -167,6 +250,24 @@ func Run(ctx context.Context, cfg *config.Config, newDriver DriverBuilder) Repor
 					n = "repository reachable"
 				}
 				add("repository", lerr, n)
+			}
+		}
+	}
+
+	// --- the git transport: same identity, owned target ---
+	if tok, err := cfg.Credentials.Producer.Resolve(); err == nil {
+		if d, err := newDriver(cfg, tok); err == nil {
+			add("git config allowlist", deps.GitGuard(cfg, d, tok), cfg.Paths.SubmitRepo)
+			login, err := deps.GitIdentity(ctx, cfg, d, tok)
+			switch {
+			case err != nil:
+				add("git identity", fmt.Errorf("undecided: %v", err), "")
+			case ids["producer"].Login == "":
+				add("git identity", fmt.Errorf("git would push as %q but the producer's API identity could not be resolved to compare", login), "")
+			case login != ids["producer"].Login:
+				add("git identity", fmt.Errorf("git would push as %q, but the producer's API identity is %q; the two mechanisms disagree", login, ids["producer"].Login), "")
+			default:
+				add("git identity", nil, fmt.Sprintf("git pushes as %s, the same identity the API sees", login))
 			}
 		}
 	}
@@ -259,6 +360,73 @@ func checkCommand(argv []string, field, consequence string) error {
 	}
 	if _, err := exec.LookPath(argv[0]); err != nil {
 		return fmt.Errorf("%s: %q not found: %w", field, argv[0], err)
+	}
+	return nil
+}
+
+// checkWritableOrCreatable accepts a writable directory, or an absent path
+// whose nearest existing ancestor is writable -- submit creates it. A path
+// that exists as a non-directory, or whose ancestor is unwritable, fails.
+func checkWritableOrCreatable(p string) error {
+	fi, err := os.Stat(p)
+	switch {
+	case err == nil && !fi.IsDir():
+		return fmt.Errorf("%s exists and is not a directory", p)
+	case err == nil:
+		return checkWritableDir(p)
+	case !os.IsNotExist(err):
+		return err
+	}
+	// Absent: walk up to the nearest existing ancestor.
+	for dir := filepath.Dir(p); ; dir = filepath.Dir(dir) {
+		if fi, err := os.Stat(dir); err == nil {
+			if !fi.IsDir() {
+				return fmt.Errorf("%s: ancestor %s is not a directory", p, dir)
+			}
+			if err := checkWritableDir(dir); err != nil {
+				return fmt.Errorf("%s is absent and cannot be created: %w", p, err)
+			}
+			return nil
+		}
+		if dir == filepath.Dir(dir) {
+			return fmt.Errorf("%s: no existing ancestor", p)
+		}
+	}
+}
+
+func realGitIdentity(ctx context.Context, cfg *config.Config, d scm.Driver, secret string) (string, error) {
+	tr, err := gittransport.New(cfg, d, secret)
+	if err != nil {
+		return "", err
+	}
+	id, err := tr.Identity(ctx)
+	if err != nil {
+		return "", err
+	}
+	return id.Login, nil
+}
+
+func realGitGuard(cfg *config.Config, d scm.Driver, secret string) error {
+	tr, err := gittransport.New(cfg, d, secret)
+	if err != nil {
+		return err
+	}
+	return tr.Guard()
+}
+
+// checkOwnedByMe requires the path to be owned by the identity doctor runs as,
+// which is the identity every git command will run as.
+func checkOwnedByMe(path string) error {
+	fi, err := os.Stat(path)
+	if err != nil {
+		return err
+	}
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return fmt.Errorf("cannot read the owner of %s on this platform", path)
+	}
+	if int(st.Uid) != os.Geteuid() {
+		return fmt.Errorf("%s is owned by uid %d but factoryd runs as uid %d; git will refuse a repository it does not own, and it should -- the submit repository must be factoryd's", path, st.Uid, os.Geteuid())
 	}
 	return nil
 }
