@@ -29,7 +29,24 @@ operation, not theorised:
 | 9 | Handoff state spread across 8 ad-hoc files | no schema | §6 one typed, versioned state document |
 | 10 | Producer could not commit at all under its sandbox | `.git` is read-only in `workspace-write` | §4.4 sandbox-aware submit |
 
-**Design rule derived from all ten:** *a check that cannot fail is not a check.* Before
+### Found since, and load-bearing for the same reason
+
+Later observations, from continued operation of v1 and from building v2. Kept
+separate because the table above is one day’s evidence and should stay that way,
+but these carry the same weight.
+
+| # | Failure | Root cause | v2 requirement |
+|---|---|---|---|
+| 11 | The producer’s `git push` went out under the **reviewer’s** credential | `fetch`/`push` ignore the API token and consult the ambient credential helper; the first matching entry won | §4.4 the producer credential governs the git transport |
+| 12 | `doctor` reported healthy while the git and API identities disagreed | only the API identity was ever resolved | §4.1 verify the git transport identity |
+| 13 | A missing cache directory was reported as `gate FAILED`, exit 5 | a build that cannot write and a build that found a defect both exit non-zero | §9.6 environmental failure is not a red gate |
+| 14 | A real GitLab merge conflict was reported as a CI failure | the fixture was hand-written from documentation and said 405; the provider answers 422 | §9.7 fixtures are recorded, not written |
+
+Item 11 failed closed only because the reviewer credential happened to lack
+repository write scope. With it, the push would have succeeded as the wrong
+identity and nothing would have said so.
+
+**Design rule derived from all of them:** *a check that cannot fail is not a check.* Before
 trusting any green signal, state what would have to break for it to go red. If you
 cannot, it is decoration. This rule is normative throughout this spec.
 
@@ -100,10 +117,41 @@ factoryd scm <verb> ...        # thin, scriptable access to the driver
 factoryd doctor                # verify a factory's config, credentials, paths, identities
 ```
 
-`doctor` is not optional. It must verify: config parses; both credentials
-authenticate; **producer and reviewer resolve to different identities**; declared
-paths exist and are writable; the target repo is reachable; the workdir is a clone,
-not a worktree (§4.4). It exits non-zero on any failure and names which.
+That is the finished surface, not the current one. §11 gives the order the
+subcommands arrive in; anything not yet built exits non-zero saying so, because a
+subcommand that silently did nothing would be indistinguishable from one that ran
+and found nothing to do.
+
+`doctor` is not optional. It must verify:
+
+- config parses;
+- both credentials authenticate, and **producer and reviewer resolve to
+  different identities**;
+- **the identity `git` itself would present for the remote is the producer's**,
+  and **the URL git would actually contact — after rewriting — is the configured
+  remote, addressing the project the provider block names** (§5.4);
+- declared paths exist and are writable; every path in
+  `gate.required_writable_paths` is a writable directory **or is absent with a
+  writable nearest existing ancestor**, since submit creates it (§4.4);
+- **the producer cannot write `paths.submit_repo`** — established by running a
+  write probe through the same mechanism the producer turn runs under, with the
+  same probe succeeding against `paths.producer_workdir` as its control (§4.4);
+- the submit repository's local git config carries **only** allowlisted keys
+  (§5.4) — defence in depth, since the producer cannot reach that file;
+- `gate.env` declares `PATH`, and every `${VAR}` referenced by a declared path
+  is set in it — `doctor` resolves those paths against the same fully-declared
+  environment `submit` will give the gate, not against its own (§4.4);
+- the target repo is reachable;
+- `paths.submit_repo` is a clone, not a worktree (§4.4).
+
+It exits non-zero on any failure and names which.
+
+The git-transport check is separate from the API one because the two identities
+are resolved by different mechanisms — one from an explicit header, the other
+from whatever the ambient credential helper returns first — and they can
+disagree. Observed in production: they did, and every API-level check still
+reported healthy. "Could not determine" fails, on the same standard as
+distinctness: undecided is not satisfied.
 
 ### 4.2 Supervisor
 
@@ -142,6 +190,13 @@ plain file in the same directory succeeds). Do not attempt to widen that sandbox
 Instead the producer declares intent in plain files and `factoryd submit`, running
 outside the sandbox, does the git and network work:
 
+That observation is what prompted the design; it is **not** what the design rests
+on. A sandbox that permitted the producer to write its `.git` must change
+nothing, because submit does not use it — see the two-directory boundary below.
+A safety property inferred from how one sandbox happened to behave is an
+assumption, not a boundary, and it would go quiet the day someone changed the
+sandbox.
+
 ```
 .producer-branch       branch name — required when changes exist; refuse to guess; refuse the target branch
 .producer-commit-msg   commit message; non-empty is the signal that there is work to commit
@@ -153,18 +208,151 @@ Submit is also **the gate**. In order:
 
 1. resolve the **producer** credential; **fail closed** — never fall back to the
    reviewer's. Refuse if the two resolve to the same identity, naming it.
+   This governs **both the API and the git transport** — see below.
 2. materialize: create branch from target, stage, commit
-3. run the configured gate command (build/vet/test). If red: write a question
+3. re-check `gate.required_writable_paths` (below). A missing or unwritable one
+   exits **3**, not 5: a misconfigured host is not a red branch (§9.6).
+4. run the configured gate command (build/vet/test). If red: write a question
    (§6.2), signal, **do not push**
-4. push, create-or-update the Draft PR/MR
-5. signal the reviewer
+5. push, create-or-update the Draft PR/MR
+6. signal the reviewer
 
 Exit codes are part of the contract: `0` submitted · `4` nothing to submit ·
 `5` gate failed · `3` configuration/identity failure.
 
-**The workdir must be a clone, not a git worktree.** A worktree keeps its refs in the
-parent repository, outside the sandbox, so the producer cannot write them. `doctor`
-must check this.
+**The producer credential governs the git transport, not only the API.** The
+contract and its verification oracle are in §5.4; this is why it exists, and it
+is stated separately because it is the half an implementer will miss: `fetch` and
+`push` do not take the token you pass to the API. Left alone, git consults the
+ambient credential helper, and the first matching entry wins whoever it belongs
+to.
+
+Observed in production, 2026-09-01: the first entry in the host's
+`~/.git-credentials` was the **reviewer's**, so the producer's push went out
+under it. It failed closed only because that credential happened to lack
+repository write scope. Had it carried write, the push would have **succeeded as
+the reviewer** and nothing would have said so — a successful push looks identical
+either way — breaking two-party trust at the git layer while every API-level
+check still passed.
+
+Therefore every git operation, `fetch` as much as `push`, runs through a
+`GitTransport` (§5.4): inherited credential sources suppressed, the producer
+credential supplied explicitly, and never through argv.
+
+**The gate declares the paths it needs; they are not discovered.**
+
+```json
+"gate": {
+  "command": ["bash", "-c", "go build ./... && go test ./..."],
+  "env": {
+    "PATH": "/usr/local/bin:/usr/bin:/bin",
+    "HOME": "/var/lib/factoryd/widgets",
+    "GOCACHE": "/var/cache/factoryd/widgets/go",
+    "GOFLAGS": "-count=1"
+  },
+  "required_writable_paths": ["${GOCACHE}", "build/artifacts"],
+  "timeout_seconds": 900
+}
+```
+
+Declared, because a gate command is an opaque argv — often a shell string — and
+the paths a build writes to are set by environment variables, tool defaults and
+the build system itself. Trying to recover them by parsing the command would be a
+guess presented as a check: it would miss paths that matter and invent ones that
+do not, and a check that is sometimes wrong about what it verified is worse than
+no check, because it is believed.
+
+**The gate's environment is declared in full, and nothing is inherited.** The
+gate environment is exactly the `FACTORYD_*` variables submit sets, plus
+`gate.env`. There is no allowlist and no pass-through. `PATH` is required in
+`gate.env`; a gate with no `PATH` cannot run anything, and inheriting one would
+reintroduce the whole problem.
+
+An earlier draft allowed an `inherit_env` allowlist, on the reasoning that
+naming the variables made them accountable. It does not. `doctor` is run from a
+terminal and `submit` runs as a service; even with identical *names* the
+**values** differ — a different `PATH`, a different `HOME`, a proxy set in one
+and not the other. `doctor` would go green having resolved `${GOCACHE}` against
+an environment `submit` never sees. Naming a variable does not make its value
+the same in two processes, and no check inside `doctor` can establish that it is.
+
+This is the "same environment" corollary of §5.4: the environment has to be
+*owned*, not agreed upon. Declared in full, both commands compute the identical
+environment from the identical file, and the question of whose process it came
+from does not arise.
+
+Submit records the resolved paths — after `${VAR}` expansion — in the state
+document, so what was checked and what actually ran can be compared afterwards
+rather than assumed equal.
+
+Resolution rules, so the field means one thing:
+
+- A relative path resolves against the gate's working directory.
+- `${VAR}` expands from **that** environment. **An unset variable is an error,
+  not an empty expansion** — expanding `${GOCACHE}/x` to `/x` would check a path
+  the gate will never touch and pass.
+- No shell, no globbing, no `~`. Anything needing those is a path the operator
+  should write out.
+
+**A declared path is a directory, and submit creates it if it is absent.**
+Detecting the missing cache directory would be an improvement on reporting it as
+a red gate; creating it removes the failure entirely. So:
+
+- `doctor` requires each path to be a writable directory, **or** absent with a
+  writable nearest existing ancestor — creatable counts as satisfied, and is
+  reported as such rather than silently.
+- `submit` creates any absent path before running the gate.
+- A path that exists as a non-directory, or cannot be created, is exit **3**.
+
+The residual risk is a typo creating a directory nothing uses. That is visible
+and harmless, and much cheaper than a false red gate that teaches the operator
+to disbelieve red.
+
+An empty list is legal and means the gate needs nothing beyond its workdir. It is
+a claim the operator makes, and a wrong one shows up as an exit 3 rather than a
+mystery.
+
+**Git never runs in a repository the producer can write.** There are two
+directories, and the separation is the boundary:
+
+| | `paths.producer_workdir` | `paths.submit_repo` |
+|---|---|---|
+| written by | the producer | factoryd only |
+| contains | source the producer edits | the clone every git command runs in |
+| its `.git` | ignored entirely; may not exist | factoryd's, and the only one git reads |
+
+Submit copies the producer's **source tree** into the submit repository and does
+all of its git work there. The copy excludes git control data — any path named
+`.git`, at any depth, file or directory — and refuses a symlink that resolves
+outside the tree. Nothing the producer wrote can reach the configuration git
+reads, because it is not copied and the destination is not writable by the
+producer.
+
+This replaces an earlier design in which the producer's own clone was validated
+before each operation. That was a time-of-check-to-time-of-use race and could not
+be fixed by checking harder: submit read `.git/config`, approved it, then started
+a git process that read the file again, and the producer could replace it
+atomically in between. "Factoryd created" is provenance at one instant, not
+ownership over time, and a cooperative lock between a factory and the agent it
+is sandboxing is not a boundary. The allowlist of §5.4 still applies to the
+submit repository, but as defence in depth over a file the producer cannot
+reach — not as the mechanism.
+
+**The boundary is verified by probe, not by assertion.** `doctor` runs a write
+probe **through exactly the mechanism the producer turn runs under** — the same
+sandbox wrapper, the same user — and requires it to fail against
+`paths.submit_repo`. The same probe must **succeed** against
+`paths.producer_workdir`: without that control, "the producer cannot write it"
+is indistinguishable from a probe that cannot write anything.
+
+If the producer turn runs with the same authority as submit, there is no
+boundary to verify and `doctor` fails, saying so. An unenforced separation
+recorded as enforced is worse than none: it is the two-party split on paper with
+nothing holding it up.
+
+**The submit repository must be a clone, not a git worktree.** A worktree keeps
+its refs in the parent repository, so the refs submit writes would land outside
+the directory whose ownership was just established.
 
 ### 4.5 Reconciler / health tick
 
@@ -230,6 +418,11 @@ type Driver interface {
     PostAudit(ctx, id, sha string, a Audit) error
     Audits(ctx, id, sha string) ([]Audit, error)
     Whoami(ctx) (Identity, error)
+
+    // GitCredential is what this provider expects over HTTPS. See §5.4: the
+    // two do not agree on the username half, so it cannot be derived from the
+    // token alone.
+    GitCredential(secret string) GitCredential
 }
 ```
 
@@ -237,6 +430,232 @@ Both implementations must pass one shared conformance suite against recorded fix
 v1's two drivers diverged: five verbs the producer half needed existed only in the
 GitHub driver, which silently made the producer daemon GitHub-only. A conformance
 suite makes that a build failure.
+
+### 5.4 Git transport
+
+The provider driver speaks the API. Nothing in it touches git, and the two
+authenticate by different mechanisms — which is exactly how a producer came to
+push under the reviewer's credential while every API check passed (§1, item 11).
+So the git side gets its own contract, and its own identity question:
+
+```go
+// GitIdentity is who a transport authenticates as at the remote.
+type GitIdentity struct {
+    Login string // the account the remote sees
+    // Source names how it was resolved: "credential-helper" or "ssh".
+    Source string
+}
+
+// GitTransport performs submit's git operations under an identity it can state.
+//
+// Identity must resolve using the SAME isolation and credential source that
+// Fetch and Push use. A check performed under different conditions than the
+// operation it vouches for proves nothing about that operation.
+type GitTransport interface {
+    // Identity resolves who this transport would present to the remote. It
+    // returns an error rather than a guess when it cannot: an unresolved
+    // identity is undecided, not satisfied.
+    Identity(ctx context.Context) (GitIdentity, error)
+
+    Fetch(ctx context.Context, refspec string) error
+    Push(ctx context.Context, refspec string) error
+}
+```
+
+**The credential has two halves, and only the provider knows the first.** Git
+authenticates over HTTPS with a username *and* a password, and the conventions
+differ: the token alone is not enough to answer `git credential fill`.
+
+```go
+// GitCredential is what git is handed for an HTTPS remote.
+type GitCredential struct {
+    Username string
+    Secret   string
+}
+```
+
+The username is provider-owned, supplied by `Driver.GitCredential` (§5.3), so
+neither the transport nor the operator has to know the convention. It is not
+cosmetic: the host in the incident behind §1 item 11 had entries under **two**
+different usernames for the same instance, and which one git picked decided
+which identity pushed.
+
+**Configuration.** The remote is declared, not discovered. A transport that
+inferred its remote from the workdir would verify one thing and push to another:
+
+```json
+"git": {
+  "remote": "https://gitlab.example.com/acme/widgets.git",
+  "transport": "https",
+  "ssh_key_file": "/etc/factoryd/widgets/producer_ed25519",
+  "known_hosts_file": "/etc/factoryd/widgets/known_hosts",
+  "proxy": "",
+  "ca_file": ""
+}
+```
+
+`transport` is `https` or `ssh`. For `https` the credential is
+`credentials.producer` — the same one the API uses, and no other. For `ssh`,
+`ssh_key_file` and `known_hosts_file` are required and ignored otherwise.
+`proxy` and `ca_file` are the **only** way a proxy or an alternative trust store
+reaches the transport: empty means direct connection and the system trust store,
+and nothing ambient can widen either (see the environment rule below).
+
+**Isolation is part of the contract, not a precaution.** Every git invocation
+must run with inherited credential sources suppressed:
+
+- **https:** no ambient `credential.helper` may apply. Submit supplies its own,
+  configured explicitly for this invocation, reading the producer credential from
+  a file the process owns at mode `0600` and removes, or from stdin. **Never a
+  remote URL with the credential embedded, and never argv** —
+  `/proc/<pid>/cmdline` is world-readable, so a token on a command line is
+  readable by anything on the host.
+- **ssh:** `-F /dev/null` first — without it, `~/.ssh/config` and the system
+  ssh config still apply, and a `ProxyCommand` or `ProxyJump` there routes the
+  connection through a host factoryd never chose, with the effective URL
+  unchanged. Then, on that clean base: `IdentitiesOnly=yes`,
+  `IdentityAgent=none`, an explicit `IdentityFile`, and the host-key set pinned
+  from **both** directions: `UserKnownHostsFile` set to `git.known_hosts_file`,
+  `GlobalKnownHostsFile=/dev/null`, `StrictHostKeyChecking=yes`, and
+  `UpdateHostKeys=no`.
+
+  Each of those is there because the one before it is not enough. `-F /dev/null`
+  discards the config files but not OpenSSH's built-in defaults, and one of
+  those defaults is `GlobalKnownHostsFile /etc/ssh/ssh_known_hosts
+  /etc/ssh/ssh_known_hosts2` — verifiable with `ssh -G`, which still lists them
+  after `-F /dev/null` and an explicit user file. So a key absent from
+  `git.known_hosts_file` is still accepted if the host's system file carries it:
+  the pinned set was a floor, not a set. `GlobalKnownHostsFile=/dev/null` makes
+  the user file the whole of it. `UpdateHostKeys=no` then stops the remote
+  extending that set itself — with it on, a server can hand over additional
+  keys that ssh records, and the trust set factoryd pinned grows without
+  factoryd's involvement.
+
+  Trust-on-first-use inside an unowned home directory is one more ambient
+  input; so is a system known-hosts file nobody in this factory maintains. An
+  agent holding the reviewer's key is the same failure as a credential helper
+  holding the reviewer's token; a ProxyCommand in a dotfile is the same failure
+  as `http_proxy` in the environment.
+
+**The invariant.** *A verification is valid only for an operation it shares an
+environment with, and only while nothing can change that environment in
+between.*
+
+Everything below is an instance of it, and so was every gap found reviewing this
+section: the credential was pinned but not the target, the token was pinned but
+not the username, the path was pinned but not the environment it resolved in.
+Each time, the check verified the thing next to the thing that actually decided.
+Two corollaries do the work:
+
+- **Same environment.** The environment must be fully owned by factoryd, so that
+  "the environment `doctor` saw" and "the environment `submit` used" are the
+  same object rather than two processes' ambient state that happen to agree.
+- **No window.** A check that ran earlier vouches for nothing if what it checked
+  can change afterwards. Where the gap cannot be closed, the check moves next to
+  the operation.
+
+**Pinning the credential is not enough; the target must be pinned too.** A
+correct `remote` proves nothing on its own. `url.<base>.insteadOf` and
+`pushInsteadOf` rewrite it, `core.sshCommand` and `GIT_SSH_COMMAND` replace the
+transport, and `GIT_DIR`, `GIT_ASKPASS` and the system and global config files
+all reach in from outside. Every one of those can send a correctly-configured
+remote somewhere else, and the push still looks like it worked.
+
+So the git environment is isolated to the same standard as the credential:
+
+- `GIT_CONFIG_GLOBAL` and `GIT_CONFIG_SYSTEM` point at `/dev/null`; only
+  configuration submit sets explicitly applies.
+- **The repository's own `.git/config` is owned outright, by allowlist.** It is
+  not covered by the `/dev/null` above, and it is the one file the producer can
+  actually reach: it has write access to its workdir by definition, so it can
+  configure the very repository submit is about to push from.
+
+  A denylist cannot close this. Refusing `credential.helper` and
+  `url.*.insteadOf` leaves `http.<url>.proxy` sending the connection through an
+  interceptor, `http.sslVerify=false` accepting any certificate, and
+  `http.sslCAInfo` swapping the trust store — **none of which change the
+  effective URL**, so the target check passes while the credential is handed to
+  someone else. Nor is that list complete either; it is the next three anyone
+  thought of. You cannot enumerate what you do not own, and every future Git
+  release makes a denylist more wrong.
+
+  So the local configuration is **default-deny**:
+
+  - Git runs only in `paths.submit_repo`, which the producer cannot write
+    (§4.4). That is the boundary. The allowlist below is defence in depth over a
+    file the producer cannot reach — checking a file the producer *could* write
+    would be a time-of-check-to-time-of-use race, since git rereads it after the
+    check.
+  - Before every fetch and every push, submit reads the repository's effective
+    local configuration and **refuses if any key outside this allowlist is
+    present**:
+
+    ```
+    core.repositoryformatversion   core.filemode      core.bare
+    core.logallrefupdates          core.symlinks      core.ignorecase
+    core.precomposeunicode         extensions.objectformat
+    remote.<name>.url              remote.<name>.fetch
+    branch.<name>.merge            branch.<name>.remote
+    ```
+
+    That is what a clone needs to be a clone. Everything else — every `http.*`,
+    every `url.*`, `credential.*`, `core.sshCommand`, `core.worktree`,
+    `include.path`, `includeIf.*` — is absent or submit does not run. A key Git
+    adds next year is refused by default rather than admitted by omission.
+  - `remote.<name>.url` is allowlisted because a clone has one, **and submit
+    does not use it**: pushes and fetches name the URL explicitly, and the
+    effective-URL check below still runs, because `insteadOf` rewrites an
+    explicit URL too.
+
+  This is the "fully owned" corollary applied properly. The earlier draft of
+  this section policed the local config with a denylist, which satisfies the
+  letter of the invariant and not the substance: the verification and the
+  operation still shared configuration that factoryd did not own.
+- **The git process environment is constructed in full, exactly as the gate's
+  is (§4.4).** An earlier draft dropped inherited `GIT_*` variables, which is a
+  denylist wearing an environment's clothes: `http_proxy`, `https_proxy`,
+  `all_proxy`, `NO_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR` and `CURL_CA_BUNDLE`
+  all steer git's HTTPS transport and none of them starts with `GIT_`. A filter
+  keyed on a prefix owns the prefix, not the environment — and a `doctor` run
+  from a terminal and a `submit` run as a service would still transport through
+  different proxies while both reported the same green.
+
+  So every git and ssh process starts from an environment factoryd builds:
+  `PATH` and `HOME` from configuration, the `GIT_CONFIG_*`/`GIT_TERMINAL_PROMPT`
+  and inert-`GIT_ASKPASS` settings above, and nothing else. A proxy or TLS
+  override reaches the transport only through a typed factory config field
+  (`git.proxy`, `git.ca_file`) that declares it — never through whatever the
+  parent process was started with. `doctor` and `submit` build this environment
+  from the same configuration, so "which proxy" stops being a property of who
+  launched the process.
+- The transport is set explicitly, never inherited.
+
+And the effective target is checked, not the configured one — **inside the
+transport, immediately before every fetch and every push**, not once as a
+`doctor` preflight. This is the "no window" corollary: `doctor` runs before the
+producer's turn, and the producer can edit `.git/config` during it. A preflight
+answer about the target is stale by the time the push happens.
+
+- **the URL git will actually use** — `git remote get-url` and
+  `git remote get-url --push`, both after rewriting — must equal the configured
+  `git.remote`;
+- **`git.remote` must address the same project** the provider block names
+  (`github.owner`/`repo`, or `gitlab.project`). A remote pointing at a different
+  repository than the one being reviewed is a misconfiguration no identity check
+  would catch: the right account pushing to the wrong place.
+
+**The verification oracle**, so `Identity` is implementable rather than aspirational:
+
+- **https:** run `git credential fill` for the configured remote, under the
+  isolation above. Whatever it returns is what git will use. Resolve that
+  credential through the provider API (`Driver.Whoami`) and report the identity
+  it names. A helper that returns nothing is an error, not an empty identity.
+- **ssh:** run the provider's authentication probe (`ssh -T`) under the isolation
+  above and read the account out of the greeting — GitHub answers `Hi <login>!`,
+  GitLab `Welcome to GitLab, @<login>!`. An unparseable greeting is an error.
+
+Both are read-only and safe to run from `doctor`. Neither infers the answer from
+configuration: they ask the mechanism that will actually be used.
 
 ---
 
@@ -346,6 +765,63 @@ catches things:
 5. **Match command position, not the mention.** Guards that grep for a string fire on
    comments, on string literals, and on their own fixtures. Parse, or anchor.
 
+6. **An environmental failure must not present as a failed check.** A gate whose
+   build cannot write its cache directory exits non-zero exactly like a gate that
+   found a real defect, and submit cannot tell them apart afterwards — so the
+   discrimination has to happen *before* the gate runs. Observed in production: a
+   missing directory was reported as `gate FAILED`, exit 5, and the producer would
+   have been sent a `changes-requested` for someone else’s mistake. The cost is
+   not the wasted cycle. A gate that cries red for environmental reasons trains the
+   operator to disbelieve red gates, and the whole value of refusing to push on red
+   depends on red meaning what it says.
+7. **A fixture is evidence only if it came from the thing it describes.** A fixture
+   written from documentation records what the API was *believed* to do. A driver
+   matching it exactly passes every test above it while being wrong about the
+   provider — a check that can fail against the wrong reality, which is harder to
+   notice than one that cannot fail, because everything looks like it is working.
+   Record fixtures from a live provider, error shapes first; state the provenance
+   of every one; and when a case genuinely cannot be provoked, say why in the
+   fixture itself.
+
+### 9.1 What must be shown to fail
+
+A requirement with no demonstrated failure is a wish. Each row below is a
+condition an implementation must be able to *produce*, and a check that must go
+red when it does. Nothing here is satisfied by a passing suite alone.
+
+| requirement | must be shown to fail when | positive control |
+|---|---|---|
+| §4.4 git identity (https) | an ambient `credential.helper` resolves the remote to a non-producer account | the same check passes with the producer credential configured |
+| §4.4 git identity (ssh) | an agent, default key, or `~/.ssh/config` `IdentityFile` authenticates as a non-producer account | passes with `-F /dev/null`, `IdentitiesOnly` and the producer key |
+| §4.4 identity is undecidable | the helper returns nothing, or the greeting cannot be parsed | a resolvable transport reports a login |
+| §4.4 credential never in argv | the credential appears in the spawned git process's `/proc/<pid>/cmdline` | **the credential is present in the channel it should use** — otherwise "absent from argv" passes for a submit that never supplied it at all |
+| §4.4 `fetch` is covered too | an ambient credential is used for fetch, not only push | fetch succeeds under the producer credential |
+| §5.4 URL rewrite | `url.<base>.insteadOf` redirects the configured remote → the effective URL no longer matches, refuse | the same check passes with no rewrite in force |
+| §5.4 push rewrite | `pushInsteadOf` redirects only the push URL | `get-url --push` matches when unrewritten |
+| §5.4 config isolation | a global or system git config that would redirect or re-credential is **not** in force during any git operation | the explicit configuration submit sets *is* in force |
+| §5.4 remote vs project | `git.remote` addresses a different repository than the provider block names → refuse | matching remote and provider block passes |
+| §5.3 `GitCredential` | either driver returns a username its provider will not accept | **both** drivers exercised, each asserting its own convention |
+| §4.4 gate env is owned | any variable reaches the gate that `gate.env` did not declare, or `gate.env` omits `PATH` | the declared environment reaches the gate intact |
+| §4.4 gate env agreement | `doctor` and `submit` resolve a `${VAR}` path to different values — including when run from **different processes with different ambient environments**, which is the case that made an allowlist unworkable | both resolve it to the same path from the same config |
+| §5.4 local config allowlist | **any** key outside the allowlist is present in the workdir's local config → refuse | a clone carrying only allowlisted keys pushes normally |
+| §5.4 the URL check is not enough | `http.<url>.proxy`, `http.sslVerify=false` or `http.sslCAInfo` is set — the effective URL and project still match, and submit must still refuse | the same push succeeds once the setting is removed |
+| §5.4 ambient proxy env | `https_proxy`/`all_proxy` set in the parent environment routes nothing: identity, target, fetch and push are all unaffected, because the git process never receives them | `git.proxy` declared in config **does** take effect — proving the transport honours a proxy when one is actually declared, so "unaffected" is not a transport that ignores proxies entirely |
+| §5.4 ambient ssh config | a `ProxyCommand` in `~/.ssh/config` (or the system ssh config) is never executed by any factoryd ssh invocation | the same `ProxyCommand` in a config passed without `-F /dev/null` executes — proving the probe can detect execution at all |
+| §5.4 host-key policy | a remote presenting a key absent from `git.known_hosts_file` is refused, not learned — **including when that key is present in `/etc/ssh/ssh_known_hosts`**, which is the case `-F /dev/null` alone does not cover | the pinned key connects |
+| §5.4 host-key set is fixed | the remote offers additional host keys during the session and ssh records none of them | `ssh -G` on the factoryd invocation reports `updatehostkeys no` and `globalknownhostsfile /dev/null`, so the assertion is about the options actually in force, not the ones intended |
+| §4.4 the boundary holds | the producer principal **can** write `paths.submit_repo` → `doctor` fails | the same probe succeeds against `paths.producer_workdir`, so "cannot write" is not a broken probe |
+| §4.4 no boundary at all | the producer runs with submit's own authority → `doctor` fails rather than reporting a separation it cannot enforce | a genuinely separated pair passes |
+| §4.4 the race is gone | `.git/config` in the **producer workdir** is replaced — with a proxy, a rewrite, anything — at any moment, including after every check and while the push is running: the push is unaffected, because git never reads that file | the identical setting placed in `paths.submit_repo`'s config **does** refuse, proving the test can detect it at all |
+| §4.4 control data never crosses | a `.git` anywhere in the producer tree, at any depth, is copied into the submit repository | an ordinary source tree copies intact |
+| §4.4 symlink escape | a symlink in the producer tree resolving outside it is followed | a symlink within the tree is preserved |
+| §4.4 gate paths | a declared path exists as a non-directory, or cannot be created → exit **3** | a genuinely red gate still exits **5**, and an absent-but-creatable path is created and passes |
+| §4.4 unset `${VAR}` | a referenced variable is unset → refuse | a set variable resolves and passes |
+| §4.1 doctor covers the above | each condition above, reached through `doctor` rather than only through unit tests | a healthy factory passes every check |
+
+The fourth row is the one most likely to be got wrong. "No token in argv" is
+trivially true of an implementation that never passes the token anywhere, so the
+test has to prove the credential reached the intended channel in the same run.
+
 ---
 
 ## 10. Non-goals
@@ -370,7 +846,8 @@ contract so the two are swappable one verb at a time.
    with a known v1 bug.
 3. **State document + `doctor`.**
 4. **Supervisor** (both roles, one implementation) with spin/abort and progress.
-5. **Submit** with the gate, identity check, and sandbox-aware materialization.
+5. **Submit** with the gate, identity check — API *and* git transport (§4.4) —
+   and sandbox-aware materialization.
 6. **Health, alerts, resource guards.**
 7. **Status page.**
 
@@ -380,5 +857,5 @@ v2 is done when, for one real factory: an operator drops a brief; a sandboxed pr
 with no network and no git writes produces a change; submit gates and opens it; a
 reviewer of a *different identity* reviews, runs an adversarial pass on an
 escalate-class path, and merges; the merge is verified by ancestry; **and every one of
-the ten failures in §1 is either impossible by construction or caught by a test that
-has been shown to fail.**
+the failures in §1 is either impossible by construction or caught by a test that has
+been shown to fail.**

@@ -41,6 +41,16 @@ and each one has a real failure behind it.
    fire on comments, on string literals, and on their own fixtures. Parse, or
    anchor.
 
+7. **An environmental failure must not present as a failed check.** A gate whose
+   build cannot write its cache exits non-zero exactly like a gate that found a
+   real defect. Discriminate *before* the check runs, not after. A gate that
+   cries red for environmental reasons trains the operator to disbelieve red
+   gates, and the value of refusing to push on red depends entirely on red
+   meaning what it says.
+
+8. **A fixture is evidence only if it came from the thing it describes.** See
+   "Fixtures are recorded, not written" below.
+
 ## Adding a driver verb
 
 Both drivers must implement it, and the conformance suite must exercise it. The
