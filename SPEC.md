@@ -184,10 +184,25 @@ So the supervisor keeps a second counter, **independent of consumption**:
 consecutive turns that exited non-zero or timed out without reporting progress.
 Progress resets it; consuming the trigger does not. It halts at `fail_abort`
 (default 5) exactly as the spin guard halts at `spin_abort`, with a reason that
-names which guard fired. A single such failure is not a halt — agents fail — but
-it is logged at a level someone reads, saying that nothing is pending and
-nothing will retry, and it is recorded in state for the health tick (§4.5) to
-act on.
+names which guard fired.
+
+A counter alone is not enough, because after a consumed failure nothing is
+pending and nothing external will start the next turn: the counter would sit at
+one forever, which is the stall with a number on it. So the supervisor
+**re-arms itself**. It writes a supervisor-owned marker (`inbox/<role>-retry`),
+backs off, and runs the next turn on it. The marker is a file rather than a
+memory, because a retry lost on restart recreates the stall it exists to fix; it
+carries the original trigger and the failure that led here, so the agent — and
+the operator — can read why this turn is a retry. The supervisor removes it once
+the retry has run, unless that retry is the one that halts: then it stays, as a
+real trigger does, because a halt should not erase its own evidence.
+
+An interrupted turn counts toward neither guard. Stopping the supervisor kills
+the running turn with its process group, and the exit code that produces says
+nothing about the agent; counted, an ordinary shutdown would leave a failure on
+the streak, a later unrelated failure would halt the factory, and the operator
+who stopped it would never connect the two. The turn is recorded as interrupted
+and no marker is written.
 
 ### 4.3 Watcher
 

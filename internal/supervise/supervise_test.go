@@ -25,9 +25,12 @@ type fakeRunner struct {
 	mu    sync.Mutex
 	turns []supervise.Turn
 	act   func(n int, t supervise.Turn) supervise.TurnResult
+	// run, when set, replaces act and sees the turn's context -- for turns
+	// that must block until the supervisor is stopped.
+	run func(ctx context.Context, t supervise.Turn) supervise.TurnResult
 }
 
-func (f *fakeRunner) Run(_ context.Context, t supervise.Turn, started func(proc.Ref)) (supervise.TurnResult, error) {
+func (f *fakeRunner) Run(ctx context.Context, t supervise.Turn, started func(proc.Ref)) (supervise.TurnResult, error) {
 	f.mu.Lock()
 	f.turns = append(f.turns, t)
 	n := len(f.turns)
@@ -36,6 +39,9 @@ func (f *fakeRunner) Run(_ context.Context, t supervise.Turn, started func(proc.
 		if ref, err := proc.Self("turn"); err == nil {
 			started(ref)
 		}
+	}
+	if f.run != nil {
+		return f.run(ctx, t), nil
 	}
 	if f.act == nil {
 		return supervise.TurnResult{}, nil
@@ -394,14 +400,13 @@ func TestOneRolesProgressDoesNotResetAnothers(t *testing.T) {
 	}
 }
 
-// The production shape from issue #12: every turn consumes its trigger and then
-// fails. The spin guard never engages -- consumption resets it every time -- so
-// to every existing signal this is an idle factory with an empty queue, while
-// the work sits stranded. The fail streak is the counter that can see it.
+// Consecutive failures across real, distinct triggers: each turn consumes one
+// and a fresh one is left for the next. The spin guard never engages, because
+// consumption resets it every time; the fail streak is the counter that climbs.
 //
-// Each turn consumes one trigger and a fresh one is left for the next, so
-// consumption is genuine: the acted-on path is gone when the supervisor checks.
-func TestConsumedButFailedTurnsStillHalt(t *testing.T) {
+// This is NOT the issue #12 stall -- that has one trigger and no replacement,
+// and is TestStallAfterConsumedFailureIsRetriedThenHalted below.
+func TestConsecutiveConsumedFailuresHalt(t *testing.T) {
 	fx := newFixture(t)
 	fx.wake(t)
 
@@ -443,6 +448,158 @@ func TestConsumedButFailedTurnsStillHalt(t *testing.T) {
 
 // A failure that reported progress is a partial step, not a stall. Same rule as
 // the spin guard: progress resets, consumption does not.
+// The stall from issue #12, exactly: ONE trigger, consumed by a turn that then
+// fails, and nothing else ever arrives. Before this fix the supervisor logged a
+// warning and waited forever with fail_streak=1 -- fail_abort was unreachable
+// without an unrelated trigger, which is precisely what the 3.5-hour idle
+// looked like. Now the supervisor re-arms itself on a durable marker, the
+// streak climbs, and it halts with a reason.
+func TestStallAfterConsumedFailureIsRetriedThenHalted(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t) // the only trigger there will ever be
+
+	var sawRetry int
+	r := &fakeRunner{act: func(n int, tr supervise.Turn) supervise.TurnResult {
+		for _, trig := range tr.Triggers {
+			if trig.Label == supervise.RetryLabel {
+				sawRetry++
+				continue
+			}
+			os.Remove(trig.Path) // consume the real trigger; replace nothing
+		}
+		return supervise.TurnResult{ExitCode: 1}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	err := s.Run(ctx)
+	if !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted: with one trigger and no replacement the factory idled instead of escalating", err)
+	}
+	// Turn 1 on the real trigger, then fail_abort-1 retries.
+	if got := r.count(); got != 3 {
+		t.Fatalf("ran %d turns, want 3 (one real, two retries, fail_abort=3)", got)
+	}
+	if sawRetry != 2 {
+		t.Fatalf("the agent was woken for %d retries, want 2: the supervisor did not re-arm itself", sawRetry)
+	}
+	// And the retries were backed off, not fired in a tight ring.
+	if len(fx.slept) != 2 {
+		t.Fatalf("backed off %v, want two delays before the halt", fx.slept)
+	}
+
+	rs := fx.roleState(t)
+	if rs.SpinCount != 0 {
+		t.Fatalf("spin count = %d; the spin guard must be blind to this scenario", rs.SpinCount)
+	}
+	if !strings.Contains(rs.HaltReason, "fail_abort") {
+		t.Fatalf("halt reason does not name the fail guard: %q", rs.HaltReason)
+	}
+	// The marker is durable evidence of what happened; a halt does not erase it.
+	body, err := os.ReadFile(fx.cfg.RetryPath("reviewer"))
+	if err != nil {
+		t.Fatalf("no retry marker after the halt: %v", err)
+	}
+	if !strings.Contains(string(body), "wake") {
+		t.Fatalf("the retry marker does not name the original trigger:\n%s", body)
+	}
+}
+
+// A retry that succeeds clears everything: streak reset, marker removed, and
+// the supervisor goes back to a genuine idle.
+func TestSuccessfulRetryClearsTheStreak(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+
+	r := &fakeRunner{act: func(n int, tr supervise.Turn) supervise.TurnResult {
+		for _, trig := range tr.Triggers {
+			if trig.Label != supervise.RetryLabel {
+				os.Remove(trig.Path)
+			}
+		}
+		if n == 1 {
+			return supervise.TurnResult{ExitCode: 1} // fails once
+		}
+		return supervise.TurnResult{} // the retry succeeds
+	}}
+	s := fx.newSupervisor(t, r, 2)
+
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); err != nil {
+		t.Fatalf("a failure followed by a successful retry halted: %v", err)
+	}
+	if got := r.count(); got != 2 {
+		t.Fatalf("ran %d turns, want 2", got)
+	}
+	rs := fx.roleState(t)
+	if rs.FailStreak != 0 || rs.Halted {
+		t.Fatalf("fail_streak=%d halted=%v after a successful retry", rs.FailStreak, rs.Halted)
+	}
+	if _, err := os.Stat(fx.cfg.RetryPath("reviewer")); err == nil {
+		t.Fatal("the retry marker survived a successful retry; the next start would retry again for nothing")
+	}
+	if len(rs.Pending) != 0 {
+		t.Fatalf("pending = %+v after everything was handled", rs.Pending)
+	}
+}
+
+// Stopping the supervisor mid-turn is not an agent failure. The kill produces a
+// non-zero exit, and counting it would let an ordinary shutdown poison the
+// streak -- so that a later, unrelated failure halts the factory and nobody
+// connects the two.
+func TestShutdownDuringATurnIsNotAFailure(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+
+	started := make(chan struct{})
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult { panic("unused") }}
+	r.run = func(ctx context.Context, tr supervise.Turn) supervise.TurnResult {
+		close(started)
+		<-ctx.Done() // the turn is running when the supervisor is stopped
+		return supervise.TurnResult{ExitCode: 143}
+	}
+	s := fx.newSupervisor(t, r, 0)
+
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- s.Run(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("the turn never started")
+	}
+	cancel()
+	select {
+	case err := <-done:
+		if err != nil {
+			t.Fatalf("Run returned %v on shutdown, want nil", err)
+		}
+	case <-time.After(10 * time.Second):
+		t.Fatal("the supervisor did not stop")
+	}
+
+	rs := fx.roleState(t)
+	if rs.FailStreak != 0 {
+		t.Fatalf("fail_streak = %d after a shutdown mid-turn; the streak was poisoned", rs.FailStreak)
+	}
+	if rs.Halted {
+		t.Fatal("a shutdown halted the factory")
+	}
+	if _, err := os.Stat(fx.cfg.RetryPath("reviewer")); err == nil {
+		t.Fatal("a shutdown re-armed a retry, as if the agent had failed")
+	}
+	if rs.LastTurn == nil || !rs.LastTurn.Interrupted {
+		t.Fatalf("the interrupted turn is not recorded as interrupted: %+v", rs.LastTurn)
+	}
+	// The real trigger is untouched: the turn never got to consume it.
+	if _, err := os.Stat(filepath.Join(fx.inbox, "wake")); err != nil {
+		t.Fatal("the trigger vanished during a shutdown")
+	}
+}
+
 func TestProgressResetsTheFailStreak(t *testing.T) {
 	fx := newFixture(t)
 	fx.wake(t)
@@ -490,6 +647,10 @@ func TestSingleConsumedFailureIsRecordedNotHalted(t *testing.T) {
 	}
 	if rs.LastTurn == nil || rs.LastTurn.ExitCode == nil || *rs.LastTurn.ExitCode != 1 {
 		t.Fatalf("last turn does not record the non-zero exit: %+v", rs.LastTurn)
+	}
+	// Not silent: the supervisor has re-armed itself.
+	if _, err := os.Stat(fx.cfg.RetryPath("reviewer")); err != nil {
+		t.Fatalf("no retry marker after a consumed failure: %v", err)
 	}
 }
 

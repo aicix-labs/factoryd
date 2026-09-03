@@ -43,6 +43,10 @@ type Turn struct {
 	ExitCode  *int       `json:"exit_code,omitempty"`
 	// Trigger names what caused the turn ("inbox/wake", "inbox/brief.md").
 	Trigger string `json:"trigger,omitempty"`
+	// Interrupted records that the supervisor was stopped while the turn was
+	// running. The exit code is whatever the kill produced and says nothing
+	// about the agent; an interrupted turn counts toward no guard.
+	Interrupted bool `json:"interrupted,omitempty"`
 	// Process is the turn's own process, held by handle.
 	Process *proc.Ref `json:"process,omitempty"`
 }

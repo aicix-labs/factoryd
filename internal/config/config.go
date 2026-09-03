@@ -424,6 +424,15 @@ func (c *Config) ProgressPath(role string) string {
 	return filepath.Join(c.InboxDir(), role+"-progress")
 }
 
+// RetryPath is the supervisor-owned trigger a role re-arms on after a turn
+// consumed its trigger and then failed. Supervisor-owned: the supervisor writes
+// it and removes it, and an agent never needs to know it exists. A file rather
+// than an in-memory flag so the retry survives a supervisor restart -- an
+// in-memory retry lost on restart recreates the exact stall it exists to fix.
+func (c *Config) RetryPath(role string) string {
+	return filepath.Join(c.InboxDir(), role+"-retry")
+}
+
 // StopPath is the halt sentinel for a role. Its presence stops the supervisor
 // from starting, and only an operator removes it: a circuit breaker that resets
 // itself is not a circuit breaker.

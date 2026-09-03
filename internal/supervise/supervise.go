@@ -90,22 +90,31 @@ type Supervisor struct {
 	turnSeq int
 }
 
+// RetryLabel names the supervisor-owned retry trigger.
+const RetryLabel = "retry"
+
 // TriggersFor returns the trigger specs a role waits on (SPEC.md §6.2).
 //
 // The handoff directories are named from the reviewer's point of view: inbox is
 // what arrives for review, outbox is what the reviewer sends back.
 func TriggersFor(cfg *config.Config, role string) ([]watch.Spec, error) {
+	// The supervisor's own trigger (see Config.RetryPath). Listed last so that
+	// when a real trigger is also present, it is what the turn is told it was
+	// woken for first.
+	retry := watch.Spec{Label: RetryLabel, Dir: cfg.InboxDir(), Pattern: role + "-retry"}
 	switch role {
 	case "producer":
 		return []watch.Spec{
 			{Label: "brief", Dir: cfg.InboxDir(), Pattern: "brief.md"},
 			{Label: "answer", Dir: cfg.OutboxDir(), Pattern: "answer.md"},
 			{Label: "verdict", Dir: cfg.OutboxDir(), Pattern: "*.json"},
+			retry,
 		}, nil
 	case "reviewer":
 		return []watch.Spec{
 			{Label: "wake", Dir: cfg.InboxDir(), Pattern: "wake"},
 			{Label: "question", Dir: cfg.InboxDir(), Pattern: "question.md"},
+			retry,
 		}, nil
 	default:
 		return nil, fmt.Errorf("supervise: role %q is not producer or reviewer", role)
