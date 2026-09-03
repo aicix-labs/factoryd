@@ -9,10 +9,12 @@ package doctor
 import (
 	"context"
 	"fmt"
+	"github.com/aicix-labs/factoryd/internal/alert"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
+	"time"
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/factory"
@@ -351,15 +353,25 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 		cfg.Supervisor.SpinWarn, cfg.Supervisor.SpinAbort, cfg.Supervisor.BackoffSeconds))
 
 	// --- alerts ---
-	alertErr := error(nil)
+	// Delivered, not inspected: a probe alert goes through every transport
+	// now, because "the file path looks writable" and "the command exists"
+	// are not the same as an alert arriving. What would have to break for
+	// this to go red is exactly what breaks when a real alert is lost.
 	if len(cfg.Alerts) == 0 {
-		alertErr = fmt.Errorf("no alert transport configured; detection with nowhere to report to is not an alert")
+		add("alert transports", fmt.Errorf("no alert transport configured; detection with nowhere to report to is not an alert"), "")
+	} else if fan, err := alert.New(cfg); err != nil {
+		add("alert transports", err, "")
+	} else {
+		probe := alert.Alert{Factory: cfg.Name, At: time.Now(), Kind: "doctor", Severity: "probe",
+			Summary: "factoryd doctor delivery probe; if you can read this, the transport works"}
+		ds, _ := fan.Deliver(ctx, probe)
+		for _, d := range ds {
+			kind, _, _ := strings.Cut(d.Transport, " ")
+			add("alert "+kind, d.Err, d.Transport+": probe alert delivered")
+		}
 	}
-	kinds := make([]string, 0, len(cfg.Alerts))
-	for _, a := range cfg.Alerts {
-		kinds = append(kinds, a.Kind)
-	}
-	add("alert transports", alertErr, strings.Join(kinds, ", "))
+	add("health thresholds", nil, fmt.Sprintf("alert after %d ticks, repeat every %ds; stale trigger %ds, turn grace %ds, disk headroom %d%%, %d bounded cache(s)",
+		cfg.Health.AlertAfter, cfg.Health.RepeatSeconds, cfg.Health.StaleTriggerSeconds, cfg.Health.TurnGraceSeconds, cfg.Health.DiskMinFreePercent, len(cfg.Health.Caches)))
 
 	// --- credentials and identities ---
 	ids := map[string]scm.Identity{}

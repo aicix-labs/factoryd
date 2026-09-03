@@ -178,6 +178,24 @@ type State struct {
 
 	// LastVerdict is the most recent verdict recorded, whatever it was.
 	LastVerdict *Verdict `json:"last_verdict,omitempty"`
+
+	// Health is the cadence record of the health tick: for each standing
+	// condition, when it was first seen and last alerted. It lives here, under
+	// the same lock as everything else, so that a tick that crashed between
+	// deciding to alert and recording that it did cannot alert twice -- or,
+	// worse, decide it already had.
+	Health map[string]*Condition `json:"health,omitempty"`
+}
+
+// Condition is one standing health condition.
+type Condition struct {
+	FirstSeen time.Time `json:"first_seen"`
+	LastSeen  time.Time `json:"last_seen"`
+	// Ticks is consecutive ticks the condition has held.
+	Ticks int `json:"ticks"`
+	// LastAlerted is zero until the first alert went out.
+	LastAlerted time.Time `json:"last_alerted,omitempty"`
+	Summary     string    `json:"summary"`
 }
 
 // New returns an empty state document for a factory.

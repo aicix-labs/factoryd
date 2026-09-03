@@ -10,7 +10,7 @@ import (
 )
 
 const good = `{
-  "schema_version": 3,
+  "schema_version": 4,
   "name": "widgets",
   "provider": "github",
   "github": {"owner": "acme", "repo": "widgets"},
@@ -75,9 +75,9 @@ func TestUnknownKeyIsRefused(t *testing.T) {
 
 func TestValidationFailures(t *testing.T) {
 	cases := map[string]struct{ from, to, want string }{
-		"missing schema version":              {`"schema_version": 3,`, ``, "schema_version"},
-		"future schema version":               {`"schema_version": 3`, `"schema_version": 99`, "schema_version"},
-		"previous schema version":             {`"schema_version": 3`, `"schema_version": 2`, "schema_version"},
+		"missing schema version":              {`"schema_version": 4,`, ``, "schema_version"},
+		"future schema version":               {`"schema_version": 4`, `"schema_version": 99`, "schema_version"},
+		"previous schema version":             {`"schema_version": 4`, `"schema_version": 3`, "schema_version"},
 		"no producer turn":                    {`"command": ["claude", "-p", "producer-brief"], `, `"command": [], `, "roles.producer.command"},
 		"warn at or above abort":              {`"gate":`, `"supervisor": {"spin_warn": 9, "spin_abort": 4}, "gate":`, "spin_warn"},
 		"no submit repo":                      {`"submit_repo": "/var/lib/factoryd/widgets/submit"`, `"submit_repo": ""`, "submit_repo"},
@@ -105,6 +105,14 @@ func TestValidationFailures(t *testing.T) {
 		"no alerts":                           {`[{"kind": "file", "path": "/var/log/factoryd/alerts.log"}]`, `[]`, "alert transport"},
 		"unknown alert kind":                  {`"kind": "file"`, `"kind": "carrier-pigeon"`, "carrier-pigeon"},
 		"alert missing path":                  {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "file"}`, "no path"},
+		"webhook is not deliverable here":     {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "webhook"}`, "not implemented"},
+		"syslog is not deliverable here":      {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "syslog"}`, "not implemented"},
+		"alert command without PATH":          {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "command", "command": ["notify"]}`, "PATH"},
+		"alert file relative path":            {`"path": "/var/log/factoryd/alerts.log"`, `"path": "alerts.log"`, "absolute"},
+		"cache without a bound":               {`"alerts":`, `"health": {"caches": [{"path": "/var/cache/factoryd/go"}]}, "alerts":`, "max_bytes"},
+		"cache relative path":                 {`"alerts":`, `"health": {"caches": [{"path": "go", "max_bytes": 1}]}, "alerts":`, "absolute"},
+		"disk headroom out of range":          {`"alerts":`, `"health": {"disk_min_free_percent": 100}, "alerts":`, "disk_min_free_percent"},
+		"negative unreviewed":                 {`"alerts":`, `"health": {"unreviewed_seconds": -1}, "alerts":`, "unreviewed_seconds"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {

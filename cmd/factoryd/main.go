@@ -30,6 +30,8 @@ usage:
   factoryd supervise --config <f> --role <r>         run one role's loop
   factoryd submit    --config <f>                    gate and open the producer's declared change
                                                      exits 0 submitted, 3 config/identity, 4 nothing, 5 gate red
+  factoryd health    --config <f> [--loop] [--json]  one model-free tick: detect, alert, write health.json
+                                                     exits 0 healthy, 1 findings, 3 could not look
   factoryd scm       --config <f> <verb>...         drive the provider directly
   factoryd version
 
@@ -74,6 +76,8 @@ func main() {
 		os.Exit(runSupervise(args))
 	case "submit":
 		os.Exit(runSubmit(args))
+	case "health":
+		os.Exit(runHealth(args))
 	case "scm":
 		os.Exit(runSCM(args))
 	case "version":

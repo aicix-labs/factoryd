@@ -40,7 +40,7 @@ pretending.
 | 4 | Supervisor (both roles, one implementation), spin/abort, progress | **done** |
 | 5a | Git transport (https), the owned environment, the two-directory boundary, `doctor`'"'"'s probe | **done** |
 | 5b | `submit`: materialize, gate, open the Draft PR/MR, signal | **done** |
-| 6 | Health, alert transports, resource guards | not started |
+| 6 | Health tick, alert transports (`file`, `command`), resource guards, bounded caches | **done** |
 | 7 | Status page | not started |
 
 `factoryd signal`, `audit` and `status` exit non-zero with "not implemented in
@@ -60,7 +60,9 @@ FAIL  producer workdir             /var/lib/factoryd/widgets/clone (worktree)
       /elsewhere/.git/worktrees/w. Its refs live in the parent repository,
       outside the producer's sandbox, so the producer cannot commit
 ok    gate command                 bash -c go build ./... && go vet ./... && ...
-ok    alert transports             file, command
+ok    alert file                   file /var/log/factoryd/widgets-alerts.log: probe alert delivered
+ok    alert command                command /usr/local/bin/notify-operator: probe alert delivered
+ok    health thresholds            alert after 3 ticks, repeat every 1800s; stale trigger 900s, turn grace 120s, disk headroom 10%, 1 bounded cache(s)
 ok    credential producer          file /etc/factoryd/widgets/producer.token
 ok    identity producer            producer-bot (id 1001)
 ok    credential reviewer          file /etc/factoryd/widgets/reviewer.token
@@ -70,6 +72,28 @@ ok    distinct identities          producer producer-bot (id 1001), reviewer fac
 
 1 of 13 checks FAILED: producer workdir
 ```
+
+the model-free health tick — one observation, or `--loop`. It detects, alerts
+through every configured transport (independently: one failing does not
+suppress the next), bounds the caches it was told to bound, and writes
+`<root>/health.json`. It never merges, reviews, or re-arms anything:
+
+```console
+$ factoryd health --config f.json
+2026-09-03T14:02:11Z UNHEALTHY: 2 finding(s)
+  disk_low//var/lib/factoryd/widgets   volume of /var/lib/factoryd/widgets has 4.1% free (9.3 GiB of 232.0 GiB), below the 10% headroom
+  stale_trigger/reviewer               reviewer trigger inbox/wake has waited 1h12m0s unconsumed
+  volume /var/lib/factoryd/widgets     4.1% free (9.3 GiB of 232.0 GiB)
+  cache  /var/cache/factoryd/widgets/go 4.8 GiB of 5.0 GiB; reclaimed 3 entries, 1.2 GiB
+  alerted  disk_low//var/lib/factoryd/widgets
+$ echo $?
+1
+```
+
+Exit 0 is healthy, 1 is findings, 3 is "could not look" — a tick that cannot
+stat a volume or reach the provider is unhealthy, not quiet. `doctor` delivers
+a probe alert through every transport rather than inspecting them, because
+"the path looks writable" is not "the alert landed".
 
 a supervised role loop, where the agent turn is any command you configure:
 

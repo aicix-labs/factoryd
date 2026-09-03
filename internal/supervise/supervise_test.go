@@ -87,13 +87,13 @@ func newFixture(t *testing.T) *fixture {
 		}
 	}
 	fx.cfg = &config.Config{
-		SchemaVersion: config.SchemaVersion,
-		Name:          "widgets",
-		Provider:      "github",
-		GitHub:        &config.GitHub{Owner: "acme", Repo: "widgets"},
-		TargetBranch:  "main",
-		Git:           config.Git{Remote: "https://github.com/acme/widgets.git", Transport: "https"},
-		Paths:         config.Paths{Root: root, ProducerWorkdir: filepath.Join(root, "work"), SubmitRepo: filepath.Join(root, "submit")},
+		SchemaVersion: config.SchemaVersion, Health: config.DefaultHealth(),
+		Name:         "widgets",
+		Provider:     "github",
+		GitHub:       &config.GitHub{Owner: "acme", Repo: "widgets"},
+		TargetBranch: "main",
+		Git:          config.Git{Remote: "https://github.com/acme/widgets.git", Transport: "https"},
+		Paths:        config.Paths{Root: root, ProducerWorkdir: filepath.Join(root, "work"), SubmitRepo: filepath.Join(root, "submit")},
 		Credentials: config.Credentials{
 			Producer: config.CredentialRef{Env: "P"},
 			Reviewer: config.CredentialRef{Env: "R"},

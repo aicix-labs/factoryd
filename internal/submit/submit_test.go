@@ -185,7 +185,7 @@ func newLab(t *testing.T) *lab {
 		}
 	}
 	cfg := &config.Config{
-		SchemaVersion: config.SchemaVersion, Name: "lab", Provider: "github",
+		SchemaVersion: config.SchemaVersion, Health: config.DefaultHealth(), Name: "lab", Provider: "github",
 		GitHub: &config.GitHub{Owner: "acme", Repo: "widgets"}, TargetBranch: "main",
 		Git:   config.Git{Remote: "https://github.com/acme/widgets.git", Transport: "https"},
 		Paths: config.Paths{Root: root, ProducerWorkdir: work, SubmitRepo: submitRepo},
