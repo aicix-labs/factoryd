@@ -541,6 +541,46 @@ func TestBoundaryTransportAndGateFailuresAreCaught(t *testing.T) {
 			wantName: "producer can run its command", wantText: "doctor could",
 		},
 		{
+			// roles.producer.workdir overrides the default. Root can reach the
+			// override; the producer cannot. A probe against the default would
+			// be green about a directory the turn never runs in.
+			name: "the producer workdir override is not writable by the producer",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				override := filepath.Join(cfg.Paths.Root, "override")
+				if err := os.MkdirAll(override, 0o755); err != nil {
+					t.Fatal(err)
+				}
+				cfg.Roles.Producer.Workdir = override
+				d.NewProber = func(ra *config.RunAs) (doctor.Prober, error) {
+					if ra.User == "factoryd-gate" {
+						return fakeProber{name: "gate", writable: map[string]bool{filepath.Join(cfg.Paths.SubmitRepo, "build/out"): true}}, nil
+					}
+					// writable: the DEFAULT workdir only, not the override
+					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+				}
+			},
+			wantName: "producer can write its workdir", wantText: "every turn would fail",
+		},
+		{
+			// reviewer.run_as is honoured by the runner; doctor must probe the
+			// reviewer's command under that identity too.
+			name: "the reviewer command is root-only under reviewer.run_as",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				cfg.Roles.Reviewer.RunAs = &config.RunAs{User: "factoryd-reviewer"}
+				exe, _ := config.LookPathIn(cfg.Roles.Reviewer.Env["PATH"], cfg.Roles.Reviewer.Command[0])
+				d.NewProber = func(ra *config.RunAs) (doctor.Prober, error) {
+					switch ra.User {
+					case "factoryd-gate":
+						return fakeProber{name: "gate", writable: map[string]bool{filepath.Join(cfg.Paths.SubmitRepo, "build/out"): true}}, nil
+					case "factoryd-reviewer":
+						return fakeProber{name: "reviewer", writable: map[string]bool{cfg.Paths.Root: true}, rootOnly: map[string]bool{exe: true}}, nil
+					}
+					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+				}
+			},
+			wantName: "reviewer can run its command", wantText: "doctor could",
+		},
+		{
 			name: "a gate path references an unset variable",
 			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
 				cfg.Gate.RequiredWritablePaths = []string{"${NOPE}/cache"}
@@ -716,3 +756,33 @@ type owningProber struct {
 }
 
 func (o *owningProber) Own(string) error { *o.owned = true; return nil }
+
+// The positive control for the per-role probes: a reviewer under its own
+// run_as with a normal command and a writable workdir passes every check.
+func TestReviewerUnderItsOwnIdentityPasses(t *testing.T) {
+	cfg := fixture(t)
+	cfg.Roles.Reviewer.RunAs = &config.RunAs{User: "factoryd-reviewer"}
+	d := healthyDeps(cfg, nil)
+	d.NewProber = func(ra *config.RunAs) (doctor.Prober, error) {
+		switch ra.User {
+		case "factoryd-gate":
+			return fakeProber{name: "gate", writable: map[string]bool{filepath.Join(cfg.Paths.SubmitRepo, "build/out"): true}}, nil
+		case "factoryd-reviewer":
+			return fakeProber{name: "reviewer", writable: map[string]bool{cfg.Paths.Root: true}}, nil
+		}
+		return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+	}
+	r := doctor.RunWith(context.Background(), cfg, d)
+	if !r.OK() {
+		t.Fatalf("a correctly configured reviewer.run_as was refused: %v\n%s", failedNames(r), r)
+	}
+	seen := false
+	for _, c := range r.Checks {
+		if c.Name == "reviewer can run its command" && c.OK {
+			seen = true
+		}
+	}
+	if !seen {
+		t.Fatal("the reviewer's command was never probed under its identity")
+	}
+}

@@ -151,8 +151,12 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 		add("boundary", fmt.Errorf("undecided: no producer identity to probe as"), "")
 	} else {
 		add("producer identity", nil, prober.Describe())
+		// The control probes the directory the turn will ACTUALLY run in --
+		// roles.producer.workdir may override paths.producer_workdir, and a
+		// green against the default says nothing about the override.
+		producerDir := cfg.TurnWorkdir("producer")
 		canSubmit, err1 := prober.CanWrite(ctx, cfg.Paths.SubmitRepo)
-		canWork, err2 := prober.CanWrite(ctx, cfg.Paths.ProducerWorkdir)
+		canWork, err2 := prober.CanWrite(ctx, producerDir)
 		switch {
 		case err1 != nil:
 			add("boundary", fmt.Errorf("undecided, which is not the same as satisfied: %v", err1), "")
@@ -161,9 +165,9 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 		case canSubmit:
 			add("boundary", fmt.Errorf("%s CAN write %s; the submit repository is not separated from the producer", prober.Describe(), cfg.Paths.SubmitRepo), "")
 		case !canWork:
-			add("boundary", fmt.Errorf("%s cannot write its own workdir %s either; the probe proves nothing", prober.Describe(), cfg.Paths.ProducerWorkdir), "")
+			add("boundary", fmt.Errorf("%s cannot write its own workdir %s either; the probe proves nothing", prober.Describe(), producerDir), "")
 		default:
-			add("boundary", nil, fmt.Sprintf("%s: refused at %s, allowed at %s", prober.Describe(), cfg.Paths.SubmitRepo, cfg.Paths.ProducerWorkdir))
+			add("boundary", nil, fmt.Sprintf("%s: refused at %s, allowed at %s", prober.Describe(), cfg.Paths.SubmitRepo, producerDir))
 		}
 	}
 
@@ -258,14 +262,46 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 			}
 		}
 	}
-	if prober != nil && perr == nil {
-		if exe, err := config.LookPathIn(cfg.Roles.Producer.Env["PATH"], cfg.Roles.Producer.Command[0]); err == nil {
-			if can, err := prober.CanExec(ctx, exe); err != nil {
-				add("producer can run its command", fmt.Errorf("undecided: %v", err), exe)
+	// --- every role that runs as its own identity ---
+	// The runner applies run_as to either role and honours a workdir override,
+	// so doctor verifies the actual command and the actual workdir under each
+	// role's configured identity. A role without run_as runs as factoryd, and
+	// what factoryd can do is what doctor already established.
+	for _, role := range []string{"producer", "reviewer"} {
+		spec, _ := cfg.RoleSpec(role)
+		if spec.RunAs == nil || spec.RunAs.User == "" {
+			continue
+		}
+		var who Prober
+		if role == "producer" && perr == nil {
+			who = prober
+		} else {
+			w, err := deps.NewProber(spec.RunAs)
+			if err != nil {
+				add(role+" identity", err, "")
+				continue
+			}
+			who = w
+			add(role+" identity", nil, who.Describe())
+		}
+		if who == nil {
+			continue
+		}
+		dir := cfg.TurnWorkdir(role)
+		if can, err := who.CanWrite(ctx, dir); err != nil {
+			add(role+" can write its workdir", fmt.Errorf("undecided: %v", err), dir)
+		} else if !can {
+			add(role+" can write its workdir", fmt.Errorf("%s cannot write %s, where its turns run; every turn would fail on start", who.Describe(), dir), dir)
+		} else {
+			add(role+" can write its workdir", nil, dir)
+		}
+		if exe, err := config.LookPathIn(spec.Env["PATH"], spec.Command[0]); err == nil {
+			if can, err := who.CanExec(ctx, exe); err != nil {
+				add(role+" can run its command", fmt.Errorf("undecided: %v", err), exe)
 			} else if !can {
-				add("producer can run its command", fmt.Errorf("%s cannot execute %s; doctor could, which is a different question", prober.Describe(), exe), exe)
+				add(role+" can run its command", fmt.Errorf("%s cannot execute %s; doctor could, which is a different question", who.Describe(), exe), exe)
 			} else {
-				add("producer can run its command", nil, exe)
+				add(role+" can run its command", nil, exe)
 			}
 		}
 	}
