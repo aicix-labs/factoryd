@@ -38,7 +38,8 @@ pretending.
 | 2 | Typed merge results, post-merge ancestry verification | **done** |
 | 3 | Versioned state document, process handles, `doctor` | **done** |
 | 4 | Supervisor (both roles, one implementation), spin/abort, progress | **done** |
-| 5 | `submit`: the gate, identity check, sandbox-aware materialization | not started |
+| 5a | Git transport (https), the owned environment, the two-directory boundary, `doctor`'"'"'s probe | **done** |
+| 5b | `submit`: materialize, gate, open the Draft PR/MR, signal | not started |
 | 6 | Health, alert transports, resource guards | not started |
 | 7 | Status page | not started |
 
@@ -179,6 +180,38 @@ not the 405 the hand-written fixture claimed, so a conflict was being reported a
 a CI failure. Every fixture states its provenance, and the few that stay
 synthetic say why.
 
+**Git never runs in a repository the producer can write.** There are two
+directories: the producer edits `producer_workdir`, whose `.git` is ignored
+entirely; every git command runs in `submit_repo`, which factoryd owns. Submit
+copies the source tree across — excluding any `.git` at any depth, refusing
+symlinks that escape — so nothing the producer wrote reaches the configuration
+git reads. This replaced a design that validated the producer'"'"'s `.git/config`
+before each push, which was a check-then-exec race: the producer could replace
+the file between the check and git reading it. The boundary is **probed, not
+asserted**: `doctor` runs a write attempt *as the producer'"'"'s OS user*, requires
+it to fail against `submit_repo`, and requires the same probe to succeed against
+the producer'"'"'s workdir — otherwise "cannot write" is just a probe that cannot
+write anything.
+
+**The transport environment is constructed, not filtered.** Every git process
+starts from an environment factoryd builds — `PATH` and `HOME` from config,
+global and system git config at `/dev/null`, no interactive fallback — and
+nothing else. "Drop inherited `GIT_*`" was a denylist wearing an environment'"'"'s
+clothes: `https_proxy` and `SSL_CERT_FILE` steer the transport and neither
+starts with `GIT_`. A proxy or trust store reaches git only through typed
+config. The repository'"'"'s own `.git/config` is **default-deny**: twelve keys
+that make a clone a clone, and anything else — `http.proxy`, `insteadOf`, a key
+Git adds next year — refuses the operation. Recording the real GitLab answer
+had already shown why hand-written expectations are dangerous; this is the same
+lesson applied to the transport'"'"'s inputs.
+
+**Git'"'"'s identity is asked of git, not inferred from config.** `doctor` runs
+`git credential fill` under the exact isolation the push will use, then asks
+the provider API whose token that is, and requires the answer to match the
+producer'"'"'s API identity. In production the two mechanisms disagreed — git
+pushed as the reviewer while every API check passed — and it failed closed only
+because that credential happened to lack write scope.
+
 **An audit that lists nothing tried is not a pass.** An adversarial pass with an
 empty `attempts` list is rejected at the type boundary, before it reaches the
 provider.
@@ -209,7 +242,9 @@ internal/scm/          Driver interface, typed results, audit wire format
 cmd/fixturerec/        records fixtures from a live provider (dev tooling)
   httpjson/            the shared JSON-over-HTTP client
 internal/supervise/    one role loop, parameterised by role: block, run one
-                       turn, re-arm; the spin guard and the halt sentinel
+                       turn, re-arm; the spin and fail guards, the halt sentinel
+internal/gittransport/ git under an owned environment and identity: the
+                       allowlist, the effective-URL guard, the tree copy
 internal/watch/        inotify with a poll fallback; never consumes a trigger
 internal/config/       one JSON config per factory, decoded strictly
 internal/state/        the single versioned state document, written atomically

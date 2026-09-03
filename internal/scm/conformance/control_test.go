@@ -25,6 +25,7 @@ func githubFactory(dir string) conformance.Factory {
 		Provider:           "github",
 		FixtureDir:         dir,
 		UnmergeableMessage: "Pull Request has merge conflicts",
+		GitUsername:        "x-access-token",
 		New: func(hc *http.Client) (scm.Driver, error) {
 			return github.New(github.Config{
 				BaseURL: "https://api.github.com", Owner: "acme", Repo: "widgets",
@@ -39,6 +40,7 @@ func gitlabFactory(dir string) conformance.Factory {
 		Provider:           "gitlab",
 		FixtureDir:         dir,
 		UnmergeableMessage: "Branch cannot be merged",
+		GitUsername:        "oauth2",
 		New: func(hc *http.Client) (scm.Driver, error) {
 			return gitlab.New(gitlab.Config{
 				BaseURL: "https://gitlab.example.com/api/v4",

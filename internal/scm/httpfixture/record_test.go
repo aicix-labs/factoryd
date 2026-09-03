@@ -3,6 +3,7 @@ package httpfixture_test
 import (
 	"context"
 	"encoding/json"
+	"net"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -148,6 +149,26 @@ func TestBenignContentIsNotFlagged(t *testing.T) {
 
 // ---------- the recorder ----------
 
+// serve starts a test server on IPv4 loopback explicitly. httptest.NewServer
+// falls back to [::1] when 127.0.0.1 is refused, and a sandbox that disallows
+// the IPv6 listener then fails every test here for a reason unrelated to the
+// code under test. Nothing in these tests needs IPv6.
+func serve(t *testing.T, h http.Handler) *httptest.Server {
+	t.Helper()
+	ln, err := net.Listen("tcp4", "127.0.0.1:0")
+	if err != nil {
+		// A sandbox that forbids loopback cannot host a replay server at all;
+		// that is a property of the sandbox, not of the code under test. Skip
+		// with the reason rather than fail, and never silently.
+		t.Skipf("cannot create an IPv4 loopback listener here: %v", err)
+	}
+	s := httptest.NewUnstartedServer(h)
+	s.Listener = ln
+	s.Start()
+	t.Cleanup(s.Close)
+	return s
+}
+
 func liveServer(t *testing.T) *httptest.Server {
 	t.Helper()
 	mux := http.NewServeMux()
@@ -160,9 +181,7 @@ func liveServer(t *testing.T) *httptest.Server {
 		w.WriteHeader(405)
 		_, _ = w.Write([]byte(`{"message":"Branch cannot be merged"}`))
 	})
-	s := httptest.NewServer(mux)
-	t.Cleanup(s.Close)
-	return s
+	return serve(t, mux)
 }
 
 func TestRecorderCapturesAndRedacts(t *testing.T) {
@@ -305,10 +324,9 @@ func TestRecorderRefusesToWriteASecret(t *testing.T) {
 // End to end for the case issue #9 named: the operator registered nothing, and
 // a credential came back in a response body anyway.
 func TestWriteRefusesAnUnregisteredCredential(t *testing.T) {
-	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+	srv := serve(t, http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
 		_, _ = w.Write([]byte(`{"runners_token":"glpat-AAAAAAAAAAAAAAAAAAAA"}`))
 	}))
-	defer srv.Close()
 
 	// Secrets deliberately empty.
 	rec := httpfixture.NewRecorder(httpfixture.NewRedactor(), nil)

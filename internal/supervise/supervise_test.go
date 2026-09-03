@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"os"
+	"os/user"
 	"path/filepath"
 	"strings"
 	"sync"
@@ -63,6 +64,15 @@ type fixture struct {
 	slept  []time.Duration
 }
 
+func currentUser(t *testing.T) string {
+	t.Helper()
+	u, err := user.Current()
+	if err != nil {
+		t.Fatal(err)
+	}
+	return u.Username
+}
+
 func newFixture(t *testing.T) *fixture {
 	t.Helper()
 	root := t.TempDir()
@@ -82,15 +92,19 @@ func newFixture(t *testing.T) *fixture {
 		Provider:      "github",
 		GitHub:        &config.GitHub{Owner: "acme", Repo: "widgets"},
 		TargetBranch:  "main",
-		Paths:         config.Paths{Root: root, ProducerWorkdir: filepath.Join(root, "work")},
+		Git:           config.Git{Remote: "https://github.com/acme/widgets.git", Transport: "https"},
+		Paths:         config.Paths{Root: root, ProducerWorkdir: filepath.Join(root, "work"), SubmitRepo: filepath.Join(root, "submit")},
 		Credentials: config.Credentials{
 			Producer: config.CredentialRef{Env: "P"},
 			Reviewer: config.CredentialRef{Env: "R"},
 		},
-		Gate: config.Gate{Command: []string{"true"}},
+		Gate: config.Gate{Command: []string{"true"}, Env: map[string]string{"PATH": "/usr/bin:/bin"}, RunAs: &config.RunAs{User: "factoryd-gate"}},
 		Roles: config.Roles{
-			Producer: config.RoleSpec{Command: []string{"true"}},
-			Reviewer: config.RoleSpec{Command: []string{"true"}},
+			// The test's own user: switching to oneself needs no privilege, so
+			// the run_as path is exercised without root. The "cannot switch"
+			// case is its own test in runner_test.go.
+			Producer: config.RoleSpec{Command: []string{"true"}, Env: map[string]string{"PATH": os.Getenv("PATH")}, RunAs: &config.RunAs{User: currentUser(t)}},
+			Reviewer: config.RoleSpec{Command: []string{"true"}, Env: map[string]string{"PATH": os.Getenv("PATH")}},
 		},
 		Supervisor: config.Supervisor{
 			SpinWarn: 2, SpinAbort: 4, FailAbort: 3, PollIntervalSeconds: 1, BackoffSeconds: 1,

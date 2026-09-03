@@ -60,6 +60,10 @@ type Factory struct {
 	// to assert GitLab's wording for both, which passed only because the
 	// hand-written GitHub fixture had copied it.
 	UnmergeableMessage string
+
+	// GitUsername is the provider's HTTPS username convention, taken from its
+	// documentation: "x-access-token" for GitHub, "oauth2" for GitLab.
+	GitUsername string
 }
 
 // Result is one scenario's outcome. Err == nil means the scenario passed.
@@ -184,6 +188,8 @@ func scenarios() []scenario {
 		{name: "post_audit", run: scPostAudit},
 		{name: "audits", run: scAudits},
 		{name: "audit_requires_attempts", denyHTTP: true, run: scAuditRequiresAttempts},
+		{name: "git_credential", denyHTTP: true, run: scGitCredential},
+		{name: "whoami_with", run: scWhoamiWith},
 	}
 }
 
@@ -511,6 +517,46 @@ func scAuditRequiresAttempts(ctx context.Context, d scm.Driver, f Factory) error
 	}
 	if !strings.Contains(err.Error(), "attempts") {
 		return fmt.Errorf("PostAudit rejected the audit but the error does not mention attempts: %v", err)
+	}
+	return nil
+}
+
+// GitUsername is the provider's HTTPS username convention, set per Factory. It
+// is asserted rather than merely read back because the two providers disagree
+// and a wrong one authenticates as nobody -- the failure looks like a bad
+// token, not like a bad username.
+func scGitCredential(_ context.Context, d scm.Driver, f Factory) error {
+	c := d.GitCredential("s3cret")
+	if c.Secret != "s3cret" {
+		return fmt.Errorf("GitCredential lost the secret: %+v", c)
+	}
+	if c.Username == "" {
+		return fmt.Errorf("GitCredential returned no username; git needs both halves")
+	}
+	if f.GitUsername == "" {
+		return fmt.Errorf("Factory.GitUsername is empty; this scenario would assert nothing about the convention")
+	}
+	if c.Username != f.GitUsername {
+		return fmt.Errorf("GitCredential username = %q, want the provider's convention %q", c.Username, f.GitUsername)
+	}
+	return nil
+}
+
+// WhoamiWith must resolve an arbitrary secret through the API -- the same
+// exchange as Whoami, under a different header. The header is not recorded, so
+// the fixture is the whoami response; what is asserted is that the driver
+// makes the call at all and maps the answer, and refuses an empty secret
+// without making it.
+func scWhoamiWith(ctx context.Context, d scm.Driver, _ Factory) error {
+	if _, err := d.WhoamiWith(ctx, ""); err == nil {
+		return fmt.Errorf("WhoamiWith accepted an empty secret; identity would be undecided, not satisfied")
+	}
+	id, err := d.WhoamiWith(ctx, "some-other-token")
+	if err != nil {
+		return err
+	}
+	if id.ID == "" || id.Login != ReviewerName {
+		return fmt.Errorf("WhoamiWith resolved %+v, want %s with an id", id, ReviewerName)
 	}
 	return nil
 }

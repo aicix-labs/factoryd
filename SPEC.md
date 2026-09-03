@@ -391,6 +391,48 @@ boundary to verify and `doctor` fails, saying so. An unenforced separation
 recorded as enforced is worse than none: it is the two-party split on paper with
 nothing holding it up.
 
+**The gate is a third principal.** It runs producer-authored build and test
+code inside the factoryd-owned repository, and factoryd itself holds root in
+order to switch identities. Run as factoryd, that code reads every credential
+on the host and can rewrite the submit repository's hooks; run as the producer,
+it cannot write the build outputs it exists to produce. So `gate.run_as` names
+an unprivileged user distinct from both, and `doctor` probes it the same way it
+probes the producer:
+
+- it **can** write each path in `gate.required_writable_paths` — the control,
+  so that "cannot" below is not a gate that cannot do anything;
+- it **cannot** write `submit_repo/.git` — producer-authored code run by the
+  gate could otherwise plant a hook that runs during `git push`, after the
+  guard, with the credential helper active;
+- it **cannot read** either credential file.
+
+The same reasoning governs what crosses into the submit tree. A symlink is
+judged by where it will point **after** it is recreated in the destination, not
+by where it points in the source: a link `hooks -> .git/hooks` is "inside" the
+producer's tree — whose `.git` is skipped, so it may not even resolve there —
+yet recreated verbatim it points at the factory-owned hooks directory. Absolute
+targets, targets that escape via `..`, and targets passing through any `.git`
+component are refused.
+
+**Every turn's environment is constructed, like the gate's.** `roles.<role>.env`
+is the whole environment beyond `FACTORYD_*`; nothing is inherited. Passing the
+supervisor's environment through would hand the producer every variable the
+supervisor holds — including a reviewer credential named by
+`credentials.reviewer.env` — and the two-party model would be one `getenv` away
+from gone. The reviewer's credential variable is delivered to the reviewer's
+turn by name; the producer receives no credential of either role, because it
+never runs git and never calls the API. Commands are resolved against the
+declared `PATH`, not the process's: `doctor`'s shell can find `go` where the
+gate's environment cannot, and a green `doctor` would then vouch for a gate that
+fails on its first run.
+
+**The remote is pinned by authority, not only by path.**
+`https://evil.example/acme/widgets.git` names the right project on the wrong
+host, and every downstream check — the guard, the identity oracle — would then
+faithfully verify and push the producer's credential to it. The expected host is
+derived from the provider block: `github.com` for the public API, the
+`base_url`'s authority for GitHub Enterprise and for every GitLab.
+
 **The submit repository must be a clone, not a git worktree.** A worktree keeps
 its refs in the parent repository, so the refs submit writes would land outside
 the directory whose ownership was just established.
@@ -855,6 +897,12 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §4.4 the race is gone | `.git/config` in the **producer workdir** is replaced — with a proxy, a rewrite, anything — at any moment, including after every check and while the push is running: the push is unaffected, because git never reads that file | the identical setting placed in `paths.submit_repo`'s config **does** refuse, proving the test can detect it at all |
 | §4.4 control data never crosses | a `.git` anywhere in the producer tree, at any depth, is copied into the submit repository | an ordinary source tree copies intact |
 | §4.4 symlink escape | a symlink in the producer tree resolving outside it is followed | a symlink within the tree is preserved |
+| §4.4 symlink into `.git` | a link whose recreated target passes through `.git` (`hooks -> .git/hooks`, `x -> ../.git/config`) is copied | an in-tree link to a plain file is preserved |
+| §4.4 gate identity | the gate user can write `submit_repo/.git`, or can read either credential file → refuse | the gate user can write each declared path, so "cannot" is not a gate that cannot do anything |
+| §4.4 gate is its own user | `gate.run_as` is empty, or names the producer's user → refuse at load | distinct users pass |
+| §4.4 turn env is owned | a reviewer credential present in the supervisor's environment reaches the producer's turn | the reviewer's turn receives that same variable, by name |
+| §4.4 declared `PATH` | the gate or turn command is found on doctor's own `PATH` but not on the declared one → doctor refuses; the turn refuses to start | found on the declared `PATH` passes |
+| §5.4 remote authority | `git.remote` names the right project on a host other than the provider's (or on another port) → refuse at load | the provider's host passes; a GHE `base_url` accepts the GHE host and refuses `github.com` |
 | §4.4 gate paths | a declared path exists as a non-directory, or cannot be created → exit **3** | a genuinely red gate still exits **5**, and an absent-but-creatable path is created and passes |
 | §4.4 unset `${VAR}` | a referenced variable is unset → refuse | a set variable resolves and passes |
 | §4.1 doctor covers the above | each condition above, reached through `doctor` rather than only through unit tests | a healthy factory passes every check |

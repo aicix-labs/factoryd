@@ -1,5 +1,5 @@
 {
-  "schema_version": 2,
+  "schema_version": 3,
   "name": "widgets",
   "provider": "github",
   "github": {
@@ -8,9 +8,14 @@
     "merge_method": "merge"
   },
   "target_branch": "main",
+  "git": {
+    "remote": "https://github.com/acme/widgets.git",
+    "transport": "https"
+  },
   "paths": {
     "root": "/var/lib/factoryd/widgets",
-    "producer_workdir": "/var/lib/factoryd/widgets/clone"
+    "producer_workdir": "/var/lib/factoryd/widgets/clone",
+    "submit_repo": "/var/lib/factoryd/widgets/submit"
   },
   "credentials": {
     "producer": {
@@ -26,6 +31,18 @@
       "-c",
       "go build ./... && go vet ./... && go test -count=1 ./..."
     ],
+    "env": {
+      "PATH": "/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin",
+      "HOME": "/var/lib/factoryd/widgets",
+      "GOCACHE": "/var/cache/factoryd/widgets/go",
+      "GOFLAGS": "-count=1"
+    },
+    "required_writable_paths": [
+      "${GOCACHE}"
+    ],
+    "run_as": {
+      "user": "factoryd-gate"
+    },
     "timeout_seconds": 900
   },
   "roles": {
@@ -33,12 +50,23 @@
       "command": [
         "/usr/local/bin/factory-producer-turn"
       ],
-      "timeout_seconds": 3600
+      "env": {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": "/var/lib/factoryd/widgets"
+      },
+      "timeout_seconds": 3600,
+      "run_as": {
+        "user": "factoryd-producer"
+      }
     },
     "reviewer": {
       "command": [
         "/usr/local/bin/factory-reviewer-turn"
       ],
+      "env": {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": "/var/lib/factoryd/widgets"
+      },
       "timeout_seconds": 1800
     }
   },

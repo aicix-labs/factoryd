@@ -241,4 +241,20 @@ type Driver interface {
 	Audits(ctx context.Context, id ChangeID, sha string) ([]Audit, error)
 
 	Whoami(ctx context.Context) (Identity, error)
+
+	// WhoamiWith resolves the identity of an arbitrary secret, so the git
+	// transport can ask "whose token did git just resolve?" of the API rather
+	// than of configuration (SPEC.md §5.4). No I/O beyond the one request.
+	WhoamiWith(ctx context.Context, secret string) (Identity, error)
+
+	// GitCredential is what git is handed over HTTPS for this provider. The
+	// username half is provider-owned: GitHub and GitLab do not agree on it,
+	// so it cannot be derived from the token alone. Pure; no I/O.
+	GitCredential(secret string) GitCredential
+}
+
+// GitCredential is a username/secret pair for git's credential protocol.
+type GitCredential struct {
+	Username string
+	Secret   string
 }
