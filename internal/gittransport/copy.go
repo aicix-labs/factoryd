@@ -82,15 +82,19 @@ func CopyTree(src, dst string) error {
 		target := filepath.Join(dst, rel)
 
 		if d.Type()&os.ModeSymlink != 0 {
-			resolved, err := filepath.EvalSymlinks(path)
-			if err != nil {
-				return fmt.Errorf("copytree: %s: %w", rel, err)
-			}
-			if resolved != src && !strings.HasPrefix(resolved, src+string(os.PathSeparator)) {
-				return fmt.Errorf("copytree: %s is a symlink resolving outside the producer tree (%s); refusing", rel, resolved)
-			}
 			link, err := os.Readlink(path)
 			if err != nil {
+				return err
+			}
+			// Judged by where the link will point AFTER it is recreated in the
+			// destination, not by where it points in the source. A link such
+			// as hooks -> .git/hooks is "inside" the producer tree -- the
+			// producer's .git is skipped, so it may not even resolve there --
+			// yet recreated verbatim it points at the factory-owned
+			// submit_repo/.git/hooks. Once the gate runs producer-authored code
+			// it can write through that link, and the hook then runs during
+			// git push with the credential helper active.
+			if err := checkLinkTarget(rel, link); err != nil {
 				return err
 			}
 			return os.Symlink(link, target)
@@ -125,4 +129,25 @@ func copyFile(src, dst string, mode fs.FileMode) error {
 		return err
 	}
 	return out.Close()
+}
+
+// checkLinkTarget refuses a symlink target that is absolute, that escapes the
+// tree via "..", or that passes through a ".git" component -- judged lexically
+// relative to the link's own directory, which is exactly how the recreated
+// link will resolve in the destination.
+func checkLinkTarget(linkRel, target string) error {
+	if filepath.IsAbs(target) {
+		return fmt.Errorf("copytree: %s is an absolute symlink (%s); refusing", linkRel, target)
+	}
+	// Where does it land, relative to the tree root?
+	landing := filepath.Clean(filepath.Join(filepath.Dir(linkRel), target))
+	if landing == ".." || strings.HasPrefix(landing, ".."+string(os.PathSeparator)) {
+		return fmt.Errorf("copytree: %s is a symlink escaping the tree (%s); refusing", linkRel, target)
+	}
+	for _, part := range strings.Split(landing, string(os.PathSeparator)) {
+		if part == ".git" {
+			return fmt.Errorf("copytree: %s is a symlink into .git (%s); it would point at the submit repository's own control data once recreated; refusing", linkRel, target)
+		}
+	}
+	return nil
 }

@@ -21,6 +21,13 @@ type Prober interface {
 	// dir. It must attempt the write, not reason about permissions: a
 	// reasoned answer is an assumption wearing a check's clothes.
 	CanWrite(ctx context.Context, dir string) (bool, error)
+	// CanRead reports whether the principal can read the file at path. Used
+	// against credential files: a gate that can read the reviewer's token has
+	// the two-party model in its hands.
+	CanRead(ctx context.Context, path string) (bool, error)
+	// Own makes path writable by the principal -- what submit does for each
+	// declared gate path when it creates it. A no-op when not privileged.
+	Own(path string) error
 	// Describe names the principal, for the report.
 	Describe() string
 }
@@ -74,7 +81,11 @@ func (p *setuidProber) CanWrite(ctx context.Context, dir string) (bool, error) {
 	// A shell one-liner, so no factoryd code runs as the producer.
 	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", `touch "$1" && rm -f "$1"`, "probe", probe)
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
-	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: p.uid, Gid: p.gid, NoSetGroups: true}}
+	// Groups explicitly empty: with NoSetGroups the child keeps factoryd's
+	// supplementary groups -- root's -- and answers the question for the
+	// wrong principal. The live probe reported "CAN write .git" while sudo -u
+	// was refused, which is how this was found.
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: p.uid, Gid: p.gid, Groups: []uint32{}}}
 	err := cmd.Run()
 	if err == nil {
 		return true, nil
@@ -86,6 +97,38 @@ func (p *setuidProber) CanWrite(ctx context.Context, dir string) (bool, error) {
 	// Could not even start the child -- most often EPERM from setuid without
 	// privilege. That is undecided, which is not the same as satisfied.
 	return false, fmt.Errorf("could not run the probe as %s: %w (factoryd needs CAP_SETUID or root to switch user)", p.Describe(), err)
+}
+
+// CanRead attempts a read as the principal, by the same mechanism as CanWrite.
+func (p *setuidProber) CanRead(ctx context.Context, path string) (bool, error) {
+	if uint32(os.Geteuid()) == p.uid {
+		return false, fmt.Errorf("doctor runs as uid %d, the same identity as %s; there is no boundary to verify", p.uid, p.name)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", `head -c 1 "$1" >/dev/null`, "probe", path)
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: p.uid, Gid: p.gid, Groups: []uint32{}}}
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	var ee *exec.ExitError
+	if asExitError(err, &ee) {
+		return false, nil
+	}
+	return false, fmt.Errorf("could not run the read probe as %s: %w (factoryd needs CAP_SETUID or root to switch user)", p.Describe(), err)
+}
+
+// Own chowns path to the principal. Without privilege it does nothing and
+// returns nil: the subsequent write probe then reports whether the host is
+// already arranged correctly, which is the honest answer an unprivileged doctor
+// can give.
+func (p *setuidProber) Own(path string) error {
+	if os.Geteuid() != 0 {
+		return nil
+	}
+	return os.Chown(path, int(p.uid), int(p.gid))
 }
 
 func asExitError(err error, target **exec.ExitError) bool {

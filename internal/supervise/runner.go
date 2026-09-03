@@ -49,7 +49,14 @@ func (r *ExecRunner) Run(ctx context.Context, t Turn, started func(proc.Ref)) (T
 		defer cancel()
 	}
 
-	cmd := exec.CommandContext(turnCtx, spec.Command[0], spec.Command[1:]...)
+	// Resolved against the turn's OWN PATH, then executed by absolute path,
+	// so what doctor could find and what the turn can find are the same
+	// question with the same answer.
+	exe, lookErr := config.LookPathIn(spec.Env["PATH"], spec.Command[0])
+	if lookErr != nil {
+		return TurnResult{ExitCode: -1}, fmt.Errorf("exec: %s turn: %w", r.Role, lookErr)
+	}
+	cmd := exec.CommandContext(turnCtx, exe, spec.Command[1:]...)
 	cmd.Dir = r.Config.TurnWorkdir(r.Role)
 	cmd.Stdout = r.Stdout
 	cmd.Stderr = r.Stderr
@@ -78,6 +85,12 @@ func (r *ExecRunner) Run(ctx context.Context, t Turn, started func(proc.Ref)) (T
 	cmd.WaitDelay = 10 * time.Second
 
 	if err := cmd.Start(); err != nil {
+		if spec.RunAs != nil && spec.RunAs.User != "" {
+			// Name the switch, whatever errno the kernel or a sandbox returned
+			// for it: the operator needs to know the turn did not start as
+			// factoryd instead.
+			return TurnResult{ExitCode: -1}, fmt.Errorf("exec: could not start the %s turn as run_as user %q: %w", r.Role, spec.RunAs.User, err)
+		}
 		return TurnResult{ExitCode: -1}, fmt.Errorf("exec: starting the %s turn: %w", r.Role, err)
 	}
 	if started != nil {
@@ -130,24 +143,30 @@ func (r *ExecRunner) env(t Turn) []string {
 	for _, tr := range t.Triggers {
 		trigPaths = append(trigPaths, tr.Path)
 	}
-	return append(os.Environ(),
-		"FACTORYD_FACTORY="+r.Config.Name,
-		"FACTORYD_ROLE="+r.Role,
-		"FACTORYD_TURN="+t.ID,
-		"FACTORYD_ROOT="+r.Config.Paths.Root,
-		"FACTORYD_INBOX="+r.Config.InboxDir(),
-		"FACTORYD_OUTBOX="+r.Config.OutboxDir(),
-		"FACTORYD_WORKDIR="+r.Config.TurnWorkdir(r.Role),
-		"FACTORYD_TARGET_BRANCH="+r.Config.TargetBranch,
-		"FACTORYD_PROGRESS="+r.Config.ProgressPath(r.Role),
-		"FACTORYD_TRIGGERS="+labels(t.Triggers),
-		"FACTORYD_TRIGGER_PATHS="+strings.Join(trigPaths, string(os.PathListSeparator)),
-	)
+	factoryd := map[string]string{
+		"FACTORYD_FACTORY":       r.Config.Name,
+		"FACTORYD_ROLE":          r.Role,
+		"FACTORYD_TURN":          t.ID,
+		"FACTORYD_ROOT":          r.Config.Paths.Root,
+		"FACTORYD_INBOX":         r.Config.InboxDir(),
+		"FACTORYD_OUTBOX":        r.Config.OutboxDir(),
+		"FACTORYD_WORKDIR":       r.Config.TurnWorkdir(r.Role),
+		"FACTORYD_TARGET_BRANCH": r.Config.TargetBranch,
+		"FACTORYD_PROGRESS":      r.Config.ProgressPath(r.Role),
+		"FACTORYD_TRIGGERS":      labels(t.Triggers),
+		"FACTORYD_TRIGGER_PATHS": strings.Join(trigPaths, string(os.PathListSeparator)),
+	}
+	// Constructed, never inherited: os.Environ() is consulted for exactly the
+	// reviewer's credential name and nothing else (Config.TurnEnv).
+	return r.Config.TurnEnv(r.Role, factoryd, os.Environ())
 }
 
 // credentialFor resolves an OS user to the credential the turn is started
 // with. Resolved at launch, not at load, so a user deleted since doctor ran
 // fails here by name.
+// CredentialFor is exported for its test; it is not part of the runner's API.
+func CredentialFor(name string) (*syscall.Credential, error) { return credentialFor(name) }
+
 func credentialFor(name string) (*syscall.Credential, error) {
 	u, err := user.Lookup(name)
 	if err != nil {
@@ -161,5 +180,10 @@ func credentialFor(name string) (*syscall.Credential, error) {
 	if err != nil {
 		return nil, err
 	}
-	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), NoSetGroups: true}, nil
+	// Groups is set to an explicitly empty list, not left nil with NoSetGroups.
+	// NoSetGroups keeps the PARENT's supplementary groups -- factoryd's, which
+	// is root's -- so a "producer" turn would still be in group root, and a
+	// 775 root:root .git is writable by it. Found by doctor's live probe: the
+	// setuid child could write what sudo -u could not.
+	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: []uint32{}}, nil
 }

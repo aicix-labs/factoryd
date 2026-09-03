@@ -28,11 +28,12 @@ const good = `{
   "gate": {
     "command": ["go", "test", "./..."],
     "env": {"PATH": "/usr/local/go/bin:/usr/bin:/bin", "HOME": "/var/lib/factoryd/widgets", "GOCACHE": "/var/cache/factoryd/go"},
-    "required_writable_paths": ["${GOCACHE}", "build/out"]
+    "required_writable_paths": ["${GOCACHE}", "build/out"],
+    "run_as": {"user": "factoryd-gate"}
   },
   "roles": {
-    "producer": {"command": ["claude", "-p", "producer-brief"], "run_as": {"user": "factoryd-producer"}},
-    "reviewer": {"command": ["claude", "-p", "reviewer-playbook"]}
+    "producer": {"command": ["claude", "-p", "producer-brief"], "env": {"PATH": "/usr/local/bin:/usr/bin:/bin"}, "run_as": {"user": "factoryd-producer"}},
+    "reviewer": {"command": ["claude", "-p", "reviewer-playbook"], "env": {"PATH": "/usr/local/bin:/usr/bin:/bin"}}
   },
   "alerts": [{"kind": "file", "path": "/var/log/factoryd/alerts.log"}]
 }`
@@ -74,19 +75,33 @@ func TestUnknownKeyIsRefused(t *testing.T) {
 
 func TestValidationFailures(t *testing.T) {
 	cases := map[string]struct{ from, to, want string }{
-		"missing schema version":  {`"schema_version": 3,`, ``, "schema_version"},
-		"future schema version":   {`"schema_version": 3`, `"schema_version": 99`, "schema_version"},
-		"previous schema version": {`"schema_version": 3`, `"schema_version": 2`, "schema_version"},
-		"no producer turn":        {`"command": ["claude", "-p", "producer-brief"], `, `"command": [], `, "roles.producer.command"},
-		"warn at or above abort":  {`"gate":`, `"supervisor": {"spin_warn": 9, "spin_abort": 4}, "gate":`, "spin_warn"},
-		"negative fail abort":     {`"gate":`, `"supervisor": {"fail_abort": -1}, "gate":`, "fail_abort"},
-		"empty name":              {`"name": "widgets"`, `"name": ""`, "name"},
-		"unknown provider":        {`"provider": "github"`, `"provider": "bitbucket"`, "provider"},
-		"no target branch":        {`"target_branch": "main"`, `"target_branch": ""`, "target_branch"},
-		"empty gate":              {`"command": ["go", "test", "./..."]`, `"command": []`, "gate.command"},
-		"no alerts":               {`[{"kind": "file", "path": "/var/log/factoryd/alerts.log"}]`, `[]`, "alert transport"},
-		"unknown alert kind":      {`"kind": "file"`, `"kind": "carrier-pigeon"`, "carrier-pigeon"},
-		"alert missing path":      {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "file"}`, "no path"},
+		"missing schema version":              {`"schema_version": 3,`, ``, "schema_version"},
+		"future schema version":               {`"schema_version": 3`, `"schema_version": 99`, "schema_version"},
+		"previous schema version":             {`"schema_version": 3`, `"schema_version": 2`, "schema_version"},
+		"no producer turn":                    {`"command": ["claude", "-p", "producer-brief"], `, `"command": [], `, "roles.producer.command"},
+		"warn at or above abort":              {`"gate":`, `"supervisor": {"spin_warn": 9, "spin_abort": 4}, "gate":`, "spin_warn"},
+		"no submit repo":                      {`"submit_repo": "/var/lib/factoryd/widgets/submit"`, `"submit_repo": ""`, "submit_repo"},
+		"submit repo is the workdir":          {`"submit_repo": "/var/lib/factoryd/widgets/submit"`, `"submit_repo": "/var/lib/factoryd/widgets/work"`, "two-directory"},
+		"ssh transport refused":               {`"transport": "https"`, `"transport": "ssh"`, "not implemented"},
+		"no transport":                        {`"transport": "https"`, `"transport": ""`, "git.transport"},
+		"remote names another project":        {`"remote": "https://github.com/acme/widgets.git"`, `"remote": "https://github.com/acme/other.git"`, "different repository"},
+		"remote on a hostile host, same path": {`"remote": "https://github.com/acme/widgets.git"`, `"remote": "https://evil.example/acme/widgets.git"`, "not the provider"},
+		"remote on a hostile port":            {`"remote": "https://github.com/acme/widgets.git"`, `"remote": "https://github.com:8443/acme/widgets.git"`, "not the provider"},
+		"credentials in the remote URL":       {`"remote": "https://github.com/acme/widgets.git"`, `"remote": "https://token@github.com/acme/widgets.git"`, "never through a URL"},
+		"no run_as":                           {`, "run_as": {"user": "factoryd-producer"}`, ``, "run_as"},
+		"no PATH in gate env":                 {`"PATH": "/usr/local/go/bin:/usr/bin:/bin", `, ``, "PATH"},
+		"path references unset var":           {`"${GOCACHE}"`, `"${TMPDIR}"`, "does not set"},
+		"path with glob":                      {`"build/out"`, `"build/*"`, "no globbing"},
+		"no gate run_as":                      {`"run_as": {"user": "factoryd-gate"}`, `"run_as": {"user": ""}`, "gate.run_as"},
+		"gate shares the producer's user":     {`"run_as": {"user": "factoryd-gate"}`, `"run_as": {"user": "factoryd-producer"}`, "cannot share"},
+		"negative fail abort":                 {`"gate":`, `"supervisor": {"fail_abort": -1}, "gate":`, "fail_abort"},
+		"empty name":                          {`"name": "widgets"`, `"name": ""`, "name"},
+		"unknown provider":                    {`"provider": "github"`, `"provider": "bitbucket"`, "provider"},
+		"no target branch":                    {`"target_branch": "main"`, `"target_branch": ""`, "target_branch"},
+		"empty gate":                          {`"command": ["go", "test", "./..."]`, `"command": []`, "gate.command"},
+		"no alerts":                           {`[{"kind": "file", "path": "/var/log/factoryd/alerts.log"}]`, `[]`, "alert transport"},
+		"unknown alert kind":                  {`"kind": "file"`, `"kind": "carrier-pigeon"`, "carrier-pigeon"},
+		"alert missing path":                  {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "file"}`, "no path"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -102,6 +117,46 @@ func TestValidationFailures(t *testing.T) {
 				t.Fatalf("error does not mention %q: %v", c.want, err)
 			}
 		})
+	}
+}
+
+// The git host follows the provider endpoint: github.com for the public API,
+// the base_url's authority for GitHub Enterprise and for every GitLab.
+func TestProviderGitHost(t *testing.T) {
+	cases := []struct {
+		provider, base, want string
+	}{
+		{"github", "", "github.com"},
+		{"github", "https://api.github.com", "github.com"},
+		{"github", "https://ghe.example/api/v3", "ghe.example"},
+		{"github", "https://ghe.example:8443/api/v3", "ghe.example:8443"},
+		{"gitlab", "", "gitlab.com"},
+		{"gitlab", "https://gitlab.dev.aicix.com/api/v4", "gitlab.dev.aicix.com"},
+	}
+	for _, c := range cases {
+		cfg := &config.Config{Provider: c.provider}
+		if c.provider == "github" {
+			cfg.GitHub = &config.GitHub{BaseURL: c.base}
+		} else {
+			cfg.GitLab = &config.GitLab{BaseURL: c.base}
+		}
+		got, err := cfg.ProviderGitHost()
+		if err != nil || got != c.want {
+			t.Errorf("%s base=%q: host=%q err=%v, want %q", c.provider, c.base, got, err, c.want)
+		}
+	}
+	// A GHE remote on the GHE host passes; the same path on github.com does not.
+	ghe := strings.Replace(good, `"github": {"owner": "acme", "repo": "widgets"}`, `"github": {"owner": "acme", "repo": "widgets", "base_url": "https://ghe.example/api/v3"}`, 1)
+	ghe = strings.Replace(ghe, `"remote": "https://github.com/acme/widgets.git"`, `"remote": "https://ghe.example/acme/widgets.git"`, 1)
+	if ghe == good {
+		t.Fatal("test setup did not modify the config")
+	}
+	if _, err := config.Load(write(t, ghe)); err != nil {
+		t.Fatalf("a GHE remote on the GHE host was refused: %v", err)
+	}
+	wrong := strings.Replace(ghe, `"remote": "https://ghe.example/acme/widgets.git"`, `"remote": "https://github.com/acme/widgets.git"`, 1)
+	if _, err := config.Load(write(t, wrong)); err == nil {
+		t.Fatal("a github.com remote was accepted for a GHE provider")
 	}
 }
 

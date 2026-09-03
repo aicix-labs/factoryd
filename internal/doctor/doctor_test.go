@@ -40,16 +40,30 @@ func builder(listErr error) doctor.DriverBuilder {
 // fakeProber answers the boundary question from a table: which directories
 // the "producer" can write. Never touches privilege.
 type fakeProber struct {
+	name     string
 	writable map[string]bool
+	readable map[string]bool
 	err      error
 }
 
-func (f fakeProber) Describe() string { return "fake-producer (uid 4242)" }
+func (f fakeProber) Describe() string {
+	if f.name == "" {
+		return "fake-producer (uid 4242)"
+	}
+	return f.name
+}
 func (f fakeProber) CanWrite(_ context.Context, dir string) (bool, error) {
 	if f.err != nil {
 		return false, f.err
 	}
 	return f.writable[dir], nil
+}
+func (f fakeProber) Own(string) error { return nil }
+func (f fakeProber) CanRead(_ context.Context, path string) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.readable[path], nil
 }
 
 // healthyDeps wires fakes for a healthy factory: the producer can write its
@@ -58,7 +72,19 @@ func (f fakeProber) CanWrite(_ context.Context, dir string) (bool, error) {
 func healthyDeps(cfg *config.Config, listErr error) doctor.Deps {
 	return doctor.Deps{
 		NewDriver: builder(listErr),
-		NewProber: func(*config.RunAs) (doctor.Prober, error) {
+		// One fake serves both principals, keyed on the run_as user: the
+		// producer may write only its workdir; the gate may write the declared
+		// paths and nothing else, and may read no credential.
+		NewProber: func(ra *config.RunAs) (doctor.Prober, error) {
+			if ra != nil && ra.User == "factoryd-gate" {
+				w := map[string]bool{}
+				for _, p := range cfg.Gate.RequiredWritablePaths {
+					if r, err := cfg.ResolveGatePath(p); err == nil {
+						w[r] = true
+					}
+				}
+				return fakeProber{name: "fake-gate (uid 4343)", writable: w}, nil
+			}
 			return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
 		},
 		GitIdentity: func(_ context.Context, _ *config.Config, _ scm.Driver, secret string) (string, error) {
@@ -107,10 +133,11 @@ func fixture(t *testing.T) *config.Config {
 			Producer: config.CredentialRef{File: filepath.Join(root, "producer.token")},
 			Reviewer: config.CredentialRef{File: filepath.Join(root, "reviewer.token")},
 		},
-		Gate: config.Gate{Command: []string{gate}, Env: map[string]string{"PATH": "/usr/bin:/bin"}},
+		Gate: config.Gate{Command: []string{gate}, Env: map[string]string{"PATH": "/usr/bin:/bin"},
+			RunAs: &config.RunAs{User: "factoryd-gate"}, RequiredWritablePaths: []string{"build/out"}},
 		Roles: config.Roles{
-			Producer: config.RoleSpec{Command: []string{gate}, RunAs: &config.RunAs{User: "nobody"}},
-			Reviewer: config.RoleSpec{Command: []string{gate}},
+			Producer: config.RoleSpec{Command: []string{gate}, Env: map[string]string{"PATH": os.Getenv("PATH")}, RunAs: &config.RunAs{User: "nobody"}},
+			Reviewer: config.RoleSpec{Command: []string{gate}, Env: map[string]string{"PATH": os.Getenv("PATH")}},
 		},
 		Supervisor: config.Supervisor{
 			SpinWarn: config.DefaultSpinWarn, SpinAbort: config.DefaultSpinAbort,
@@ -383,6 +410,48 @@ func TestBoundaryTransportAndGateFailuresAreCaught(t *testing.T) {
 			wantName: "git config allowlist", wantText: "http.proxy",
 		},
 		{
+			name: "the gate can write .git",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				d.NewProber = func(ra *config.RunAs) (doctor.Prober, error) {
+					if ra.User == "factoryd-gate" {
+						return fakeProber{name: "gate", writable: map[string]bool{
+							filepath.Join(cfg.Paths.SubmitRepo, ".git"):      true,
+							filepath.Join(cfg.Paths.SubmitRepo, "build/out"): true}}, nil
+					}
+					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+				}
+			},
+			wantName: "gate cannot touch .git", wantText: "plant a hook",
+		},
+		{
+			name: "the gate can read the reviewer credential",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				d.NewProber = func(ra *config.RunAs) (doctor.Prober, error) {
+					if ra.User == "factoryd-gate" {
+						return fakeProber{name: "gate",
+							writable: map[string]bool{filepath.Join(cfg.Paths.SubmitRepo, "build/out"): true},
+							readable: map[string]bool{cfg.Credentials.Reviewer.File: true}}, nil
+					}
+					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+				}
+			},
+			wantName: "gate cannot read reviewer credential", wantText: "two-party",
+		},
+		{
+			// The control for the two above: "cannot" must not be a gate that
+			// cannot do anything.
+			name: "the gate cannot write a path it declared",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				d.NewProber = func(ra *config.RunAs) (doctor.Prober, error) {
+					if ra.User == "factoryd-gate" {
+						return fakeProber{name: "gate", writable: map[string]bool{}}, nil
+					}
+					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+				}
+			},
+			wantName: "gate can write build/out", wantText: "declared it needs",
+		},
+		{
 			name: "a gate path references an unset variable",
 			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
 				cfg.Gate.RequiredWritablePaths = []string{"${NOPE}/cache"}
@@ -447,5 +516,24 @@ func TestAbsentButCreatableGatePathIsAccepted(t *testing.T) {
 	}
 	if !r.OK() {
 		t.Fatalf("unrelated failures: %v", failedNames(r))
+	}
+}
+
+// doctor must resolve the gate command where the gate will look, not where
+// doctor's own shell looks. Ambient PATH finds it; the declared PATH does not;
+// doctor must fail.
+func TestGateCommandResolvedAgainstDeclaredPath(t *testing.T) {
+	cfg := fixture(t)
+	cfg.Gate.Command = []string{"true"} // a bare name: resolution is the question
+	cfg.Gate.Env["PATH"] = t.TempDir()  // declared PATH with nothing on it
+	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
+	found := false
+	for _, c := range r.Checks {
+		if c.Name == "gate command" && !c.OK && strings.Contains(c.Err.Error(), "declared PATH") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("doctor passed the gate command against an empty declared PATH (its own PATH found it):\n%s", r)
 	}
 }

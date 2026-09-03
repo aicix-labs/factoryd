@@ -98,13 +98,13 @@ func newFixture(t *testing.T) *fixture {
 			Producer: config.CredentialRef{Env: "P"},
 			Reviewer: config.CredentialRef{Env: "R"},
 		},
-		Gate: config.Gate{Command: []string{"true"}, Env: map[string]string{"PATH": "/usr/bin:/bin"}},
+		Gate: config.Gate{Command: []string{"true"}, Env: map[string]string{"PATH": "/usr/bin:/bin"}, RunAs: &config.RunAs{User: "factoryd-gate"}},
 		Roles: config.Roles{
 			// The test's own user: switching to oneself needs no privilege, so
 			// the run_as path is exercised without root. The "cannot switch"
 			// case is its own test in runner_test.go.
-			Producer: config.RoleSpec{Command: []string{"true"}, RunAs: &config.RunAs{User: currentUser(t)}},
-			Reviewer: config.RoleSpec{Command: []string{"true"}},
+			Producer: config.RoleSpec{Command: []string{"true"}, Env: map[string]string{"PATH": os.Getenv("PATH")}, RunAs: &config.RunAs{User: currentUser(t)}},
+			Reviewer: config.RoleSpec{Command: []string{"true"}, Env: map[string]string{"PATH": os.Getenv("PATH")}},
 		},
 		Supervisor: config.Supervisor{
 			SpinWarn: 2, SpinAbort: 4, FailAbort: 3, PollIntervalSeconds: 1, BackoffSeconds: 1,

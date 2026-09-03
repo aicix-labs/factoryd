@@ -40,6 +40,9 @@
     "required_writable_paths": [
       "${GOCACHE}"
     ],
+    "run_as": {
+      "user": "factoryd-gate"
+    },
     "timeout_seconds": 900
   },
   "roles": {
@@ -47,6 +50,10 @@
       "command": [
         "/usr/local/bin/factory-producer-turn"
       ],
+      "env": {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": "/var/lib/factoryd/widgets"
+      },
       "timeout_seconds": 3600,
       "run_as": {
         "user": "factoryd-producer"
@@ -56,6 +63,10 @@
       "command": [
         "/usr/local/bin/factory-reviewer-turn"
       ],
+      "env": {
+        "PATH": "/usr/local/bin:/usr/bin:/bin",
+        "HOME": "/var/lib/factoryd/widgets"
+      },
       "timeout_seconds": 1800
     }
   },

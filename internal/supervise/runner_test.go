@@ -231,3 +231,83 @@ func TestProducerTurnRefusesToStartAsTheWrongIdentity(t *testing.T) {
 		t.Fatalf("a missing run_as user was not named: %v", err)
 	}
 }
+
+// The producer's environment is constructed. A reviewer credential referenced
+// by credentials.reviewer.env lives in the supervisor's environment, and
+// passing that environment through would put the two-party model one getenv
+// away from gone. The producer must not see it; the reviewer must receive it
+// by name -- the control that proves the mechanism delivers anything at all.
+func TestProducerEnvironmentCarriesNoReviewerCredential(t *testing.T) {
+	const sentinel = "REVIEWER_TOKEN_SENTINEL_9f3c1a"
+	t.Setenv("FACTORYD_TEST_REVIEWER_TOKEN", sentinel)
+	t.Setenv("UNRELATED_AMBIENT", "ambient-value")
+
+	fx, _, out := execFixture(t, []string{"sh", "-c", "env"}, 30)
+	fx.cfg.Credentials.Reviewer = config.CredentialRef{Env: "FACTORYD_TEST_REVIEWER_TOKEN"}
+	fx.cfg.Roles.Producer.Command = []string{"sh", "-c", "env"}
+	fx.cfg.Roles.Producer.RunAs = &config.RunAs{User: currentUser(t)}
+
+	pr := &supervise.ExecRunner{Config: fx.cfg, Role: "producer", Stdout: out, Stderr: out}
+	if _, err := pr.Run(context.Background(), turn(fx, 0), nil); err != nil {
+		t.Fatal(err)
+	}
+	env := out.String()
+	if strings.Contains(env, sentinel) {
+		t.Fatalf("the reviewer credential reached the producer's environment:\n%s", env)
+	}
+	if strings.Contains(env, "ambient-value") {
+		t.Fatalf("an ambient variable reached the producer's environment; it is not constructed:\n%s", env)
+	}
+	if !strings.Contains(env, "FACTORYD_ROLE=producer") {
+		t.Fatalf("the constructed environment is missing FACTORYD_ROLE:\n%s", env)
+	}
+
+	// Control: the reviewer DOES receive it, by name, and still nothing else.
+	out.Reset()
+	rr := &supervise.ExecRunner{Config: fx.cfg, Role: "reviewer", Stdout: out, Stderr: out}
+	if _, err := rr.Run(context.Background(), turn(fx, 0), nil); err != nil {
+		t.Fatal(err)
+	}
+	env = out.String()
+	if !strings.Contains(env, "FACTORYD_TEST_REVIEWER_TOKEN="+sentinel) {
+		t.Fatalf("the reviewer did not receive its own credential; the mechanism delivers nothing:\n%s", env)
+	}
+	if strings.Contains(env, "ambient-value") {
+		t.Fatalf("an ambient variable reached the reviewer's environment:\n%s", env)
+	}
+}
+
+// A command is resolved against the turn's declared PATH, not the process's.
+func TestTurnCommandResolvesAgainstDeclaredPath(t *testing.T) {
+	fx, r, _ := execFixture(t, []string{"true"}, 30)
+	spec := fx.cfg.Roles.Reviewer
+	spec.Env = map[string]string{"PATH": t.TempDir()} // declared PATH with nothing on it
+	fx.cfg.Roles.Reviewer = spec
+	_, err := r.Run(context.Background(), turn(fx, 0), nil)
+	if err == nil {
+		t.Fatal("the turn ran a command its declared PATH cannot find; it was resolved against the supervisor's PATH")
+	}
+	if !strings.Contains(err.Error(), "declared PATH") {
+		t.Fatalf("the failure does not say the declared PATH is the problem: %v", err)
+	}
+}
+
+// The credential a run_as turn is started with must drop the parent's
+// supplementary groups. NoSetGroups keeps them -- and factoryd's are root's --
+// so a producer turn would still be in group root and a 775 root:root .git is
+// writable by it. This pins the shape; the live doctor probe is what found it.
+func TestRunAsCredentialDropsSupplementaryGroups(t *testing.T) {
+	cred, err := supervise.CredentialFor(currentUser(t))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if cred.NoSetGroups {
+		t.Fatal("NoSetGroups is set; the turn would inherit factoryd's supplementary groups")
+	}
+	if cred.Groups == nil {
+		t.Fatal("Groups is nil; with NoSetGroups false a nil list still means \"do not call setgroups\" on some paths -- it must be explicitly empty")
+	}
+	if len(cred.Groups) != 0 {
+		t.Fatalf("Groups = %v, want none", cred.Groups)
+	}
+}

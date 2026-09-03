@@ -10,7 +10,6 @@ import (
 	"context"
 	"fmt"
 	"os"
-	"os/exec"
 	"path/filepath"
 	"strings"
 	"syscall"
@@ -168,6 +167,64 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 		}
 	}
 
+	// --- the gate's identity, by probe ---
+	// The gate runs producer-authored code. It must be able to write its
+	// declared paths and must not be able to write .git or read a credential.
+	// Each is probed as the gate user; each has its own control.
+	gate, gerr := deps.NewProber(cfg.Gate.RunAs)
+	if gerr != nil {
+		add("gate identity", gerr, "")
+	} else {
+		add("gate identity", nil, gate.Describe())
+		gitDir := filepath.Join(cfg.Paths.SubmitRepo, ".git")
+		if can, err := gate.CanWrite(ctx, gitDir); err != nil {
+			add("gate cannot touch .git", fmt.Errorf("undecided: %v", err), "")
+		} else if can {
+			add("gate cannot touch .git", fmt.Errorf("%s CAN write %s; producer-authored code run by the gate could plant a hook that runs during push", gate.Describe(), gitDir), "")
+		} else {
+			add("gate cannot touch .git", nil, gitDir)
+		}
+		for _, cred := range []struct{ name, file string }{
+			{"reviewer", cfg.Credentials.Reviewer.File}, {"producer", cfg.Credentials.Producer.File},
+		} {
+			if cred.file == "" {
+				continue
+			}
+			if can, err := gate.CanRead(ctx, cred.file); err != nil {
+				add("gate cannot read "+cred.name+" credential", fmt.Errorf("undecided: %v", err), cred.file)
+			} else if can {
+				add("gate cannot read "+cred.name+" credential", fmt.Errorf("%s CAN read %s; the two-party model is in the gate's hands", gate.Describe(), cred.file), cred.file)
+			} else {
+				add("gate cannot read "+cred.name+" credential", nil, cred.file)
+			}
+		}
+		for _, p := range cfg.Gate.RequiredWritablePaths {
+			resolved, err := cfg.ResolveGatePath(p)
+			if err != nil {
+				continue // reported under "gate path" below
+			}
+			// Created here as submit would create it: owned by the gate, so the
+			// gate can write it, inside a repository the gate cannot otherwise
+			// touch. Ownership is applied only when doctor has the privilege
+			// to apply it; otherwise the probe reports the truth of the host.
+			if err := os.MkdirAll(resolved, 0o755); err != nil {
+				add("gate can write "+p, err, resolved)
+				continue
+			}
+			if err := gate.Own(resolved); err != nil {
+				add("gate can write "+p, fmt.Errorf("could not give %s to the gate: %w", resolved, err), resolved)
+				continue
+			}
+			if can, err := gate.CanWrite(ctx, resolved); err != nil {
+				add("gate can write "+p, fmt.Errorf("undecided: %v", err), resolved)
+			} else if !can {
+				add("gate can write "+p, fmt.Errorf("%s cannot write %s, which the gate declared it needs", gate.Describe(), resolved), resolved)
+			} else {
+				add("gate can write "+p, nil, resolved)
+			}
+		}
+	}
+
 	// --- gate environment and paths ---
 	if _, ok := cfg.Gate.Env["PATH"]; !ok {
 		add("gate env", fmt.Errorf("gate.env declares no PATH"), "")
@@ -184,13 +241,16 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 	}
 
 	// --- gate ---
-	add("gate command", checkCommand(cfg.Gate.Command, "gate.command",
+	// Resolved against the DECLARED PATH, not doctor's own. Doctor's shell can
+	// find go where the gate's environment cannot, and then a green doctor
+	// vouches for a gate that fails on its first run.
+	add("gate command", checkCommand(cfg.Gate.Env["PATH"], cfg.Gate.Command, "gate.command",
 		"submit would push code nothing has built"), strings.Join(cfg.Gate.Command, " "))
 
 	// --- role turns ---
 	for _, role := range []string{"producer", "reviewer"} {
 		spec, _ := cfg.RoleSpec(role)
-		add("turn "+role, checkCommand(spec.Command, "roles."+role+".command",
+		add("turn "+role, checkCommand(spec.Env["PATH"], spec.Command, "roles."+role+".command",
 			"the supervisor would have no turn to run"), strings.Join(spec.Command, " "))
 		add("workdir "+role, checkWritableDir(cfg.TurnWorkdir(role)), cfg.TurnWorkdir(role))
 
@@ -354,12 +414,12 @@ func workdirKind(dir string) (string, error) {
 // checkCommand verifies a configured argv is runnable. A command that does not
 // exist fails at the moment it is needed, which for a turn is the moment a
 // trigger arrives and for the gate is the moment a change is ready to push.
-func checkCommand(argv []string, field, consequence string) error {
+func checkCommand(declaredPath string, argv []string, field, consequence string) error {
 	if len(argv) == 0 {
 		return fmt.Errorf("%s is empty; %s", field, consequence)
 	}
-	if _, err := exec.LookPath(argv[0]); err != nil {
-		return fmt.Errorf("%s: %q not found: %w", field, argv[0], err)
+	if _, err := config.LookPathIn(declaredPath, argv[0]); err != nil {
+		return fmt.Errorf("%s: %w", field, err)
 	}
 	return nil
 }

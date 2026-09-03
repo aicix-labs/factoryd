@@ -84,7 +84,7 @@ func newLab(t *testing.T) *lab {
 		GitHub: &config.GitHub{Owner: "acme", Repo: "widgets"}, TargetBranch: "main",
 		Git:   config.Git{Remote: "file://" + l.bare, Transport: "https"},
 		Paths: config.Paths{Root: root, ProducerWorkdir: l.work, SubmitRepo: l.submit},
-		Gate:  config.Gate{Command: []string{"true"}, Env: map[string]string{"PATH": os.Getenv("PATH"), "HOME": root}},
+		Gate:  config.Gate{Command: []string{"true"}, Env: map[string]string{"PATH": os.Getenv("PATH"), "HOME": root}, RunAs: &config.RunAs{User: "factoryd-gate"}},
 	}
 	return l
 }
@@ -323,6 +323,38 @@ func TestCopyTreeExcludesGitControlDataAtAnyDepth(t *testing.T) {
 	}
 	if b, _ := os.ReadFile(filepath.Join(l.submit, ".git", "config")); strings.Contains(string(b), "x") && len(b) == 1 {
 		t.Fatal("the producer's .git/config overwrote the submit repository's")
+	}
+}
+
+// A link that is "inside" the producer tree but resolves into .git once
+// recreated in the submit repository: the producer plants hooks -> .git/hooks
+// (its own .git is skipped, so in the source this may not even resolve). In the
+// destination it points at the factory-owned hooks directory; producer code run
+// by the gate writes a pre-push through it, and that hook runs during git push
+// with the credential helper active. Judged by the landing, not the source.
+func TestCopyTreeRefusesASymlinkIntoDotGit(t *testing.T) {
+	cases := map[string]string{
+		"hooks":           ".git/hooks",
+		"nested/pre-push": "../.git/hooks/pre-push",
+		"deep/a/b/c":      "../../../.git/config",
+		"dotdot-then-git": "sub/../.git/config",
+	}
+	for name, target := range cases {
+		t.Run(name, func(t *testing.T) {
+			l := newLab(t)
+			if err := os.MkdirAll(filepath.Join(l.work, filepath.Dir(name)), 0o755); err != nil {
+				t.Fatal(err)
+			}
+			if err := os.Symlink(target, filepath.Join(l.work, name)); err != nil {
+				t.Fatal(err)
+			}
+			if err := gittransport.CopyTree(l.work, l.submit); err == nil {
+				t.Fatalf("%s -> %s was copied; it would point into the submit repository's .git", name, target)
+			}
+			if _, err := os.Lstat(filepath.Join(l.submit, name)); err == nil {
+				t.Fatalf("%s was planted in the submit tree", name)
+			}
+		})
 	}
 }
 
