@@ -74,7 +74,14 @@ func (r *ExecRunner) Run(ctx context.Context, t Turn, started func(proc.Ref)) (T
 		if err != nil {
 			return TurnResult{ExitCode: -1}, fmt.Errorf("exec: %s turn: %w", r.Role, err)
 		}
-		cmd.SysProcAttr.Credential = cred
+		// A switch to the identity the process already has is not a switch.
+		// Setting a Credential would still call setgroups, which an
+		// unprivileged process cannot -- so an unprivileged factoryd running
+		// a turn as itself would refuse to start for no reason. When there
+		// IS a switch, the credential applies in full, groups dropped.
+		if !isSelf(cred) {
+			cmd.SysProcAttr.Credential = cred
+		}
 	}
 	cmd.Cancel = func() error {
 		if cmd.Process == nil {
@@ -186,4 +193,11 @@ func credentialFor(name string) (*syscall.Credential, error) {
 	// 775 root:root .git is writable by it. Found by doctor's live probe: the
 	// setuid child could write what sudo -u could not.
 	return &syscall.Credential{Uid: uint32(uid), Gid: uint32(gid), Groups: []uint32{}}, nil
+}
+
+// isSelf reports whether cred names the identity this process already runs
+// as. Root is never "self" for this purpose: root switching to root still
+// wants its supplementary groups dropped, and can.
+func isSelf(cred *syscall.Credential) bool {
+	return os.Geteuid() != 0 && int(cred.Uid) == os.Geteuid() && int(cred.Gid) == os.Getegid()
 }
