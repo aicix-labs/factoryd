@@ -43,6 +43,7 @@ type fakeProber struct {
 	name     string
 	writable map[string]bool
 	readable map[string]bool
+	rootOnly map[string]bool
 	err      error
 }
 
@@ -59,6 +60,14 @@ func (f fakeProber) CanWrite(_ context.Context, dir string) (bool, error) {
 	return f.writable[dir], nil
 }
 func (f fakeProber) Own(string) error { return nil }
+
+// CanExec: everything is executable except paths the test marked root-only.
+func (f fakeProber) CanExec(_ context.Context, path string) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return !f.rootOnly[path], nil
+}
 func (f fakeProber) CanRead(_ context.Context, path string) (bool, error) {
 	if f.err != nil {
 		return false, f.err
@@ -452,6 +461,86 @@ func TestBoundaryTransportAndGateFailuresAreCaught(t *testing.T) {
 			wantName: "gate can write build/out", wantText: "declared it needs",
 		},
 		{
+			// A declared path is a capability grant. "." is the repository root,
+			// from which the gate could rename, delete or replace .git.
+			name: "a gate path grants the repository root",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				cfg.Gate.RequiredWritablePaths = []string{"."}
+			},
+			wantName: "gate path .", wantText: "ancestor",
+		},
+		{
+			name: "a gate path grants .git itself",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				cfg.Gate.RequiredWritablePaths = []string{".git"}
+			},
+			wantName: "gate path .git", wantText: "never own",
+		},
+		{
+			name: "a gate path grants something inside .git",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				cfg.Gate.RequiredWritablePaths = []string{".git/hooks"}
+			},
+			wantName: "gate path .git/hooks", wantText: "never own",
+		},
+		{
+			// The lexical check cannot see this; the physical one must.
+			name: "a gate path is a symlink landing on .git",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				if err := os.Symlink(".git", filepath.Join(cfg.Paths.SubmitRepo, "cache")); err != nil {
+					t.Fatal(err)
+				}
+				cfg.Gate.RequiredWritablePaths = []string{"cache/objects"}
+			},
+			wantName: "gate can write cache/objects", wantText: "resolves inside",
+		},
+		{
+			// Provisioning changed what the first probe measured.
+			name: "the gate can touch .git once the declared paths exist",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				git := filepath.Join(cfg.Paths.SubmitRepo, ".git")
+				d.NewProber = func(ra *config.RunAs) (doctor.Prober, error) {
+					if ra.User == "factoryd-gate" {
+						calls := 0
+						return &countingProber{fakeProber: fakeProber{name: "gate",
+							writable: map[string]bool{filepath.Join(cfg.Paths.SubmitRepo, "build/out"): true}},
+							gitDir: git, calls: &calls}, nil
+					}
+					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+				}
+			},
+			wantName: "gate cannot touch .git after provisioning", wantText: "once the declared paths exist",
+		},
+		{
+			// An execute bit is not executability by the gate.
+			name: "the gate command is root-only",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				exe, _ := config.LookPathIn(cfg.Gate.Env["PATH"], cfg.Gate.Command[0])
+				d.NewProber = func(ra *config.RunAs) (doctor.Prober, error) {
+					if ra.User == "factoryd-gate" {
+						return fakeProber{name: "gate",
+							writable: map[string]bool{filepath.Join(cfg.Paths.SubmitRepo, "build/out"): true},
+							rootOnly: map[string]bool{exe: true}}, nil
+					}
+					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+				}
+			},
+			wantName: "gate can run its command", wantText: "doctor could",
+		},
+		{
+			name: "the producer command is root-only",
+			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
+				exe, _ := config.LookPathIn(cfg.Roles.Producer.Env["PATH"], cfg.Roles.Producer.Command[0])
+				d.NewProber = func(ra *config.RunAs) (doctor.Prober, error) {
+					if ra.User == "factoryd-gate" {
+						return fakeProber{name: "gate", writable: map[string]bool{filepath.Join(cfg.Paths.SubmitRepo, "build/out"): true}}, nil
+					}
+					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}, rootOnly: map[string]bool{exe: true}}, nil
+				}
+			},
+			wantName: "producer can run its command", wantText: "doctor could",
+		},
+		{
 			name: "a gate path references an unset variable",
 			mutate: func(t *testing.T, cfg *config.Config, d *doctor.Deps) {
 				cfg.Gate.RequiredWritablePaths = []string{"${NOPE}/cache"}
@@ -535,5 +624,42 @@ func TestGateCommandResolvedAgainstDeclaredPath(t *testing.T) {
 	}
 	if !found {
 		t.Fatalf("doctor passed the gate command against an empty declared PATH (its own PATH found it):\n%s", r)
+	}
+}
+
+// countingProber answers "cannot write .git" the first time and "can" after,
+// modelling provisioning that handed the gate reach into .git.
+type countingProber struct {
+	fakeProber
+	gitDir string
+	calls  *int
+}
+
+func (c *countingProber) CanWrite(ctx context.Context, dir string) (bool, error) {
+	if dir == c.gitDir {
+		*c.calls++
+		return *c.calls > 1, nil
+	}
+	return c.fakeProber.CanWrite(ctx, dir)
+}
+
+// The positive control for the capability rows: an ordinary cache directory
+// inside the repository, and one outside it, are both accepted.
+func TestOrdinaryGatePathsAreAccepted(t *testing.T) {
+	cfg := fixture(t)
+	outside := filepath.Join(t.TempDir(), "gocache")
+	cfg.Gate.Env["GOCACHE"] = outside
+	cfg.Gate.RequiredWritablePaths = []string{"build/out", "${GOCACHE}"}
+	d := healthyDeps(cfg, nil)
+	d.NewProber = func(ra *config.RunAs) (doctor.Prober, error) {
+		if ra.User == "factoryd-gate" {
+			return fakeProber{name: "gate", writable: map[string]bool{
+				filepath.Join(cfg.Paths.SubmitRepo, "build/out"): true, outside: true}}, nil
+		}
+		return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+	}
+	r := doctor.RunWith(context.Background(), cfg, d)
+	if !r.OK() {
+		t.Fatalf("ordinary gate paths were refused: %v\n%s", failedNames(r), r)
 	}
 }

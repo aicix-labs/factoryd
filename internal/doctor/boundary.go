@@ -25,6 +25,11 @@ type Prober interface {
 	// against credential files: a gate that can read the reviewer's token has
 	// the two-party model in its hands.
 	CanRead(ctx context.Context, path string) (bool, error)
+	// CanExec reports whether the principal can execute the file at path,
+	// traversal included. An execute bit is not executability: a root-owned
+	// 0700 binary has one, and doctor running as root can run it, and the
+	// producer or gate cannot.
+	CanExec(ctx context.Context, path string) (bool, error)
 	// Own makes path writable by the principal -- what submit does for each
 	// declared gate path when it creates it. A no-op when not privileged.
 	Own(path string) error
@@ -118,6 +123,28 @@ func (p *setuidProber) CanRead(ctx context.Context, path string) (bool, error) {
 		return false, nil
 	}
 	return false, fmt.Errorf("could not run the read probe as %s: %w (factoryd needs CAP_SETUID or root to switch user)", p.Describe(), err)
+}
+
+// CanExec attempts test -x as the principal, by the same mechanism as the
+// other probes. Traversal is exercised by the child's own path lookup.
+func (p *setuidProber) CanExec(ctx context.Context, path string) (bool, error) {
+	if uint32(os.Geteuid()) == p.uid {
+		return false, fmt.Errorf("doctor runs as uid %d, the same identity as %s; there is no boundary to verify", p.uid, p.name)
+	}
+	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
+	defer cancel()
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", `test -x "$1"`, "probe", path)
+	cmd.Env = []string{"PATH=/usr/bin:/bin"}
+	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: p.uid, Gid: p.gid, Groups: []uint32{}}}
+	err := cmd.Run()
+	if err == nil {
+		return true, nil
+	}
+	var ee *exec.ExitError
+	if asExitError(err, &ee) {
+		return false, nil
+	}
+	return false, fmt.Errorf("could not run the exec probe as %s: %w (factoryd needs CAP_SETUID or root to switch user)", p.Describe(), err)
 }
 
 // Own chowns path to the principal. Without privilege it does nothing and

@@ -728,7 +728,34 @@ func (c *Config) ResolveGatePath(p string) (string, error) {
 	if !filepath.IsAbs(expanded) {
 		expanded = filepath.Join(c.GateWorkdir(), expanded)
 	}
-	return filepath.Clean(expanded), nil
+	expanded = filepath.Clean(expanded)
+	if err := c.gatePathMayNotReachGit(p, expanded); err != nil {
+		return "", err
+	}
+	return expanded, nil
+}
+
+// gatePathMayNotReachGit refuses a declared path that is .git, is inside .git,
+// or is an ancestor of .git -- including the submit repository itself and
+// everything above it.
+//
+// A declared path is a capability grant: submit creates it owned by the gate
+// user. "." would hand the gate the repository root, from which it can rename,
+// delete or replace .git; "/" or any ancestor would too. The .git probe would
+// then be green about a state the provisioning had just destroyed. This is the
+// lexical half; doctor repeats it after physical resolution, since a symlink
+// can make a harmless-looking path land somewhere else.
+func (c *Config) gatePathMayNotReachGit(declared, resolved string) error {
+	gitDir := filepath.Join(c.Paths.SubmitRepo, ".git")
+	switch {
+	case resolved == gitDir:
+		return fmt.Errorf("path %q is the submit repository's .git; the gate may never own it", declared)
+	case strings.HasPrefix(resolved, gitDir+string(os.PathSeparator)):
+		return fmt.Errorf("path %q is inside the submit repository's .git; the gate may never own it", declared)
+	case gitDir == resolved || strings.HasPrefix(gitDir, resolved+string(os.PathSeparator)):
+		return fmt.Errorf("path %q is an ancestor of the submit repository's .git; owning it would let the gate rename, delete or replace .git", declared)
+	}
+	return nil
 }
 
 // GateWorkdir is where the gate runs: the submit repository, since that is

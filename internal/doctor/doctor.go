@@ -198,10 +198,18 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 				add("gate cannot read "+cred.name+" credential", nil, cred.file)
 			}
 		}
+		provisioned := 0
 		for _, p := range cfg.Gate.RequiredWritablePaths {
 			resolved, err := cfg.ResolveGatePath(p)
 			if err != nil {
 				continue // reported under "gate path" below
+			}
+			// A declared path is a capability grant, so it is judged after
+			// PHYSICAL resolution -- a symlink can make "cache" land on .git --
+			// and refused if it is .git, inside it, or above it.
+			if err := physicalPathMayNotReachGit(cfg, p, resolved); err != nil {
+				add("gate can write "+p, err, resolved)
+				continue
 			}
 			// Created here as submit would create it: owned by the gate, so the
 			// gate can write it, inside a repository the gate cannot otherwise
@@ -215,12 +223,49 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 				add("gate can write "+p, fmt.Errorf("could not give %s to the gate: %w", resolved, err), resolved)
 				continue
 			}
+			provisioned++
 			if can, err := gate.CanWrite(ctx, resolved); err != nil {
 				add("gate can write "+p, fmt.Errorf("undecided: %v", err), resolved)
 			} else if !can {
 				add("gate can write "+p, fmt.Errorf("%s cannot write %s, which the gate declared it needs", gate.Describe(), resolved), resolved)
 			} else {
 				add("gate can write "+p, nil, resolved)
+			}
+		}
+		// Re-probe .git AFTER provisioning. The earlier probe described the
+		// repository before any path was created or given away; this one
+		// describes the environment the gate will actually run in.
+		if provisioned > 0 {
+			if can, err := gate.CanWrite(ctx, gitDir); err != nil {
+				add("gate cannot touch .git after provisioning", fmt.Errorf("undecided: %v", err), "")
+			} else if can {
+				add("gate cannot touch .git after provisioning", fmt.Errorf("%s CAN write %s once the declared paths exist; a declared path granted the gate reach into .git", gate.Describe(), gitDir), "")
+			} else {
+				add("gate cannot touch .git after provisioning", nil, gitDir)
+			}
+		}
+
+		// Executability by the identity that will run the command, not by
+		// doctor. A root-owned 0700 binary passes an execute-bit check and
+		// fails the moment the child switches uid.
+		if exe, err := config.LookPathIn(cfg.Gate.Env["PATH"], cfg.Gate.Command[0]); err == nil {
+			if can, err := gate.CanExec(ctx, exe); err != nil {
+				add("gate can run its command", fmt.Errorf("undecided: %v", err), exe)
+			} else if !can {
+				add("gate can run its command", fmt.Errorf("%s cannot execute %s; doctor could, which is a different question", gate.Describe(), exe), exe)
+			} else {
+				add("gate can run its command", nil, exe)
+			}
+		}
+	}
+	if prober != nil && perr == nil {
+		if exe, err := config.LookPathIn(cfg.Roles.Producer.Env["PATH"], cfg.Roles.Producer.Command[0]); err == nil {
+			if can, err := prober.CanExec(ctx, exe); err != nil {
+				add("producer can run its command", fmt.Errorf("undecided: %v", err), exe)
+			} else if !can {
+				add("producer can run its command", fmt.Errorf("%s cannot execute %s; doctor could, which is a different question", prober.Describe(), exe), exe)
+			} else {
+				add("producer can run its command", nil, exe)
 			}
 		}
 	}
@@ -487,6 +532,41 @@ func checkOwnedByMe(path string) error {
 	}
 	if int(st.Uid) != os.Geteuid() {
 		return fmt.Errorf("%s is owned by uid %d but factoryd runs as uid %d; git will refuse a repository it does not own, and it should -- the submit repository must be factoryd's", path, st.Uid, os.Geteuid())
+	}
+	return nil
+}
+
+// physicalPathMayNotReachGit resolves the nearest existing ancestor of resolved
+// through any symlinks and repeats the ancestor/descendant check against .git
+// on the result. The lexical check in config cannot see a symlink.
+func physicalPathMayNotReachGit(cfg *config.Config, declared, resolved string) error {
+	gitDir := filepath.Join(cfg.Paths.SubmitRepo, ".git")
+	// Walk up to something that exists, resolve it, and re-append the rest.
+	rest := ""
+	probe := resolved
+	for {
+		if _, err := os.Lstat(probe); err == nil {
+			break
+		}
+		rest = filepath.Join(filepath.Base(probe), rest)
+		parent := filepath.Dir(probe)
+		if parent == probe {
+			break
+		}
+		probe = parent
+	}
+	real, err := filepath.EvalSymlinks(probe)
+	if err != nil {
+		return fmt.Errorf("path %q: %w", declared, err)
+	}
+	physical := filepath.Clean(filepath.Join(real, rest))
+	switch {
+	case physical == gitDir:
+		return fmt.Errorf("path %q resolves to the submit repository's .git; the gate may never own it", declared)
+	case strings.HasPrefix(physical, gitDir+string(os.PathSeparator)):
+		return fmt.Errorf("path %q resolves inside the submit repository's .git; the gate may never own it", declared)
+	case strings.HasPrefix(gitDir, physical+string(os.PathSeparator)):
+		return fmt.Errorf("path %q resolves to an ancestor of the submit repository's .git (%s); owning it would let the gate rename, delete or replace .git", declared, physical)
 	}
 	return nil
 }
