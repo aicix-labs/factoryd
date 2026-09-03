@@ -270,10 +270,13 @@ Submit is also **the gate**. In order:
    producer's newer work waits for the reviewer's decision.
 7. push, **non-force**, to the content-derived branch; create-or-update the
    Draft PR/MR; re-read it after the push and validate it in full.
-8. **supersede**: close each earlier draft in the family with a pointer to the
-   new one — after re-reading it, because the pre-push read is stale by the
-   length of the push. One that went ready in that window is left exactly as
-   it is.
+8. **supersede — by report, never by write**: the earlier drafts in the
+   family are named in the new draft's body, the log and the result, and left
+   open. Submit never writes to an existing change. A read of one is stale by
+   the time a write would land, and neither provider offers a close
+   conditional on the state that was read; a reread before a close is not a
+   guard, it is the same race one call later. The reviewer, who holds the
+   merge, closes what is superseded.
 9. signal the reviewer
 
 **Why the branch is immutable.** A check-then-push on a mutable branch has a
@@ -936,7 +939,7 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §4.4 gate identity | the gate user can write `submit_repo/.git`, or can read either credential file → refuse | the gate user can write each declared path, so "cannot" is not a gate that cannot do anything |
 | §4.4 check-to-push race | a draft is marked ready **while the gate runs** → no push at all, nothing opened, nothing closed | the identical run with no flip pushes exactly once, non-force, to the content-derived branch |
 | §4.4 unknown owner is not ours | a change in the family with **no author**, or a producer with **no login** → refuse before the gate | the same change carrying the producer's login is accepted and updated |
-| §4.4 supersession re-reads | the earlier draft goes ready **during the push** → it is not closed; the new content still opens as its own draft | an earlier draft that is still ours *is* closed, naming the new one — so "not closed" is not a Close that never fires |
+| §4.4 supersession never writes | the earlier draft goes ready the instant **after submit's last read of it** → `Close` is never invoked; the new content still opens as its own draft naming the old one | the old draft *is* named in the new body and the result — so "never closed" is not a supersession that never happened |
 | §4.4 gate is its own user | `gate.run_as` is empty, or names the producer's user → refuse at load | distinct users pass |
 | §4.4 turn env is owned | a reviewer credential present in the supervisor's environment reaches the producer's turn | the reviewer's turn receives that same variable, by name |
 | §4.4 declared `PATH` | the gate or turn command is found on doctor's own `PATH` but not on the declared one → doctor refuses; the turn refuses to start | found on the declared `PATH` passes |

@@ -50,6 +50,11 @@ type Result struct {
 	Change *scm.Change
 	// Branch is the branch that was pushed.
 	Branch string
+	// Supersedes lists the earlier drafts in the family that the new draft
+	// replaces. They are left open: closing one would be a write to a change
+	// that may have left the producer's hands since it was last read, and no
+	// provider offers a close conditional on that. The reviewer closes them.
+	Supersedes []scm.ChangeID
 	// DirtyPaths is set on ExitNothing: files the producer changed without
 	// declaring a submission (issue #12). The next turn's failure is then
 	// predictable rather than surprising.
@@ -344,9 +349,13 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	// 8. Open the Draft. The branch is new by construction (a same-tree
 	// draft returned "already submitted" before the gate), so this is
 	// always a create, never an update of a change something else may hold.
+	var supersedes []scm.ChangeID
+	for _, c := range family {
+		supersedes = append(supersedes, c.ID)
+	}
 	change, err := deps.Driver.OpenDraft(ctx, scm.DraftSpec{
 		SourceBranch: branch, TargetBranch: cfg.TargetBranch,
-		Title: firstLine(msg), Body: draftBody(msg, sha, deps.Now()),
+		Title: firstLine(msg), Body: draftBody(msg, sha, deps.Now(), supersedes),
 	})
 	if err != nil {
 		return Result{}, wrap(ExitConfig, err, "opening the draft for %s", branch)
@@ -358,28 +367,15 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	}
 	fmt.Fprintf(log, "draft: opened %s\n", change.ID)
 
-	// Earlier drafts in the family are superseded: closed with a pointer to
-	// the new one -- but only those still ours. A change that went ready in
-	// the meantime is the reviewer's and is left exactly as it is.
-	for _, c := range family {
-		if c.ID == change.ID {
-			continue
-		}
-		// Re-read immediately before closing: the pre-push read is stale by
-		// the length of the push, and a draft marked ready in that window
-		// is no longer ours to close.
-		c, err = deps.Driver.Get(ctx, c.ID)
-		if err != nil {
-			return Result{}, wrap(ExitConfig, err, "re-reading %s before superseding it", c.ID)
-		}
-		if err := changeIsOurs(c, c.SourceBranch, cfg.TargetBranch, deps.Producer); err != nil {
-			fmt.Fprintf(log, "draft: %s left as is (%v)\n", c.ID, err)
-			continue
-		}
-		if err := deps.Driver.Close(ctx, c.ID, fmt.Sprintf("Superseded by %s (%s).", change.ID, branch)); err != nil {
-			return Result{}, wrap(ExitConfig, err, "closing the superseded draft %s", c.ID)
-		}
-		fmt.Fprintf(log, "draft: superseded %s\n", c.ID)
+	// Earlier drafts in the family are superseded, and REPORTED as such:
+	// named in the new draft's body, here, and in the result. They are not
+	// closed. Submit never writes to an existing change: any read of one is
+	// stale by the time the write lands, and neither provider offers a
+	// close conditional on the state that was read. A draft a reviewer
+	// took in that window would be closed under them. The reviewer, who
+	// holds the merge, closes what it supersedes.
+	for _, id := range supersedes {
+		fmt.Fprintf(log, "draft: supersedes %s (left open for the reviewer)\n", id)
 	}
 
 	// 9. Signal the reviewer and retire the control files.
@@ -389,7 +385,7 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	for _, f := range []string{BranchFile, CommitMsgFile} {
 		_ = os.Remove(filepath.Join(work, f))
 	}
-	return Result{Exit: ExitSubmitted, Reason: "submitted", Change: &change, Branch: branch}, nil
+	return Result{Exit: ExitSubmitted, Reason: "submitted", Change: &change, Branch: branch, Supersedes: supersedes}, nil
 }
 
 // readControl reads a control file. Absent or blank means "not declared".
@@ -441,8 +437,12 @@ func firstLine(s string) string {
 	return strings.TrimSpace(s)
 }
 
-func draftBody(msg, sha string, at time.Time) string {
-	return fmt.Sprintf("%s\n\n---\nopened by factoryd submit at %s\ncommit %s\n", msg, at.Format(time.RFC3339), sha)
+func draftBody(msg, sha string, at time.Time, supersedes []scm.ChangeID) string {
+	b := fmt.Sprintf("%s\n\n---\nopened by factoryd submit at %s\ncommit %s\n", msg, at.Format(time.RFC3339), sha)
+	for _, id := range supersedes {
+		b += fmt.Sprintf("supersedes %s (left open; the reviewer closes it)\n", id)
+	}
+	return b
 }
 
 func authorEmail(id scm.Identity, cfg *config.Config) string {

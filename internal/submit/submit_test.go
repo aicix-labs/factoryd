@@ -104,18 +104,23 @@ func (p *fakeProvisioner) Provision(_ context.Context, path string) error {
 
 type fakeDriver struct {
 	scm.Driver
-	family []scm.Change // what ListOpen returns; tests mutate it, even mid-gate
-	after  *scm.Change  // what Get returns after the push; nil means the family entry
-	opened *scm.DraftSpec
-	closed []scm.ChangeID
-	calls  *[]string
+	family    []scm.Change // what ListOpen returns; tests mutate it, even mid-gate
+	after     *scm.Change  // what Get returns after the push; nil means the family entry
+	afterList func()       // runs after every ListOpen: state that changes the instant after it was read
+	opened    *scm.DraftSpec
+	closed    []scm.ChangeID
+	calls     *[]string
 }
 
 func (d *fakeDriver) ListOpen(context.Context) ([]scm.Change, error) {
 	if d.calls != nil {
 		*d.calls = append(*d.calls, "list")
 	}
-	return append([]scm.Change(nil), d.family...), nil
+	out := append([]scm.Change(nil), d.family...)
+	if d.afterList != nil {
+		d.afterList() // the world moves the instant after a read returns
+	}
+	return out, nil
 }
 
 func (d *fakeDriver) Close(_ context.Context, id scm.ChangeID, _ string) error {
@@ -193,6 +198,11 @@ func newLab(t *testing.T) *lab {
 	l.git = &fakeGit{commitOK: "c0mm1t", tree: "abc123"} // distinct: a branch named after the commit is wrong
 	l.gate = &fakeGate{exit: 0, calls: calls}
 	l.drv = &fakeDriver{calls: calls}
+	t.Cleanup(func() {
+		if len(l.drv.closed) != 0 {
+			t.Errorf("submit closed %v; submit never writes to an existing change (a read is stale by the time a write lands, and no provider offers a conditional close)", l.drv.closed)
+		}
+	})
 	l.prov = &fakeProvisioner{}
 	l.deps = submit.Deps{
 		Driver: l.drv, Transport: l.tr, Git: l.git, Gate: l.gate, Provision: l.prov,
@@ -708,8 +718,14 @@ func TestNewContentSupersedesEarlierDraft(t *testing.T) {
 	if len(l.tr.pushed) != 1 || strings.Contains(l.tr.pushed[0], old) {
 		t.Fatalf("pushed %v; the old branch must never be pushed to", l.tr.pushed)
 	}
-	if len(l.drv.closed) != 1 || l.drv.closed[0] != "7" {
-		t.Fatalf("closed %v, want the superseded draft 7", l.drv.closed)
+	if len(l.drv.closed) != 0 {
+		t.Fatalf("closed %v; the superseded draft is reported, never closed", l.drv.closed)
+	}
+	if len(r.Supersedes) != 1 || r.Supersedes[0] != "7" {
+		t.Fatalf("result.Supersedes=%v, want [7]", r.Supersedes)
+	}
+	if !strings.Contains(l.drv.opened.Body, "supersedes 7") {
+		t.Fatalf("new draft body does not name the superseded draft:\n%s", l.drv.opened.Body)
 	}
 	if r.Change == nil || r.Change.ID == "7" {
 		t.Fatalf("result=%+v", r)
@@ -744,27 +760,40 @@ func TestImmutableBranchIsContentDerived(t *testing.T) {
 	}
 }
 
-// The pre-push read is stale by the length of the push. A draft a reviewer
-// marks ready in that window is the reviewer's and must not be closed.
-func TestDraftMarkedReadyDuringPushIsNotSuperseded(t *testing.T) {
+// The reviewer's case: the older draft is marked ready the instant after
+// submit's LAST read of it (the pre-push family read), and again during the
+// push for good measure. Close must never be invoked: the read was stale
+// when the write would have landed, and there is no conditional close.
+// The new content still goes up as its own draft, naming the older one.
+func TestOlderDraftFlippedAfterLastReadIsNeverClosed(t *testing.T) {
 	l := newLab(t)
 	l.edit(t, "src/a.go")
 	l.declare(t, "producer/fix", "fix")
 	old := submit.ImmutableBranch("producer/fix", "0ld0ld0ld0")
 	l.drv.family = []scm.Change{{ID: "7", SourceBranch: old, TargetBranch: "main", Draft: true, State: scm.StateOpen, Author: "producer-bot"}}
+	lists := 0
+	l.drv.afterList = func() {
+		lists++
+		if lists == 2 { // the pre-push read is the second and last
+			l.drv.family[0].Draft = false
+		}
+	}
 	l.tr.onPush = func() { l.drv.family[0].Draft = false }
 	r, err := submit.Run(context.Background(), l.cfg, l.deps)
 	if err != nil {
 		t.Fatal(err)
 	}
+	if lists != 2 {
+		t.Fatalf("ListOpen called %d times; the flip did not happen after the last read", lists)
+	}
 	if len(l.tr.pushed) != 1 || l.drv.opened == nil {
-		t.Fatalf("pushed=%v opened=%v; the new content still goes up as its own draft", l.tr.pushed, l.drv.opened != nil)
+		t.Fatalf("pushed=%v opened=%v", l.tr.pushed, l.drv.opened != nil)
 	}
 	if len(l.drv.closed) != 0 {
-		t.Fatalf("closed %v; a draft that went ready during the push is the reviewer's", l.drv.closed)
+		t.Fatalf("Close invoked on %v after the draft was marked ready; that is the reviewer's change", l.drv.closed)
 	}
-	if r.Change == nil || r.Change.ID == "7" {
-		t.Fatalf("result=%+v", r)
+	if len(r.Supersedes) != 1 || r.Supersedes[0] != "7" {
+		t.Fatalf("Supersedes=%v", r.Supersedes)
 	}
 }
 
