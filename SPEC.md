@@ -41,6 +41,7 @@ but these carry the same weight.
 | 12 | `doctor` reported healthy while the git and API identities disagreed | only the API identity was ever resolved | §4.1 verify the git transport identity |
 | 13 | A missing cache directory was reported as `gate FAILED`, exit 5 | a build that cannot write and a build that found a defect both exit non-zero | §9.6 environmental failure is not a red gate |
 | 14 | A real GitLab merge conflict was reported as a CI failure | the fixture was hand-written from documentation and said 405; the provider answers 422 | §9.7 fixtures are recorded, not written |
+| 15 | A factory idled 3.5h with completed work stranded and every signal green | a turn consumed its trigger, then exited 1; the spin guard resets on consumption, so nothing counted and nothing re-armed | §4.2 a failure counter independent of the trigger |
 
 Item 11 failed closed only because the reviewer credential happened to lack
 repository write scope. With it, the push would have succeeded as the wrong
@@ -171,6 +172,46 @@ and silent. Therefore:
 - **halt at `spin_abort`** (default 6–10): write the stop sentinel, record the reason
   in health *and* in the log, exit. Never relaunch indefinitely.
 - **preserve the trigger** on abort. It is the only evidence a signal arrived.
+
+**A failed turn is a failure whether or not it consumed its trigger.** The spin
+guard keys on the trigger, and that gives it a blind spot with a production
+incident behind it (§1, item 15): a turn that consumes its trigger and then
+exits non-zero leaves nothing pending, so nothing re-arms, the spin counter
+resets on consumption, and every signal reads as an idle factory with an empty
+queue — while finished work sits stranded in the workdir. It idled for 3.5 hours.
+
+So the supervisor keeps a second counter, **independent of consumption**:
+consecutive turns that exited non-zero or timed out without reporting progress.
+Progress resets it; consuming the trigger does not. It halts at `fail_abort`
+(default 5) exactly as the spin guard halts at `spin_abort`, with a reason that
+names which guard fired.
+
+A counter alone is not enough, because after a consumed failure nothing is
+pending and nothing external will start the next turn: the counter would sit at
+one forever, which is the stall with a number on it. So the supervisor
+**re-arms itself**. It writes a supervisor-owned marker (`inbox/<role>-retry`),
+backs off, and runs the next turn on it. The marker is a file rather than a
+memory, because a retry lost on restart recreates the stall it exists to fix; it
+carries the original trigger and the failure that led here, so the agent — and
+the operator — can read why this turn is a retry. The supervisor removes it once
+the retry has run, unless that retry is the one that halts: then it stays, as a
+real trigger does, because a halt should not erase its own evidence.
+
+An interrupted turn counts toward neither guard. Stopping the supervisor kills
+the running turn with its process group, and the exit code that produces says
+nothing about the agent; counted, an ordinary shutdown would leave a failure on
+the streak, a later unrelated failure would halt the factory, and the operator
+who stopped it would never connect the two. The turn is recorded as
+interrupted. But if the agent had already consumed its trigger when it was
+killed, a restart would find nothing pending — the same stall, arriving via
+Ctrl-C — so the supervisor persists a marker saying so, and the restart runs
+exactly one recovery turn. Continuity, not failure: the streak stays at zero.
+
+**The marker's own I/O is control-plane, and its failure halts.** A marker that
+cannot be written leaves nothing to re-arm on; a marker that cannot be removed
+re-arms the same retry forever, every run a success, invisible to both guards.
+Neither may be logged and stepped over as though the marker state had changed.
+Both halt, with a reason that names the marker.
 
 ### 4.3 Watcher
 

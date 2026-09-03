@@ -79,6 +79,7 @@ func fixture(t *testing.T) *config.Config {
 		},
 		Supervisor: config.Supervisor{
 			SpinWarn: config.DefaultSpinWarn, SpinAbort: config.DefaultSpinAbort,
+			FailAbort:           config.DefaultFailAbort,
 			PollIntervalSeconds: config.DefaultPollInterval,
 			BackoffSeconds:      config.DefaultBackoffSeconds,
 		},
