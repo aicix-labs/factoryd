@@ -19,6 +19,7 @@ import (
 // ---------- fakes ----------
 
 type fakeTransport struct {
+	onPush   func() // runs during the push; the world moves while a push is in flight
 	login    string
 	guardErr error
 	pushed   []string
@@ -39,10 +40,14 @@ func (f *fakeTransport) Fetch(_ context.Context, r string) error {
 func (f *fakeTransport) Push(_ context.Context, r string) error {
 	f.calls = append(f.calls, "push")
 	f.pushed = append(f.pushed, r)
+	if f.onPush != nil {
+		f.onPush()
+	}
 	return nil
 }
 
 type fakeGit struct {
+	tree     string // what Tree returns
 	calls    []string
 	nothing  bool // Commit reports nothing to commit
 	commitOK string
@@ -59,14 +64,20 @@ func (g *fakeGit) Commit(_ context.Context, msg, name, email string) (string, bo
 	}
 	return g.commitOK, true, nil
 }
+func (g *fakeGit) Tree(context.Context) (string, error) {
+	g.calls = append(g.calls, "tree")
+	return g.tree, nil
+}
+
 func (g *fakeGit) Status(context.Context) ([]string, error) { return nil, nil }
 
 type fakeGate struct {
-	exit  int
-	err   error
-	ran   bool
-	env   []string
-	calls *[]string
+	exit   int
+	err    error
+	ran    bool
+	env    []string
+	calls  *[]string
+	during func() // runs while the gate "runs"
 }
 
 func (g *fakeGate) Run(_ context.Context, _ *config.Config, exe string, env []string, out io.Writer) (int, error) {
@@ -74,6 +85,9 @@ func (g *fakeGate) Run(_ context.Context, _ *config.Config, exe string, env []st
 	g.env = env
 	if g.calls != nil {
 		*g.calls = append(*g.calls, "gate")
+	}
+	if g.during != nil {
+		g.during()
 	}
 	return g.exit, g.err
 }
@@ -90,10 +104,23 @@ func (p *fakeProvisioner) Provision(_ context.Context, path string) error {
 
 type fakeDriver struct {
 	scm.Driver
-	found  *scm.Change
-	after  *scm.Change // what Get returns after the push; nil means found
+	family []scm.Change // what ListOpen returns; tests mutate it, even mid-gate
+	after  *scm.Change  // what Get returns after the push; nil means the family entry
 	opened *scm.DraftSpec
+	closed []scm.ChangeID
 	calls  *[]string
+}
+
+func (d *fakeDriver) ListOpen(context.Context) ([]scm.Change, error) {
+	if d.calls != nil {
+		*d.calls = append(*d.calls, "list")
+	}
+	return append([]scm.Change(nil), d.family...), nil
+}
+
+func (d *fakeDriver) Close(_ context.Context, id scm.ChangeID, _ string) error {
+	d.closed = append(d.closed, id)
+	return nil
 }
 
 func (d *fakeDriver) Get(_ context.Context, id scm.ChangeID) (scm.Change, error) {
@@ -103,18 +130,19 @@ func (d *fakeDriver) Get(_ context.Context, id scm.ChangeID) (scm.Change, error)
 	if d.after != nil {
 		return *d.after, nil
 	}
-	if d.found != nil {
-		return *d.found, nil
+	for _, c := range d.family {
+		if c.ID == id {
+			return c, nil
+		}
 	}
-	return scm.Change{ID: id, Draft: true, State: scm.StateOpen}, nil
+	return scm.Change{ID: id, Draft: true, State: scm.StateOpen, Author: "producer-bot"}, nil
 }
 
 func (d *fakeDriver) FindOpenBySource(_ context.Context, branch string) (scm.Change, bool, error) {
-	if d.calls != nil {
-		*d.calls = append(*d.calls, "find")
-	}
-	if d.found != nil {
-		return *d.found, true, nil
+	for _, c := range d.family {
+		if c.SourceBranch == branch {
+			return c, true, nil
+		}
 	}
 	return scm.Change{}, false, nil
 }
@@ -162,7 +190,7 @@ func newLab(t *testing.T) *lab {
 	l := &lab{cfg: cfg, root: root, work: work, log: &bytes.Buffer{}}
 	calls := &[]string{}
 	l.tr = &fakeTransport{login: "producer-bot"}
-	l.git = &fakeGit{commitOK: "abc123"}
+	l.git = &fakeGit{commitOK: "c0mm1t", tree: "abc123"} // distinct: a branch named after the commit is wrong
 	l.gate = &fakeGate{exit: 0, calls: calls}
 	l.drv = &fakeDriver{calls: calls}
 	l.prov = &fakeProvisioner{}
@@ -224,8 +252,12 @@ func TestSubmitOpensADraftAndSignals(t *testing.T) {
 	if r.Exit != submit.ExitSubmitted || r.Change == nil || r.Change.ID != "42" {
 		t.Fatalf("result = %+v", r)
 	}
-	if len(l.tr.pushed) != 1 || !strings.Contains(l.tr.pushed[0], "producer/fix") {
-		t.Fatalf("pushed %v", l.tr.pushed)
+	want := submit.ImmutableBranch("producer/fix", "abc123")
+	if len(l.tr.pushed) != 1 || l.tr.pushed[0] != "refs/heads/"+want+":refs/heads/"+want {
+		t.Fatalf("pushed %v, want a non-force push of the content-derived branch %s", l.tr.pushed, want)
+	}
+	if r.Branch != want {
+		t.Fatalf("result branch = %s, want %s", r.Branch, want)
 	}
 	if l.drv.opened == nil || l.drv.opened.Title != "gate: match command position" || l.drv.opened.TargetBranch != "main" {
 		t.Fatalf("draft spec = %+v", l.drv.opened)
@@ -265,8 +297,8 @@ func TestSubmitOrdering(t *testing.T) {
 		t.Fatalf("transport calls = %s, want %s", got, want)
 	}
 	all := strings.Join(*l.gate.calls, ",")
-	if all != "find,gate,open" {
-		t.Fatalf("driver/gate order = %s, want find,gate,open (the existing change is checked before anything is pushed)", all)
+	if all != "list,gate,list,open" {
+		t.Fatalf("driver/gate order = %s, want list,gate,list,open (the family is re-read after the gate, immediately before the push)", all)
 	}
 }
 
@@ -451,20 +483,21 @@ func TestRedGateDoesNotPushAndAsksAQuestion(t *testing.T) {
 
 // ---------- idempotence ----------
 
-func TestSecondSubmissionUpdatesTheExistingDraft(t *testing.T) {
+func TestSameTreeIsAlreadySubmitted(t *testing.T) {
 	l := newLab(t)
 	l.edit(t, "f")
 	l.declare(t, "producer/fix", "msg")
-	l.drv.found = &scm.Change{ID: "7", SourceBranch: "producer/fix", TargetBranch: "main", Draft: true, State: scm.StateOpen, Author: "producer-bot"}
+	same := submit.ImmutableBranch("producer/fix", "abc123")
+	l.drv.family = []scm.Change{{ID: "7", SourceBranch: same, TargetBranch: "main", Draft: true, State: scm.StateOpen, Author: "producer-bot"}}
 	r, err := submit.Run(context.Background(), l.cfg, l.deps)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if r.Change == nil || r.Change.ID != "7" {
-		t.Fatalf("result=%+v; a second draft was opened instead of updating the first", r)
+	if r.Exit != submit.ExitNothing || r.Change == nil || r.Change.ID != "7" {
+		t.Fatalf("result=%+v; the same tree is already submitted as 7 and that is the answer", r)
 	}
-	if l.drv.opened != nil {
-		t.Fatal("OpenDraft was called although a draft already existed")
+	if l.gate.ran || len(l.tr.pushed) != 0 || l.drv.opened != nil || len(l.drv.closed) != 0 {
+		t.Fatalf("gate=%v pushed=%v opened=%v closed=%v for a tree already submitted", l.gate.ran, l.tr.pushed, l.drv.opened != nil, l.drv.closed)
 	}
 }
 
@@ -508,8 +541,9 @@ func TestExistingChangeNotOursRefusesBeforePush(t *testing.T) {
 			l.edit(t, "f")
 			l.declare(t, "producer/fix", "msg")
 			c := base
+			c.SourceBranch = submit.ImmutableBranch("producer/fix", "abc123")
 			mutate(&c)
-			l.drv.found = &c
+			l.drv.family = []scm.Change{c}
 			_, err := submit.Run(context.Background(), l.cfg, l.deps)
 			if exitOf(t, err) != submit.ExitConfig {
 				t.Fatalf("exit %d, want 3: %v", exitOf(t, err), err)
@@ -521,24 +555,6 @@ func TestExistingChangeNotOursRefusesBeforePush(t *testing.T) {
 				t.Fatal("the gate ran for a change that would never be pushed")
 			}
 		})
-	}
-}
-
-// The race: the change was ours at the check and is ready by the push. The
-// push has landed; nothing here can undo it. It must be reported loudly as an
-// infrastructure failure, never as success.
-func TestChangeMarkedReadyDuringSubmissionIsReportedNotSwallowed(t *testing.T) {
-	l := newLab(t)
-	l.edit(t, "f")
-	l.declare(t, "producer/fix", "msg")
-	ours := scm.Change{ID: "7", SourceBranch: "producer/fix", TargetBranch: "main", Draft: true, State: scm.StateOpen, Author: "producer-bot"}
-	ready := ours
-	ready.Draft = false
-	l.drv.found = &ours
-	l.drv.after = &ready
-	_, err := submit.Run(context.Background(), l.cfg, l.deps)
-	if exitOf(t, err) != submit.ExitConfig || !strings.Contains(err.Error(), "between the check and the push") {
-		t.Fatalf("exit %d: %v", exitOf(t, err), err)
 	}
 }
 
@@ -611,5 +627,161 @@ func TestRedGateWithUnsignallableReviewerIsExit3(t *testing.T) {
 	}
 	if !exists(filepath.Join(l.cfg.InboxDir(), "question.md")) {
 		t.Fatal("the question was not written before the wake failed")
+	}
+}
+
+// The gate can run for a long time. A draft that a reviewer marks ready
+// while it runs has left the producer's hands; the push must not happen at
+// all, not merely be noticed afterwards.
+func TestDraftFlippedDuringGateIsNotPushed(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "fix")
+	old := submit.ImmutableBranch("producer/fix", "0ld0ld0ld0")
+	l.drv.family = []scm.Change{{ID: "7", SourceBranch: old, TargetBranch: "main", Draft: true, State: scm.StateOpen, Author: "producer-bot"}}
+	l.gate.during = func() { l.drv.family[0].Draft = false }
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if exitOf(t, err) != submit.ExitConfig {
+		t.Fatalf("err=%v, want exit %d", err, submit.ExitConfig)
+	}
+	if !l.gate.ran {
+		t.Fatal("the gate did not run; the flip happened nowhere")
+	}
+	if len(l.tr.pushed) != 0 {
+		t.Fatalf("pushed %v after the draft was marked ready during the gate", l.tr.pushed)
+	}
+	if l.drv.opened != nil || len(l.drv.closed) != 0 {
+		t.Fatalf("opened=%v closed=%v; the reviewer's change must be left exactly as it is", l.drv.opened != nil, l.drv.closed)
+	}
+}
+
+// Both drivers map an omitted author to "". An unknown owner is not ours.
+func TestChangeWithNoAuthorIsNotOurs(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "fix")
+	same := submit.ImmutableBranch("producer/fix", "abc123")
+	l.drv.family = []scm.Change{{ID: "7", SourceBranch: same, TargetBranch: "main", Draft: true, State: scm.StateOpen, Author: ""}}
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if exitOf(t, err) != submit.ExitConfig || !strings.Contains(err.Error(), "no author") {
+		t.Fatalf("err=%v, want exit %d refusing the authorless change", err, submit.ExitConfig)
+	}
+	if l.gate.ran || len(l.tr.pushed) != 0 {
+		t.Fatalf("gate ran=%v pushed=%v; nothing may proceed on an unknown owner", l.gate.ran, l.tr.pushed)
+	}
+}
+
+// A producer whose own login is unknown cannot establish ownership of anything.
+func TestProducerWithoutLoginOwnsNothing(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "fix")
+	l.deps.Producer.Login = ""
+	l.tr.login = "" // both mechanisms agree on an empty login; ownership is what is tested
+	same := submit.ImmutableBranch("producer/fix", "abc123")
+	l.drv.family = []scm.Change{{ID: "7", SourceBranch: same, TargetBranch: "main", Draft: true, State: scm.StateOpen, Author: "producer-bot"}}
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if exitOf(t, err) != submit.ExitConfig || !strings.Contains(err.Error(), "no login") {
+		t.Fatalf("err=%v, want exit %d", err, submit.ExitConfig)
+	}
+	if len(l.tr.pushed) != 0 {
+		t.Fatalf("pushed %v", l.tr.pushed)
+	}
+}
+
+// New content is a new branch and a new draft; the earlier draft in the
+// family is closed with a pointer to it. It is never pushed into.
+func TestNewContentSupersedesEarlierDraft(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "fix")
+	old := submit.ImmutableBranch("producer/fix", "0ld0ld0ld0")
+	l.drv.family = []scm.Change{{ID: "7", SourceBranch: old, TargetBranch: "main", Draft: true, State: scm.StateOpen, Author: "producer-bot"}}
+	r, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	want := submit.ImmutableBranch("producer/fix", "abc123")
+	if l.drv.opened == nil || l.drv.opened.SourceBranch != want {
+		t.Fatalf("opened=%+v, want a new draft on %s", l.drv.opened, want)
+	}
+	if len(l.tr.pushed) != 1 || strings.Contains(l.tr.pushed[0], old) {
+		t.Fatalf("pushed %v; the old branch must never be pushed to", l.tr.pushed)
+	}
+	if len(l.drv.closed) != 1 || l.drv.closed[0] != "7" {
+		t.Fatalf("closed %v, want the superseded draft 7", l.drv.closed)
+	}
+	if r.Change == nil || r.Change.ID == "7" {
+		t.Fatalf("result=%+v", r)
+	}
+}
+
+// A ready change anywhere in the family is the reviewer's: the submission
+// stops before the gate spends anything, and the change is untouched.
+func TestReadySiblingStopsBeforeGate(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "fix")
+	old := submit.ImmutableBranch("producer/fix", "0ld0ld0ld0")
+	l.drv.family = []scm.Change{{ID: "7", SourceBranch: old, TargetBranch: "main", Draft: false, State: scm.StateOpen, Author: "producer-bot"}}
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if exitOf(t, err) != submit.ExitConfig {
+		t.Fatalf("err=%v, want exit %d", err, submit.ExitConfig)
+	}
+	if l.gate.ran || len(l.tr.pushed) != 0 || len(l.drv.closed) != 0 {
+		t.Fatalf("gate=%v pushed=%v closed=%v", l.gate.ran, l.tr.pushed, l.drv.closed)
+	}
+}
+
+func TestImmutableBranchIsContentDerived(t *testing.T) {
+	a := submit.ImmutableBranch("producer/fix", "0123456789abcdef")
+	b := submit.ImmutableBranch("producer/fix", "fedcba9876543210")
+	if a == b || a != "producer/fix-0123456789" {
+		t.Fatalf("a=%s b=%s", a, b)
+	}
+	if submit.ImmutableBranch("x", "ab") != "x-ab" {
+		t.Fatal("short sha")
+	}
+}
+
+// The pre-push read is stale by the length of the push. A draft a reviewer
+// marks ready in that window is the reviewer's and must not be closed.
+func TestDraftMarkedReadyDuringPushIsNotSuperseded(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "fix")
+	old := submit.ImmutableBranch("producer/fix", "0ld0ld0ld0")
+	l.drv.family = []scm.Change{{ID: "7", SourceBranch: old, TargetBranch: "main", Draft: true, State: scm.StateOpen, Author: "producer-bot"}}
+	l.tr.onPush = func() { l.drv.family[0].Draft = false }
+	r, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(l.tr.pushed) != 1 || l.drv.opened == nil {
+		t.Fatalf("pushed=%v opened=%v; the new content still goes up as its own draft", l.tr.pushed, l.drv.opened != nil)
+	}
+	if len(l.drv.closed) != 0 {
+		t.Fatalf("closed %v; a draft that went ready during the push is the reviewer's", l.drv.closed)
+	}
+	if r.Change == nil || r.Change.ID == "7" {
+		t.Fatalf("result=%+v", r)
+	}
+}
+
+// The branch names the tree, not the commit: the same content committed
+// again -- new timestamp, new commit sha -- must map to the same draft.
+func TestSameTreeRecommittedIsAlreadySubmitted(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "fix")
+	l.git.commitOK = "different-commit-sha"
+	same := submit.ImmutableBranch("producer/fix", "abc123")
+	l.drv.family = []scm.Change{{ID: "7", SourceBranch: same, TargetBranch: "main", Draft: true, State: scm.StateOpen, Author: "producer-bot"}}
+	r, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Exit != submit.ExitNothing || r.Change == nil || r.Change.ID != "7" || len(l.tr.pushed) != 0 {
+		t.Fatalf("result=%+v pushed=%v; a recommit of the same tree is not new content", r, l.tr.pushed)
 	}
 }

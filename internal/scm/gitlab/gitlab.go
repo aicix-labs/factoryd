@@ -396,6 +396,22 @@ func (d *Driver) OpenDraft(ctx context.Context, spec scm.DraftSpec) (scm.Change,
 	return c, nil
 }
 
+func (d *Driver) Close(ctx context.Context, id scm.ChangeID, comment string) error {
+	if strings.TrimSpace(comment) != "" {
+		if err := d.Comment(ctx, id, comment); err != nil {
+			return err
+		}
+	}
+	var m glMR
+	if _, err := d.c.Do(ctx, http.MethodPut, d.mrPath(id, ""), map[string]string{"state_event": "close"}, &m); err != nil {
+		return fmt.Errorf("gitlab close %s: %w", id, err)
+	}
+	if m.State != "closed" {
+		return fmt.Errorf("gitlab close %s: provider reports state %q after close", id, m.State)
+	}
+	return nil
+}
+
 // ---------- write verbs ----------
 
 func (d *Driver) Comment(ctx context.Context, id scm.ChangeID, body string) error {

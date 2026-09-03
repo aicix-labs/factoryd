@@ -192,6 +192,7 @@ func scenarios() []scenario {
 		{name: "find_open_found", run: scFindOpenFound},
 		{name: "find_open_absent", run: scFindOpenAbsent},
 		{name: "open_draft", run: scOpenDraft},
+		{name: "close", run: scClose},
 		{name: "whoami_with", run: scWhoamiWith},
 	}
 }
@@ -612,4 +613,10 @@ func scOpenDraft(ctx context.Context, d scm.Driver, _ Factory) error {
 		return fmt.Errorf("OpenDraft returned state %v, want open", c.State)
 	}
 	return nil
+}
+
+// Close must leave the provider reporting the change closed; the driver
+// checks the response rather than trusting the request.
+func scClose(ctx context.Context, d scm.Driver, _ Factory) error {
+	return d.Close(ctx, ChangeID, "superseded by a newer submission")
 }

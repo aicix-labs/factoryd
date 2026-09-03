@@ -257,6 +257,11 @@ type Driver interface {
 	// reviewer's act, not the producer's (SPEC.md §2).
 	OpenDraft(ctx context.Context, d DraftSpec) (Change, error)
 
+	// Close closes an open change without merging it, leaving a comment that
+	// says why. Submit uses it to retire a draft it has superseded; it never
+	// closes a change that is not a draft authored by the producer.
+	Close(ctx context.Context, id ChangeID, comment string) error
+
 	// GitCredential is what git is handed over HTTPS for this provider. The
 	// username half is provider-owned: GitHub and GitLab do not agree on it,
 	// so it cannot be derived from the token alone. Pure; no I/O.

@@ -387,6 +387,22 @@ func (d *Driver) OpenDraft(ctx context.Context, spec scm.DraftSpec) (scm.Change,
 	return c, nil
 }
 
+func (d *Driver) Close(ctx context.Context, id scm.ChangeID, comment string) error {
+	if strings.TrimSpace(comment) != "" {
+		if err := d.Comment(ctx, id, comment); err != nil {
+			return err
+		}
+	}
+	var p ghPull
+	if _, err := d.c.Do(ctx, http.MethodPatch, d.repoPath("/pulls/"+url.PathEscape(string(id))), map[string]string{"state": "closed"}, &p); err != nil {
+		return fmt.Errorf("github close %s: %w", id, err)
+	}
+	if p.State != "closed" {
+		return fmt.Errorf("github close %s: provider reports state %q after close", id, p.State)
+	}
+	return nil
+}
+
 // ---------- write verbs ----------
 
 func (d *Driver) Comment(ctx context.Context, id scm.ChangeID, body string) error {

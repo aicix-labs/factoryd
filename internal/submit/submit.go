@@ -98,6 +98,9 @@ type Git interface {
 	// Commit stages everything and commits as the given author. It returns
 	// the commit sha, or ok=false when there was nothing to commit.
 	Commit(ctx context.Context, msg, authorName, authorEmail string) (sha string, ok bool, err error)
+	// Tree returns the sha of HEAD's tree: the content, independent of who
+	// committed it or when. It names the immutable branch.
+	Tree(ctx context.Context) (string, error)
 	// Status lists paths that differ from HEAD.
 	Status(ctx context.Context) ([]string, error)
 }
@@ -208,30 +211,22 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	}
 	fmt.Fprintf(log, "intent: branch %s, message %q\n", branch, firstLine(msg))
 
-	// 3. An existing change on this branch is validated BEFORE anything is
-	// pushed to it. The lookup keys on the source branch; that alone says
-	// nothing about whether the change is still ours to push to. If a
-	// reviewer has marked it ready, a push would put new code into a change
-	// that has left the producer's hands.
-	existing, found, err := deps.Driver.FindOpenBySource(ctx, branch)
-	if err != nil {
-		return Result{}, wrap(ExitConfig, err, "looking for an open change on %s", branch)
-	}
-	if found {
-		if err := changeIsOurs(existing, branch, cfg.TargetBranch, deps.Producer); err != nil {
-			return Result{}, wrap(ExitConfig, err, "an open change already exists on %s and is not one this producer may update", branch)
-		}
-	}
-
-	// 4. Materialise into the repository the producer cannot write.
+	// 3. Materialise into the repository the producer cannot write. The
+	// branch that is pushed is derived from the CONTENT (declared name plus
+	// commit sha), which is what closes the check-to-push race: a push never
+	// modifies a branch any existing change references, because a different
+	// tree is a different branch, and the same tree is the same sha and a
+	// no-op. No lease is needed from a provider that offers none. The
+	// declared name is the family; each submission is an immutable member.
 	if err := deps.Transport.Guard(); err != nil {
 		return Result{}, wrap(ExitConfig, err, "the submit repository failed its guard before any git ran")
 	}
 	if err := deps.Transport.Fetch(ctx, "+refs/heads/"+cfg.TargetBranch+":refs/remotes/factoryd/"+cfg.TargetBranch); err != nil {
 		return Result{}, wrap(ExitConfig, err, "fetching %s", cfg.TargetBranch)
 	}
-	if err := deps.Git.Checkout(ctx, branch, "refs/remotes/factoryd/"+cfg.TargetBranch); err != nil {
-		return Result{}, wrap(ExitConfig, err, "creating %s from %s", branch, cfg.TargetBranch)
+	declared := branch
+	if err := deps.Git.Checkout(ctx, declared, "refs/remotes/factoryd/"+cfg.TargetBranch); err != nil {
+		return Result{}, wrap(ExitConfig, err, "creating %s from %s", declared, cfg.TargetBranch)
 	}
 	if err := gittransport.CopyTree(work, cfg.Paths.SubmitRepo); err != nil {
 		return Result{}, wrap(ExitConfig, err, "copying the producer's tree into the submit repository")
@@ -243,7 +238,35 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	if !committed {
 		return Result{Exit: ExitNothing, Reason: "the producer's tree is identical to " + cfg.TargetBranch + "; nothing to submit"}, nil
 	}
-	fmt.Fprintf(log, "materialised: %s at %s\n", branch, sha)
+	tree, err := deps.Git.Tree(ctx)
+	if err != nil {
+		return Result{}, wrap(ExitConfig, err, "reading the tree of %s", sha)
+	}
+	branch = ImmutableBranch(declared, tree)
+	if err := deps.Git.Checkout(ctx, branch, "HEAD"); err != nil {
+		return Result{}, wrap(ExitConfig, err, "naming the immutable branch %s", branch)
+	}
+	fmt.Fprintf(log, "materialised: %s at %s (tree %s)\n", branch, sha, tree)
+
+	// 4. Prior drafts in this family are located now and validated as ours.
+	// One on THIS branch is the same tree already submitted: there is
+	// nothing new to gate or push, and the answer is "already submitted".
+	family, err := openInFamily(ctx, deps.Driver, declared)
+	if err != nil {
+		return Result{}, wrap(ExitConfig, err, "looking for open changes on %s", declared)
+	}
+	for _, c := range family {
+		// Every member must be ours. A ready or foreign change in the family
+		// stops the submission before the gate spends anything.
+		if err := changeIsOurs(c, c.SourceBranch, cfg.TargetBranch, deps.Producer); err != nil {
+			return Result{}, wrap(ExitConfig, err, "an open change exists on %s and is not one this producer may update", declared)
+		}
+		if c.SourceBranch == branch {
+			existing := c
+			return Result{Exit: ExitNothing, Change: &existing, Branch: branch,
+				Reason: fmt.Sprintf("this tree is already submitted as %s on %s; nothing new to submit", existing.ID, branch)}, nil
+		}
+	}
 
 	// 5. The gate's paths, provisioned FOR THE GATE and proven writable BY the
 	// gate immediately before it runs. CopyTree just cleared the work tree,
@@ -293,43 +316,70 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	}
 	fmt.Fprintf(log, "gate: green\n")
 
-	// 7. Push, through the transport's own guard, as the producer.
-	if err := deps.Transport.Push(ctx, "+refs/heads/"+branch+":refs/heads/"+branch); err != nil {
+	// 7. Immediately before the push -- after the gate, which may have run
+	// for a long time -- every open change in the family is re-read. One that
+	// has left the producer's hands since the earlier look (a reviewer marked
+	// it ready during the gate) stops the submission here, before any push:
+	// the producer's newer work waits for the reviewer's decision on the
+	// change they took. This is the check the immutable branch makes
+	// sufficient: even a flip in the instant after it cannot be pushed INTO,
+	// because the push below targets a branch no change references.
+	family, err = openInFamily(ctx, deps.Driver, declared)
+	if err != nil {
+		return Result{}, wrap(ExitConfig, err, "re-reading open changes on %s before the push", declared)
+	}
+	for _, c := range family {
+		if err := changeIsOurs(c, c.SourceBranch, cfg.TargetBranch, deps.Producer); err != nil {
+			return Result{}, wrap(ExitConfig, err, "change %s left the producer's hands while the gate ran; not pushing", c.ID)
+		}
+	}
+
+	// Non-force: a branch that somehow already exists with different content
+	// is rejected by git itself. The push cannot modify anything.
+	if err := deps.Transport.Push(ctx, "refs/heads/"+branch+":refs/heads/"+branch); err != nil {
 		return Result{}, wrap(ExitConfig, err, "pushing %s", branch)
 	}
 	fmt.Fprintf(log, "pushed: %s\n", branch)
 
-	// 8. Create-or-update the Draft, idempotent on the branch.
-	var change scm.Change
-	if found {
-		// The window between the pre-push check and the push is real: a
-		// reviewer can mark the change ready in it. Re-read it now. If it
-		// changed underneath the push, the push has already landed on a
-		// change that left the producer's hands -- unrecoverable here, so it
-		// is reported as an infrastructure failure, loudly, not as success.
-		now, err := deps.Driver.Get(ctx, existing.ID)
+	// 8. Open the Draft. The branch is new by construction (a same-tree
+	// draft returned "already submitted" before the gate), so this is
+	// always a create, never an update of a change something else may hold.
+	change, err := deps.Driver.OpenDraft(ctx, scm.DraftSpec{
+		SourceBranch: branch, TargetBranch: cfg.TargetBranch,
+		Title: firstLine(msg), Body: draftBody(msg, sha, deps.Now()),
+	})
+	if err != nil {
+		return Result{}, wrap(ExitConfig, err, "opening the draft for %s", branch)
+	}
+	// The provider's response is validated in full, not just its draft
+	// flag: the change it opened must be the one that was asked for.
+	if err := changeIsOurs(change, branch, cfg.TargetBranch, deps.Producer); err != nil {
+		return Result{}, wrap(ExitConfig, err, "the provider opened %s but it is not the change that was requested", change.ID)
+	}
+	fmt.Fprintf(log, "draft: opened %s\n", change.ID)
+
+	// Earlier drafts in the family are superseded: closed with a pointer to
+	// the new one -- but only those still ours. A change that went ready in
+	// the meantime is the reviewer's and is left exactly as it is.
+	for _, c := range family {
+		if c.ID == change.ID {
+			continue
+		}
+		// Re-read immediately before closing: the pre-push read is stale by
+		// the length of the push, and a draft marked ready in that window
+		// is no longer ours to close.
+		c, err = deps.Driver.Get(ctx, c.ID)
 		if err != nil {
-			return Result{}, wrap(ExitConfig, err, "re-reading %s after the push", existing.ID)
+			return Result{}, wrap(ExitConfig, err, "re-reading %s before superseding it", c.ID)
 		}
-		if err := changeIsOurs(now, branch, cfg.TargetBranch, deps.Producer); err != nil {
-			return Result{}, wrap(ExitConfig, err, "change %s changed state between the check and the push; the push landed on it and a human must look", existing.ID)
+		if err := changeIsOurs(c, c.SourceBranch, cfg.TargetBranch, deps.Producer); err != nil {
+			fmt.Fprintf(log, "draft: %s left as is (%v)\n", c.ID, err)
+			continue
 		}
-		change = now
-		fmt.Fprintf(log, "draft: updated %s\n", change.ID)
-	} else {
-		change, err = deps.Driver.OpenDraft(ctx, scm.DraftSpec{
-			SourceBranch: branch, TargetBranch: cfg.TargetBranch,
-			Title: firstLine(msg), Body: draftBody(msg, sha, deps.Now()),
-		})
-		if err != nil {
-			return Result{}, wrap(ExitConfig, err, "opening the draft for %s", branch)
+		if err := deps.Driver.Close(ctx, c.ID, fmt.Sprintf("Superseded by %s (%s).", change.ID, branch)); err != nil {
+			return Result{}, wrap(ExitConfig, err, "closing the superseded draft %s", c.ID)
 		}
-		// The provider's response is validated in full, not just its draft
-		// flag: the change it opened must be the one that was asked for.
-		if err := changeIsOurs(change, branch, cfg.TargetBranch, deps.Producer); err != nil {
-			return Result{}, wrap(ExitConfig, err, "the provider opened %s but it is not the change that was requested", change.ID)
-		}
-		fmt.Fprintf(log, "draft: opened %s\n", change.ID)
+		fmt.Fprintf(log, "draft: superseded %s\n", c.ID)
 	}
 
 	// 9. Signal the reviewer and retire the control files.
@@ -421,8 +471,46 @@ func changeIsOurs(c scm.Change, branch, target string, producer scm.Identity) er
 		return fmt.Errorf("change %s is from %q, not %q", c.ID, c.SourceBranch, branch)
 	case c.TargetBranch != target:
 		return fmt.Errorf("change %s targets %q, not the configured %q", c.ID, c.TargetBranch, target)
-	case c.Author != "" && producer.Login != "" && c.Author != producer.Login:
+	case producer.Login == "":
+		return fmt.Errorf("the producer has no login; ownership of change %s cannot be established", c.ID)
+	case c.Author == "":
+		// Both drivers map an omitted author to "". An incomplete response
+		// must not satisfy an ownership check: an unknown owner is not ours.
+		return fmt.Errorf("change %s reports no author; ownership is unknown, which is not the same as ours", c.ID)
+	case c.Author != producer.Login:
 		return fmt.Errorf("change %s was opened by %q, not by this producer %q", c.ID, c.Author, producer.Login)
 	}
 	return nil
+}
+
+// ImmutableBranch names the branch a submission is pushed to: the declared
+// family name plus the TREE it carries. Different content is a different
+// branch; identical content is the same branch however often, and by
+// whomever, it is committed -- which a commit sha, carrying timestamps,
+// would not give.
+func ImmutableBranch(declared, tree string) string {
+	n := 10
+	if len(tree) < n {
+		n = len(tree)
+	}
+	return declared + "-" + tree[:n]
+}
+
+// openInFamily lists the open changes whose source branch belongs to the
+// declared family: the family name itself, or the family name followed by the
+// immutable suffix. Author is not filtered here; ownership is judged per
+// change by changeIsOurs, so that a foreign change in the family refuses
+// rather than being silently ignored.
+func openInFamily(ctx context.Context, d scm.Driver, declared string) ([]scm.Change, error) {
+	all, err := d.ListOpen(ctx)
+	if err != nil {
+		return nil, err
+	}
+	var out []scm.Change
+	for _, c := range all {
+		if c.SourceBranch == declared || strings.HasPrefix(c.SourceBranch, declared+"-") {
+			out = append(out, c)
+		}
+	}
+	return out, nil
 }

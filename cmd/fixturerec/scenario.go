@@ -118,6 +118,9 @@ func scenarios() []scenario {
 			w.Redactor.MapPattern(regexp.MustCompile(fmt.Sprintf(`/(merge_requests|pulls|pull|issues)/%s\b`, c.ID)), `/$1/42`)
 			return nil
 		}},
+		{name: "close", setup: "draft_change", act: func(ctx context.Context, d scm.Driver, w *world) error {
+			return d.Close(ctx, w.ChangeID, "superseded by a newer submission")
+		}},
 		{name: "merge_refused_draft", setup: "draft_change", act: func(ctx context.Context, d scm.Driver, w *world) error {
 			_, err := scm.MergeVerified(ctx, d, w.ChangeID, w.HeadSHA, conformance.TargetBranch)
 			return err

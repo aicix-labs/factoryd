@@ -129,6 +129,7 @@ func (f *fakeDriver) SetDraft(context.Context, ChangeID, bool) error            
 func (f *fakeDriver) PostAudit(context.Context, ChangeID, string, Audit) error       { panic("unused") }
 func (f *fakeDriver) Audits(context.Context, ChangeID, string) ([]Audit, error)      { panic("unused") }
 func (f *fakeDriver) FindOpenBySource(context.Context, string) (Change, bool, error) { panic("unused") }
+func (f *fakeDriver) Close(context.Context, ChangeID, string) error                  { panic("unused") }
 func (f *fakeDriver) OpenDraft(context.Context, DraftSpec) (Change, error)           { panic("unused") }
 func (f *fakeDriver) WhoamiWith(context.Context, string) (Identity, error)           { panic("unused") }
 func (f *fakeDriver) GitCredential(string) GitCredential                             { panic("unused") }

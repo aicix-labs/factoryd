@@ -79,6 +79,14 @@ func (g *RepoGit) Commit(ctx context.Context, msg, authorName, authorEmail strin
 	return strings.TrimSpace(sha), true, nil
 }
 
+func (g *RepoGit) Tree(ctx context.Context) (string, error) {
+	t, err := g.run(ctx, "rev-parse", "HEAD^{tree}")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(t), nil
+}
+
 func (g *RepoGit) Status(ctx context.Context) ([]string, error) {
 	out, err := g.run(ctx, "status", "--porcelain")
 	if err != nil {
