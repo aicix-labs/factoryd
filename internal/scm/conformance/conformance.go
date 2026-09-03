@@ -189,6 +189,10 @@ func scenarios() []scenario {
 		{name: "audits", run: scAudits},
 		{name: "audit_requires_attempts", denyHTTP: true, run: scAuditRequiresAttempts},
 		{name: "git_credential", denyHTTP: true, run: scGitCredential},
+		{name: "find_open_found", run: scFindOpenFound},
+		{name: "find_open_absent", run: scFindOpenAbsent},
+		{name: "open_draft", run: scOpenDraft},
+		{name: "close", run: scClose},
 		{name: "whoami_with", run: scWhoamiWith},
 	}
 }
@@ -559,4 +563,60 @@ func scWhoamiWith(ctx context.Context, d scm.Driver, _ Factory) error {
 		return fmt.Errorf("WhoamiWith resolved %+v, want %s with an id", id, ReviewerName)
 	}
 	return nil
+}
+
+// FindOpenBySource is what makes submit idempotent: the same branch twice
+// updates one draft rather than opening two.
+func scFindOpenFound(ctx context.Context, d scm.Driver, _ Factory) error {
+	c, ok, err := d.FindOpenBySource(ctx, SourceBranch)
+	if err != nil {
+		return err
+	}
+	if !ok {
+		return fmt.Errorf("FindOpenBySource did not find the open change for %s", SourceBranch)
+	}
+	if c.ID != ChangeID || c.SourceBranch != SourceBranch {
+		return fmt.Errorf("FindOpenBySource returned %s from %s, want %s from %s", c.ID, c.SourceBranch, ChangeID, SourceBranch)
+	}
+	return nil
+}
+
+func scFindOpenAbsent(ctx context.Context, d scm.Driver, _ Factory) error {
+	_, ok, err := d.FindOpenBySource(ctx, "producer/nothing-here")
+	if err != nil {
+		return err
+	}
+	if ok {
+		return fmt.Errorf("FindOpenBySource reported an open change for a branch that has none")
+	}
+	return nil
+}
+
+// OpenDraft must yield a change the provider reports as a draft. Ready is the
+// reviewer's act, and a provider that quietly opens ready must be refused, not
+// trusted -- the driver asks the response, it does not assume the request.
+func scOpenDraft(ctx context.Context, d scm.Driver, _ Factory) error {
+	c, err := d.OpenDraft(ctx, scm.DraftSpec{
+		SourceBranch: SourceBranch, TargetBranch: TargetBranch,
+		Title: ChangeTitle, Body: "opened by factoryd submit",
+	})
+	if err != nil {
+		return err
+	}
+	if !c.Draft {
+		return fmt.Errorf("OpenDraft returned a change that is not a draft: %+v", c)
+	}
+	if c.SourceBranch != SourceBranch || c.TargetBranch != TargetBranch {
+		return fmt.Errorf("OpenDraft opened %s -> %s, want %s -> %s", c.SourceBranch, c.TargetBranch, SourceBranch, TargetBranch)
+	}
+	if c.State != scm.StateOpen {
+		return fmt.Errorf("OpenDraft returned state %v, want open", c.State)
+	}
+	return nil
+}
+
+// Close must leave the provider reporting the change closed; the driver
+// checks the response rather than trusting the request.
+func scClose(ctx context.Context, d scm.Driver, _ Factory) error {
+	return d.Close(ctx, ChangeID, "superseded by a newer submission")
 }

@@ -395,6 +395,13 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 		}
 	}
 
+	// --- the git binary: the one on the declared PATH, by absolute path ---
+	if exe, err := gittransport.GitBinary(cfg); err != nil {
+		add("git binary", err, "")
+	} else {
+		add("git binary", nil, exe)
+	}
+
 	// --- the git transport: same identity, owned target ---
 	if tok, err := cfg.Credentials.Producer.Resolve(); err == nil {
 		if d, err := newDriver(cfg, tok); err == nil {

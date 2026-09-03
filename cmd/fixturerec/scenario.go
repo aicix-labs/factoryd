@@ -4,6 +4,7 @@ import (
 	"context"
 	"fmt"
 	"net/http"
+	"regexp"
 
 	"github.com/aicix-labs/factoryd/internal/scm"
 	"github.com/aicix-labs/factoryd/internal/scm/conformance"
@@ -95,6 +96,30 @@ func scenarios() []scenario {
 		{name: "audits", setup: "change_with_audits", act: func(ctx context.Context, d scm.Driver, w *world) error {
 			_, err := d.Audits(ctx, w.ChangeID, w.HeadSHA)
 			return err
+		}},
+		{name: "find_open_found", setup: "open_change", act: func(ctx context.Context, d scm.Driver, w *world) error {
+			_, _, err := d.FindOpenBySource(ctx, conformance.SourceBranch)
+			return err
+		}},
+		{name: "find_open_absent", setup: "open_change", act: func(ctx context.Context, d scm.Driver, w *world) error {
+			_, _, err := d.FindOpenBySource(ctx, "producer/nothing-here")
+			return err
+		}},
+		{name: "open_draft", setup: "branch_only", act: func(ctx context.Context, d scm.Driver, w *world) error {
+			c, err := d.OpenDraft(ctx, scm.DraftSpec{
+				SourceBranch: conformance.SourceBranch, TargetBranch: conformance.TargetBranch,
+				Title: conformance.ChangeTitle, Body: "opened by factoryd submit",
+			})
+			if err != nil {
+				return err
+			}
+			// The new change's id is created by the exchange being recorded.
+			w.Redactor.MapPattern(regexp.MustCompile(fmt.Sprintf(`"(iid|number)":%s\b`, c.ID)), `"$1":42`)
+			w.Redactor.MapPattern(regexp.MustCompile(fmt.Sprintf(`/(merge_requests|pulls|pull|issues)/%s\b`, c.ID)), `/$1/42`)
+			return nil
+		}},
+		{name: "close", setup: "draft_change", act: func(ctx context.Context, d scm.Driver, w *world) error {
+			return d.Close(ctx, w.ChangeID, "superseded by a newer submission")
 		}},
 		{name: "merge_refused_draft", setup: "draft_change", act: func(ctx context.Context, d scm.Driver, w *world) error {
 			_, err := scm.MergeVerified(ctx, d, w.ChangeID, w.HeadSHA, conformance.TargetBranch)

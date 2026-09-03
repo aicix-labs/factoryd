@@ -122,6 +122,21 @@ func (r *recorder) GitCredential(secret string) scm.GitCredential {
 	return r.inner.GitCredential(secret)
 }
 
+func (r *recorder) FindOpenBySource(ctx context.Context, branch string) (scm.Change, bool, error) {
+	r.note("FindOpenBySource")
+	return r.inner.FindOpenBySource(ctx, branch)
+}
+
+func (r *recorder) OpenDraft(ctx context.Context, d scm.DraftSpec) (scm.Change, error) {
+	r.note("OpenDraft")
+	return r.inner.OpenDraft(ctx, d)
+}
+
+func (r *recorder) Close(ctx context.Context, id scm.ChangeID, comment string) error {
+	r.note("Close")
+	return r.inner.Close(ctx, id, comment)
+}
+
 // interfaceVerbs is every method of scm.Driver, read from the interface itself.
 // Adding a method to Driver adds it here with no edit anywhere.
 func interfaceVerbs() []string {

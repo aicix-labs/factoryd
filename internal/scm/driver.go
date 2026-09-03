@@ -247,10 +247,33 @@ type Driver interface {
 	// than of configuration (SPEC.md §5.4). No I/O beyond the one request.
 	WhoamiWith(ctx context.Context, secret string) (Identity, error)
 
+	// FindOpenBySource returns the open change whose source branch is
+	// branch, if any. Submit is idempotent on it: a second run for the same
+	// branch updates the existing draft rather than opening a duplicate.
+	FindOpenBySource(ctx context.Context, branch string) (Change, bool, error)
+
+	// OpenDraft opens a Draft change from source into target. The change is
+	// created as a draft -- never ready -- because marking ready is the
+	// reviewer's act, not the producer's (SPEC.md §2).
+	OpenDraft(ctx context.Context, d DraftSpec) (Change, error)
+
+	// Close closes an open change without merging it, leaving a comment that
+	// says why. Submit uses it to retire a draft it has superseded; it never
+	// closes a change that is not a draft authored by the producer.
+	Close(ctx context.Context, id ChangeID, comment string) error
+
 	// GitCredential is what git is handed over HTTPS for this provider. The
 	// username half is provider-owned: GitHub and GitLab do not agree on it,
 	// so it cannot be derived from the token alone. Pure; no I/O.
 	GitCredential(secret string) GitCredential
+}
+
+// DraftSpec is what OpenDraft needs.
+type DraftSpec struct {
+	SourceBranch string
+	TargetBranch string
+	Title        string
+	Body         string
 }
 
 // GitCredential is a username/secret pair for git's credential protocol.

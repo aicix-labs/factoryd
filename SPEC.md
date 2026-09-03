@@ -250,13 +250,51 @@ Submit is also **the gate**. In order:
 1. resolve the **producer** credential; **fail closed** — never fall back to the
    reviewer's. Refuse if the two resolve to the same identity, naming it.
    This governs **both the API and the git transport** — see below.
-2. materialize: create branch from target, stage, commit
-3. re-check `gate.required_writable_paths` (below). A missing or unwritable one
+2. materialize: create branch from target, stage, commit. The branch that is
+   pushed is **derived from the content**: `<declared>-<tree[:10]>` — the
+   *tree* sha, not the commit sha, which carries timestamps and would make the
+   same content a new branch every time. The declared name is the *family*;
+   each submission is an immutable member of it.
+3. list the open changes in the family; **every one must be ours** (below). A
+   ready or foreign change anywhere in the family stops the submission here,
+   before the gate spends anything — exit **3**. A draft already on *this*
+   branch is the same tree, already submitted: exit **4**, naming it; nothing
+   is gated or pushed.
+4. re-check `gate.required_writable_paths` (below). A missing or unwritable one
    exits **3**, not 5: a misconfigured host is not a red branch (§9.6).
-4. run the configured gate command (build/vet/test). If red: write a question
+5. run the configured gate command (build/vet/test). If red: write a question
    (§6.2), signal, **do not push**
-5. push, create-or-update the Draft PR/MR
-6. signal the reviewer
+6. **re-read the family immediately before the push**. The gate may have run
+   for a long time; a draft a reviewer marked ready in the meantime has left
+   the producer's hands and the push does not happen — exit **3**, the
+   producer's newer work waits for the reviewer's decision.
+7. push, **non-force**, to the content-derived branch; create-or-update the
+   Draft PR/MR; re-read it after the push and validate it in full.
+8. **supersede — by report, never by write**: the earlier drafts in the
+   family are named in the new draft's body, the log and the result, and left
+   open. Submit never writes to an existing change. A read of one is stale by
+   the time a write would land, and neither provider offers a close
+   conditional on the state that was read; a reread before a close is not a
+   guard, it is the same race one call later. The reviewer, who holds the
+   merge, closes what is superseded.
+9. signal the reviewer
+
+**Why the branch is immutable.** A check-then-push on a mutable branch has a
+window: however close the ready/draft check sits to the push, a reviewer can
+mark the change ready in the instant between, and the push then puts new code
+into a change that is no longer the producer's. No provider offers a lease
+that closes that window. The immutable branch makes the pre-push check
+*sufficient* rather than merely *recent*: the push targets a branch that no
+existing change references, so even a flip in that instant cannot be pushed
+*into* — the worst case is a superfluous new draft beside a change the
+reviewer took, and step 8 leaves that change alone. Identical content is the
+same tree, the same branch, and the draft that already exists.
+
+**A change is ours only when it says so.** Ownership requires an open draft
+targeting the configured branch, a producer login that is known, and an author
+equal to it. Both drivers map an omitted author to `""`; an unknown owner is
+not the same as ours, and a check that accepted it would pass on exactly the
+incomplete response it should refuse.
 
 Exit codes are part of the contract: `0` submitted · `4` nothing to submit ·
 `5` gate failed · `3` configuration/identity failure.
@@ -899,6 +937,9 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §4.4 symlink escape | a symlink in the producer tree resolving outside it is followed | a symlink within the tree is preserved |
 | §4.4 symlink into `.git` | a link whose recreated target passes through `.git` (`hooks -> .git/hooks`, `x -> ../.git/config`) is copied | an in-tree link to a plain file is preserved |
 | §4.4 gate identity | the gate user can write `submit_repo/.git`, or can read either credential file → refuse | the gate user can write each declared path, so "cannot" is not a gate that cannot do anything |
+| §4.4 check-to-push race | a draft is marked ready **while the gate runs** → no push at all, nothing opened, nothing closed | the identical run with no flip pushes exactly once, non-force, to the content-derived branch |
+| §4.4 unknown owner is not ours | a change in the family with **no author**, or a producer with **no login** → refuse before the gate | the same change carrying the producer's login is accepted and updated |
+| §4.4 supersession never writes | the earlier draft goes ready the instant **after submit's last read of it** → `Close` is never invoked; the new content still opens as its own draft naming the old one | the old draft *is* named in the new body and the result — so "never closed" is not a supersession that never happened |
 | §4.4 gate is its own user | `gate.run_as` is empty, or names the producer's user → refuse at load | distinct users pass |
 | §4.4 turn env is owned | a reviewer credential present in the supervisor's environment reaches the producer's turn | the reviewer's turn receives that same variable, by name |
 | §4.4 declared `PATH` | the gate or turn command is found on doctor's own `PATH` but not on the declared one → doctor refuses; the turn refuses to start | found on the declared `PATH` passes |

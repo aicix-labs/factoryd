@@ -1,0 +1,96 @@
+{
+  "source": {
+    "recorded": true,
+    "provider": "gitlab",
+    "provider_version": "18.8.2",
+    "recorded_at": "2026-09-01T10:00:00Z"
+  },
+  "exchanges": [
+    {
+      "method": "GET",
+      "path": "/api/v4/projects/acme%2Fwidgets/merge_requests?per_page=100\u0026source_branch=producer/fix-thing\u0026state=opened",
+      "status": 200,
+      "body": [
+        {
+          "assignee": null,
+          "assignees": [],
+          "author": {
+            "avatar_url": "https://secure.gravatar.com/avatar/ecc55d65ed7cf1a3fe8e030a7880675cf47dabb0f717ec42a9cadf3ec66b53d3?s=80\u0026d=identicon",
+            "id": 1001,
+            "locked": false,
+            "name": "aicix-devops",
+            "public_email": null,
+            "state": "active",
+            "username": "producer-bot",
+            "web_url": "https://gitlab.example.com/producer-bot"
+          },
+          "blocking_discussions_resolved": true,
+          "closed_at": null,
+          "closed_by": null,
+          "created_at": "2026-09-01T10:00:00Z",
+          "description": null,
+          "detailed_merge_status": "conflict",
+          "discussion_locked": null,
+          "downvotes": 0,
+          "draft": false,
+          "force_remove_source_branch": null,
+          "has_conflicts": true,
+          "id": 1001,
+          "iid": 42,
+          "imported": false,
+          "imported_from": "none",
+          "labels": [
+            "factory"
+          ],
+          "merge_after": null,
+          "merge_commit_sha": null,
+          "merge_status": "cannot_be_merged",
+          "merge_user": null,
+          "merge_when_pipeline_succeeds": false,
+          "merged_at": null,
+          "merged_by": null,
+          "milestone": null,
+          "prepared_at": null,
+          "project_id": 1,
+          "reference": "!46",
+          "references": {
+            "full": "acme/widgets!46",
+            "relative": "!46",
+            "short": "!46"
+          },
+          "reviewers": [],
+          "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "should_remove_source_branch": null,
+          "source_branch": "producer/fix-thing",
+          "source_project_id": 1001,
+          "squash": false,
+          "squash_commit_sha": null,
+          "squash_on_merge": false,
+          "state": "opened",
+          "target_branch": "main",
+          "target_project_id": 1001,
+          "task_completion_status": {
+            "completed_count": 0,
+            "count": 0
+          },
+          "time_stats": {
+            "human_time_estimate": null,
+            "human_total_time_spent": null,
+            "time_estimate": 0,
+            "total_time_spent": 0
+          },
+          "title": "gate: match command position, not the mention",
+          "updated_at": "2026-09-01T10:00:00Z",
+          "upvotes": 0,
+          "user_notes_count": 0,
+          "web_url": "https://gitlab.example.com/acme/widgets/-/merge_requests/42",
+          "work_in_progress": false
+        }
+      ],
+      "header": {
+        "Link": "\u003chttps://gitlab.example.com/api/v4/projects/acme%2Fwidgets/merge_requests?id=acme%2Fwidgets\u0026order_by=created_at\u0026page=1\u0026per_page=100\u0026sort=desc\u0026source_branch=producer%2Ffix-thing\u0026state=opened\u0026with_labels_details=false\u0026with_merge_status_recheck=false\u003e; rel=\"first\", \u003chttps://gitlab.example.com/api/v4/projects/acme%2Fwidgets/merge_requests?id=acme%2Fwidgets\u0026order_by=created_at\u0026page=1\u0026per_page=100\u0026sort=desc\u0026source_branch=producer%2Ffix-thing\u0026state=opened\u0026with_labels_details=false\u0026with_merge_status_recheck=false\u003e; rel=\"last\"",
+        "X-Total-Pages": "1"
+      }
+    }
+  ]
+}

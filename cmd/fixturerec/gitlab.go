@@ -482,6 +482,15 @@ func (t *gitlabTarget) prepare(ctx context.Context, sc scenario) (*world, error)
 		w.Redactor = t.redactor(iid, head, "", false)
 		return w, nil
 
+	case "branch_only":
+		head, err := t.changeBranch(ctx, branch)
+		if err != nil {
+			return nil, err
+		}
+		w.HeadSHA = head
+		w.Redactor = t.redactor(0, head, "", false)
+		return w, nil
+
 	case "draft_change":
 		sha, err := t.changeBranch(ctx, branch)
 		if err != nil {

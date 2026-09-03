@@ -47,10 +47,30 @@ func New(cfg *config.Config, d scm.Driver, secret string) (*Transport, error) {
 	if d == nil {
 		return nil, fmt.Errorf("gittransport: no driver")
 	}
+	// The git binary is resolved from the DECLARED PATH, not the parent's.
+	// exec.Command resolves a bare "git" against factoryd's own inherited
+	// PATH before cmd.Env is ever consulted, so a wrapper first on the
+	// service's PATH would run -- and receive the producer's credential --
+	// despite the constructed child environment. An absolute path closes it.
+	gitExe, err := GitBinary(cfg)
+	if err != nil {
+		return nil, err
+	}
 	return &Transport{
 		cfg: cfg, driver: d, cred: d.GitCredential(secret),
-		Git: "git", Timeout: 5 * time.Minute,
+		Git: gitExe, Timeout: 5 * time.Minute,
 	}, nil
+}
+
+// GitBinary resolves git against the declared gate PATH -- the PATH every git
+// process is given -- and returns an absolute path. doctor verifies this exact
+// executable; submit and the transport execute it and nothing else.
+func GitBinary(cfg *config.Config) (string, error) {
+	exe, err := config.LookPathIn(cfg.Gate.Env["PATH"], "git")
+	if err != nil {
+		return "", fmt.Errorf("gittransport: %w", err)
+	}
+	return exe, nil
 }
 
 // Repo is the directory every git command runs in.
