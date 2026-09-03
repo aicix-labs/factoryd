@@ -514,13 +514,28 @@ must run with inherited credential sources suppressed:
   ssh config still apply, and a `ProxyCommand` or `ProxyJump` there routes the
   connection through a host factoryd never chose, with the effective URL
   unchanged. Then, on that clean base: `IdentitiesOnly=yes`,
-  `IdentityAgent=none`, an explicit `IdentityFile`, and an explicit
-  `UserKnownHostsFile` with `StrictHostKeyChecking=yes` — the host-key policy is
-  factoryd's, pinned in configuration, because trust-on-first-use inside an
-  unowned home directory is one more ambient input. An agent holding the
-  reviewer's key is the same failure as a credential helper holding the
-  reviewer's token; a ProxyCommand in a dotfile is the same failure as
-  `http_proxy` in the environment.
+  `IdentityAgent=none`, an explicit `IdentityFile`, and the host-key set pinned
+  from **both** directions: `UserKnownHostsFile` set to `git.known_hosts_file`,
+  `GlobalKnownHostsFile=/dev/null`, `StrictHostKeyChecking=yes`, and
+  `UpdateHostKeys=no`.
+
+  Each of those is there because the one before it is not enough. `-F /dev/null`
+  discards the config files but not OpenSSH's built-in defaults, and one of
+  those defaults is `GlobalKnownHostsFile /etc/ssh/ssh_known_hosts
+  /etc/ssh/ssh_known_hosts2` — verifiable with `ssh -G`, which still lists them
+  after `-F /dev/null` and an explicit user file. So a key absent from
+  `git.known_hosts_file` is still accepted if the host's system file carries it:
+  the pinned set was a floor, not a set. `GlobalKnownHostsFile=/dev/null` makes
+  the user file the whole of it. `UpdateHostKeys=no` then stops the remote
+  extending that set itself — with it on, a server can hand over additional
+  keys that ssh records, and the trust set factoryd pinned grows without
+  factoryd's involvement.
+
+  Trust-on-first-use inside an unowned home directory is one more ambient
+  input; so is a system known-hosts file nobody in this factory maintains. An
+  agent holding the reviewer's key is the same failure as a credential helper
+  holding the reviewer's token; a ProxyCommand in a dotfile is the same failure
+  as `http_proxy` in the environment.
 
 **The invariant.** *A verification is valid only for an operation it shares an
 environment with, and only while nothing can change that environment in
@@ -792,7 +807,8 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §5.4 the URL check is not enough | `http.<url>.proxy`, `http.sslVerify=false` or `http.sslCAInfo` is set — the effective URL and project still match, and submit must still refuse | the same push succeeds once the setting is removed |
 | §5.4 ambient proxy env | `https_proxy`/`all_proxy` set in the parent environment routes nothing: identity, target, fetch and push are all unaffected, because the git process never receives them | `git.proxy` declared in config **does** take effect — proving the transport honours a proxy when one is actually declared, so "unaffected" is not a transport that ignores proxies entirely |
 | §5.4 ambient ssh config | a `ProxyCommand` in `~/.ssh/config` (or the system ssh config) is never executed by any factoryd ssh invocation | the same `ProxyCommand` in a config passed without `-F /dev/null` executes — proving the probe can detect execution at all |
-| §5.4 host-key policy | a remote presenting a key absent from the configured `UserKnownHostsFile` is refused, not learned | the pinned key connects |
+| §5.4 host-key policy | a remote presenting a key absent from `git.known_hosts_file` is refused, not learned — **including when that key is present in `/etc/ssh/ssh_known_hosts`**, which is the case `-F /dev/null` alone does not cover | the pinned key connects |
+| §5.4 host-key set is fixed | the remote offers additional host keys during the session and ssh records none of them | `ssh -G` on the factoryd invocation reports `updatehostkeys no` and `globalknownhostsfile /dev/null`, so the assertion is about the options actually in force, not the ones intended |
 | §4.4 the boundary holds | the producer principal **can** write `paths.submit_repo` → `doctor` fails | the same probe succeeds against `paths.producer_workdir`, so "cannot write" is not a broken probe |
 | §4.4 no boundary at all | the producer runs with submit's own authority → `doctor` fails rather than reporting a separation it cannot enforce | a genuinely separated pair passes |
 | §4.4 the race is gone | `.git/config` in the **producer workdir** is replaced — with a proxy, a rewrite, anything — at any moment, including after every check and while the push is running: the push is unaffected, because git never reads that file | the identical setting placed in `paths.submit_repo`'s config **does** refuse, proving the test can detect it at all |
