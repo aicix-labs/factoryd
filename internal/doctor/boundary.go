@@ -155,6 +155,16 @@ func (p *setuidProber) Own(path string) error {
 	if os.Geteuid() != 0 {
 		return nil
 	}
+	// Never through a link. Chown follows symlinks, so a declared path that
+	// is a link would hand its TARGET to the gate. The guard refuses such a
+	// path before this runs; this is the second lock on the same door.
+	fi, err := os.Lstat(path)
+	if err != nil {
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("%s is a symlink; refusing to give away its target", path)
+	}
 	return os.Chown(path, int(p.uid), int(p.gid))
 }
 

@@ -663,3 +663,56 @@ func TestOrdinaryGatePathsAreAccepted(t *testing.T) {
 		t.Fatalf("ordinary gate paths were refused: %v\n%s", failedNames(r), r)
 	}
 }
+
+// submit_repo itself a symlink, and the clone carries cache -> .git. Resolving
+// only the declared path compares /real/repo/.git against /link/repo/.git and
+// misses; Own then follows the link and chowns .git. The guard must fail BEFORE
+// provisioning, with .git's ownership untouched.
+func TestSymlinkedSubmitRepoCannotSmuggleAGrantIntoDotGit(t *testing.T) {
+	cfg := fixture(t)
+	real := cfg.Paths.SubmitRepo
+	link := filepath.Join(filepath.Dir(real), "submit-link")
+	if err := os.Symlink(real, link); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Paths.SubmitRepo = link // a valid path under every other check
+	if err := os.Symlink(".git", filepath.Join(real, "cache")); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Gate.RequiredWritablePaths = []string{"cache"}
+
+	owned := false
+	d := healthyDeps(cfg, nil)
+	d.NewProber = func(ra *config.RunAs) (doctor.Prober, error) {
+		if ra.User == "factoryd-gate" {
+			return &owningProber{fakeProber: fakeProber{name: "gate"}, owned: &owned}, nil
+		}
+		return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+	}
+	r := doctor.RunWith(context.Background(), cfg, d)
+
+	var hit *doctor.Check
+	for i := range r.Checks {
+		if r.Checks[i].Name == "gate can write cache" {
+			hit = &r.Checks[i]
+		}
+	}
+	if hit == nil || hit.OK {
+		t.Fatalf("the grant into .git through a symlinked submit_repo was not refused:\n%s", r)
+	}
+	if !strings.Contains(hit.Err.Error(), "resolves") {
+		t.Fatalf("refused for the wrong reason: %v", hit.Err)
+	}
+	// Refused BEFORE provisioning: nothing was given away.
+	if owned {
+		t.Fatal("Own ran despite the refusal; .git would have been chowned to the gate")
+	}
+}
+
+// owningProber records whether Own was ever called.
+type owningProber struct {
+	fakeProber
+	owned *bool
+}
+
+func (o *owningProber) Own(string) error { *o.owned = true; return nil }

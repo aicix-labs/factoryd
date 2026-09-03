@@ -540,10 +540,36 @@ func checkOwnedByMe(path string) error {
 // through any symlinks and repeats the ancestor/descendant check against .git
 // on the result. The lexical check in config cannot see a symlink.
 func physicalPathMayNotReachGit(cfg *config.Config, declared, resolved string) error {
-	gitDir := filepath.Join(cfg.Paths.SubmitRepo, ".git")
-	// Walk up to something that exists, resolve it, and re-append the rest.
+	// Both sides of the comparison go through the same resolution. Resolving
+	// only the declared path put the two in different namespaces: with
+	// submit_repo itself a symlink, "cache -> .git" resolved to
+	// /real/repo/.git while the target was /link/repo/.git, the guard missed,
+	// and Own followed the link and chowned .git before the re-probe could
+	// object -- a boundary permanently broken by the check meant to keep it.
+	gitDir, err := canonical(filepath.Join(cfg.Paths.SubmitRepo, ".git"))
+	if err != nil {
+		return fmt.Errorf("resolving the submit repository's .git: %w", err)
+	}
+	physical, err := canonical(resolved)
+	if err != nil {
+		return fmt.Errorf("path %q: %w", declared, err)
+	}
+	switch {
+	case physical == gitDir:
+		return fmt.Errorf("path %q resolves to the submit repository's .git; the gate may never own it", declared)
+	case strings.HasPrefix(physical, gitDir+string(os.PathSeparator)):
+		return fmt.Errorf("path %q resolves inside the submit repository's .git; the gate may never own it", declared)
+	case strings.HasPrefix(gitDir, physical+string(os.PathSeparator)):
+		return fmt.Errorf("path %q resolves to an ancestor of the submit repository's .git (%s); owning it would let the gate rename, delete or replace .git", declared, physical)
+	}
+	return nil
+}
+
+// canonical resolves p through every symlink in its existing prefix and
+// re-appends the part that does not exist yet.
+func canonical(p string) (string, error) {
 	rest := ""
-	probe := resolved
+	probe := filepath.Clean(p)
 	for {
 		if _, err := os.Lstat(probe); err == nil {
 			break
@@ -557,16 +583,7 @@ func physicalPathMayNotReachGit(cfg *config.Config, declared, resolved string) e
 	}
 	real, err := filepath.EvalSymlinks(probe)
 	if err != nil {
-		return fmt.Errorf("path %q: %w", declared, err)
+		return "", err
 	}
-	physical := filepath.Clean(filepath.Join(real, rest))
-	switch {
-	case physical == gitDir:
-		return fmt.Errorf("path %q resolves to the submit repository's .git; the gate may never own it", declared)
-	case strings.HasPrefix(physical, gitDir+string(os.PathSeparator)):
-		return fmt.Errorf("path %q resolves inside the submit repository's .git; the gate may never own it", declared)
-	case strings.HasPrefix(gitDir, physical+string(os.PathSeparator)):
-		return fmt.Errorf("path %q resolves to an ancestor of the submit repository's .git (%s); owning it would let the gate rename, delete or replace .git", declared, physical)
-	}
-	return nil
+	return filepath.Clean(filepath.Join(real, rest)), nil
 }
