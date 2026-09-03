@@ -600,6 +600,147 @@ func TestShutdownDuringATurnIsNotAFailure(t *testing.T) {
 	}
 }
 
+// The stall arriving via shutdown: the agent consumes its trigger, then the
+// supervisor is stopped mid-turn. Nothing is pending, so a restart would idle
+// forever -- the same 3.5 hours, reached by an operator's Ctrl-C. The
+// supervisor must persist continuity: exactly one recovery turn on restart, and
+// no failure counted, because nothing failed.
+func TestShutdownAfterConsumptionRecoversOnRestart(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+
+	started := make(chan struct{})
+	r := &fakeRunner{}
+	r.run = func(ctx context.Context, tr supervise.Turn) supervise.TurnResult {
+		for _, trig := range tr.Triggers {
+			os.Remove(trig.Path) // consumed...
+		}
+		close(started)
+		<-ctx.Done() // ...then killed by the shutdown
+		return supervise.TurnResult{ExitCode: 143}
+	}
+	first := fx.newSupervisor(t, r, 0)
+	ctx, cancel := context.WithCancel(context.Background())
+	done := make(chan error, 1)
+	go func() { done <- first.Run(ctx) }()
+	select {
+	case <-started:
+	case <-time.After(5 * time.Second):
+		cancel()
+		t.Fatal("the turn never started")
+	}
+	cancel()
+	if err := <-done; err != nil {
+		t.Fatalf("Run returned %v on shutdown, want nil", err)
+	}
+
+	rs := fx.roleState(t)
+	if rs.FailStreak != 0 {
+		t.Fatalf("fail_streak = %d after a shutdown; a shutdown is not a failure", rs.FailStreak)
+	}
+	body, err := os.ReadFile(fx.cfg.RetryPath("reviewer"))
+	if err != nil {
+		t.Fatalf("no recovery marker after a shutdown that followed consumption: %v", err)
+	}
+	if !strings.Contains(string(body), "interrupted: true") || !strings.Contains(string(body), "wake") {
+		t.Fatalf("the marker does not say it is a recovery from an interruption of the wake turn:\n%s", body)
+	}
+
+	// Restart. Exactly one recovery turn, which succeeds, and then a genuine idle.
+	second := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		return supervise.TurnResult{}
+	}}
+	s2 := fx.newSupervisor(t, second, 0)
+	ctx2, cancel2 := context.WithTimeout(context.Background(), 3*time.Second)
+	defer cancel2()
+	_ = s2.Run(ctx2) // returns nil on the deadline once it is idle
+	if got := second.count(); got != 1 {
+		t.Fatalf("restart ran %d turns, want exactly 1 recovery turn", got)
+	}
+	if _, err := os.Stat(fx.cfg.RetryPath("reviewer")); err == nil {
+		t.Fatal("the recovery marker survived a successful recovery turn")
+	}
+	if rs := fx.roleState(t); rs.Halted || rs.FailStreak != 0 {
+		t.Fatalf("after recovery: halted=%v fail_streak=%d", rs.Halted, rs.FailStreak)
+	}
+}
+
+// lockInbox makes the handoff directory unwritable for the rest of the test,
+// so the supervisor's own marker I/O fails while everything else proceeds.
+func lockInbox(t *testing.T, fx *fixture) {
+	t.Helper()
+	if os.Geteuid() == 0 {
+		t.Skip("root ignores directory permissions; this test needs an unprivileged user")
+	}
+	if err := os.Chmod(fx.inbox, 0o500); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Chmod(fx.inbox, 0o755) })
+}
+
+// A retry marker that cannot be written leaves nothing to re-arm on. Logging
+// and carrying on would reproduce the stall through an I/O error; the only
+// honest outcome is a halt that says so.
+func TestRetryMarkerWriteFailureHalts(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+
+	r := &fakeRunner{act: func(_ int, tr supervise.Turn) supervise.TurnResult {
+		for _, trig := range tr.Triggers {
+			os.Remove(trig.Path)
+		}
+		lockInbox(t, fx) // consumed, then the marker cannot be written
+		return supervise.TurnResult{ExitCode: 1}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	err := s.Run(ctx)
+	if !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted: a marker write failure was swallowed and the factory idled", err)
+	}
+	if got := r.count(); got != 1 {
+		t.Fatalf("ran %d turns, want 1", got)
+	}
+	rs := fx.roleState(t)
+	if !rs.Halted || !strings.Contains(rs.HaltReason, "retry marker") {
+		t.Fatalf("halt not recorded with its reason: halted=%v reason=%q", rs.Halted, rs.HaltReason)
+	}
+}
+
+// A retry marker that cannot be removed would re-arm the same retry forever,
+// every run a success, invisible to both guards. Same answer: halt, and say why.
+func TestRetryMarkerRemovalFailureHalts(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+
+	r := &fakeRunner{act: func(n int, tr supervise.Turn) supervise.TurnResult {
+		for _, trig := range tr.Triggers {
+			if trig.Label != supervise.RetryLabel {
+				os.Remove(trig.Path)
+			}
+		}
+		if n == 1 {
+			return supervise.TurnResult{ExitCode: 1} // marker gets written
+		}
+		lockInbox(t, fx) // the retry succeeds, but its marker cannot be removed
+		return supervise.TurnResult{}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	err := s.Run(ctx)
+	if !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted: a stale marker was left to retry forever", err)
+	}
+	if got := r.count(); got != 2 {
+		t.Fatalf("ran %d turns, want 2 (the failure and the retry that could not be cleaned up)", got)
+	}
+	if rs := fx.roleState(t); !strings.Contains(rs.HaltReason, "remove the retry marker") {
+		t.Fatalf("halt reason does not name the removal failure: %q", rs.HaltReason)
+	}
+}
+
 func TestProgressResetsTheFailStreak(t *testing.T) {
 	fx := newFixture(t)
 	fx.wake(t)

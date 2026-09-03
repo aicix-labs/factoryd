@@ -170,6 +170,23 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 		}); err != nil {
 			s.log.Warn("could not record the interrupted turn", "turn", turn.ID, "err", err)
 		}
+		// If the agent had already consumed its trigger when it was killed,
+		// nothing external will start the next turn after a restart -- the
+		// same stall as a consumed failure, arriving via shutdown. Persist an
+		// interrupted marker so the restart runs exactly one recovery turn.
+		// The streak stays at zero: this is not a failure, it is continuity.
+		if real, onRetry := withoutRetry(triggers); len(real) > 0 && !onRetry {
+			if remaining, perr := s.watcher.Pending(); perr == nil && consumed(real, removeRetry(remaining)) {
+				if werr := s.writeInterruptedMarker(turn, res, ended); werr != nil {
+					// Cannot record continuity: say so where it will be seen, and
+					// exit non-zero so the stop is not mistaken for clean.
+					s.log.Error("shutdown after a consumed trigger, and the retry marker could not be written; the next start will idle", "err", werr)
+					return false, fmt.Errorf("shutdown: %w", werr)
+				}
+				s.log.Info("turn interrupted after consuming its trigger; a recovery turn will run on restart",
+					"turn", turn.ID, "retry", s.cfg.RetryPath(s.role))
+			}
+		}
 		s.log.Info("turn interrupted by shutdown", "turn", turn.ID, "exit", res.ExitCode)
 		return false, ctx.Err()
 	}
@@ -273,7 +290,12 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 		// that sits idle for hours with work stranded (issue #12). A file, not
 		// memory: a retry lost on restart recreates the stall it exists to fix.
 		if err := s.writeRetry(turn, res, fails, ended); err != nil {
-			s.log.Error("could not write the retry marker; this failure will not be retried", "err", err)
+			// Without the marker there is nothing to re-arm on and the factory
+			// would sit idle -- the exact stall, reached through an I/O error.
+			// This is a control-plane failure, and it halts with its reason
+			// rather than continuing as though the marker existed.
+			return true, s.haltNow(ended, fmt.Sprintf(
+				"could not write the retry marker after a consumed failure (%v); nothing is pending and the factory cannot re-arm itself", err))
 		}
 		s.log.Warn("turn failed after consuming its trigger; re-arming a retry",
 			"turn", turn.ID, "exit", res.ExitCode, "timed_out", res.TimedOut,
@@ -287,7 +309,13 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 	// does: it is the record of what the factory was retrying when it gave
 	// up, and a halt should not erase its own evidence.
 	if onRetry && !halted {
-		_ = os.Remove(s.cfg.RetryPath(s.role))
+		if err := os.Remove(s.cfg.RetryPath(s.role)); err != nil && !os.IsNotExist(err) {
+			// A marker that cannot be removed would re-arm the same retry
+			// forever, each run a success, invisible to both guards. Halting
+			// is the only honest outcome.
+			return true, s.haltNow(ended, fmt.Sprintf(
+				"could not remove the retry marker after the retry ran (%v); leaving it would retry forever", err))
+		}
 	}
 
 	switch {
@@ -392,4 +420,34 @@ func readRetryOrigin(path string) string {
 		}
 	}
 	return ""
+}
+
+// haltNow records a control-plane halt -- a failure of the supervisor's own
+// bookkeeping, not of the agent -- in state and as the sentinel, and returns
+// ErrHalted. Both destinations are attempted even if the first fails: a halt
+// that only one of them knows about is a halt nobody can act on.
+func (s *Supervisor) haltNow(at time.Time, reason string) error {
+	if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		rs := st.Role(state.Role(s.role))
+		rs.Halted, rs.HaltReason, rs.HaltedAt = true, reason, at
+		return nil
+	}); err != nil {
+		s.log.Error("could not record the halt in state", "err", err)
+	}
+	if err := s.writeStopSentinel(reason, at); err != nil {
+		s.log.Error("could not write the stop sentinel", "err", err)
+	}
+	s.log.Error("supervisor halting", "reason", reason, "sentinel", s.cfg.StopPath(s.role))
+	return ErrHalted
+}
+
+// writeInterruptedMarker records that a shutdown cut a turn off after it had
+// consumed its trigger, so the next start knows to run one recovery turn.
+func (s *Supervisor) writeInterruptedMarker(turn Turn, res TurnResult, at time.Time) error {
+	real, _ := withoutRetry(turn.Triggers)
+	body := fmt.Sprintf(
+		"retry 0 of %d\norigin: %s\nafter turn: %s\nexit: %d\ninterrupted: true\nat: %s\n\n"+
+			"The supervisor was stopped after this turn consumed its trigger. This is a recovery turn, not a failure.\n",
+		s.cfg.Supervisor.FailAbort, labels(real), turn.ID, res.ExitCode, at.Format(time.RFC3339))
+	return os.WriteFile(s.cfg.RetryPath(s.role), []byte(body), 0o644)
 }

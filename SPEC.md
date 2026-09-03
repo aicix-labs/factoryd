@@ -201,8 +201,17 @@ An interrupted turn counts toward neither guard. Stopping the supervisor kills
 the running turn with its process group, and the exit code that produces says
 nothing about the agent; counted, an ordinary shutdown would leave a failure on
 the streak, a later unrelated failure would halt the factory, and the operator
-who stopped it would never connect the two. The turn is recorded as interrupted
-and no marker is written.
+who stopped it would never connect the two. The turn is recorded as
+interrupted. But if the agent had already consumed its trigger when it was
+killed, a restart would find nothing pending — the same stall, arriving via
+Ctrl-C — so the supervisor persists a marker saying so, and the restart runs
+exactly one recovery turn. Continuity, not failure: the streak stays at zero.
+
+**The marker's own I/O is control-plane, and its failure halts.** A marker that
+cannot be written leaves nothing to re-arm on; a marker that cannot be removed
+re-arms the same retry forever, every run a success, invisible to both guards.
+Neither may be logged and stepped over as though the marker state had changed.
+Both halt, with a reason that names the marker.
 
 ### 4.3 Watcher
 
