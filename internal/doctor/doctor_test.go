@@ -258,6 +258,36 @@ func TestIndividualFailuresAreCaught(t *testing.T) {
 			wantName: "handoff inbox",
 		},
 		{
+			name: "cache root is a symlink",
+			mutate: func(t *testing.T, c *config.Config) {
+				real := filepath.Join(t.TempDir(), "real")
+				os.MkdirAll(real, 0o755)
+				link := filepath.Join(c.Paths.Root, "cache-link")
+				if err := os.Symlink(real, link); err != nil {
+					t.Fatal(err)
+				}
+				c.Paths.CacheRoot = link
+			},
+			wantName: "cache root",
+		},
+		{
+			name: "cache root is world-writable",
+			mutate: func(t *testing.T, c *config.Config) {
+				d := filepath.Join(c.Paths.Root, "cache-open")
+				os.MkdirAll(d, 0o777)
+				os.Chmod(d, 0o777)
+				c.Paths.CacheRoot = d
+			},
+			wantName: "cache root",
+		},
+		{
+			name: "cache root missing",
+			mutate: func(t *testing.T, c *config.Config) {
+				c.Paths.CacheRoot = filepath.Join(c.Paths.Root, "no-such-cache")
+			},
+			wantName: "cache root",
+		},
+		{
 			name:     "no alert transport",
 			mutate:   func(t *testing.T, c *config.Config) { c.Alerts = nil },
 			wantName: "alert transports",

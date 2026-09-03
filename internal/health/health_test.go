@@ -64,7 +64,7 @@ type lab struct {
 func newLab(t *testing.T) *lab {
 	t.Helper()
 	root := t.TempDir()
-	for _, d := range []string{"work", "submit", "inbox", "outbox"} {
+	for _, d := range []string{"work", "submit", "inbox", "outbox", "cache-root"} {
 		if err := os.MkdirAll(filepath.Join(root, d), 0o755); err != nil {
 			t.Fatal(err)
 		}
@@ -73,7 +73,7 @@ func newLab(t *testing.T) *lab {
 	l.cfg = &config.Config{
 		SchemaVersion: config.SchemaVersion, Name: "widgets", Provider: "github",
 		GitHub: &config.GitHub{Owner: "acme", Repo: "widgets"}, TargetBranch: "main",
-		Paths:  config.Paths{Root: root, ProducerWorkdir: filepath.Join(root, "work"), SubmitRepo: filepath.Join(root, "submit")},
+		Paths:  config.Paths{Root: root, ProducerWorkdir: filepath.Join(root, "work"), SubmitRepo: filepath.Join(root, "submit"), CacheRoot: filepath.Join(root, "cache-root")},
 		Roles:  config.Roles{Producer: config.RoleSpec{TimeoutSeconds: 600}, Reviewer: config.RoleSpec{TimeoutSeconds: 600}},
 		Alerts: []config.Alert{{Kind: "file", Path: l.alerts}},
 		Health: config.Health{IntervalSeconds: 60, AlertAfter: 2, RepeatSeconds: 600, StaleTriggerSeconds: 300, TurnGraceSeconds: 60, DiskMinFreePercent: 10},
@@ -104,8 +104,14 @@ func (l *lab) withState(t *testing.T, fn func(*state.State)) {
 func (l *lab) tick(t *testing.T) health.Report {
 	t.Helper()
 	rep, err := health.Tick(context.Background(), l.cfg, l.deps)
-	if err != nil {
+	var obs *health.ObservationError
+	if err != nil && !errors.As(err, &obs) {
 		t.Fatal(err)
+	}
+	// A report with tick errors must come with the typed error, and one
+	// without must not: the CLI's exit code rests on this.
+	if (len(rep.Errors) > 0) != (obs != nil) {
+		t.Fatalf("errors=%v but ObservationError=%v", rep.Errors, obs)
 	}
 	return rep
 }
@@ -311,7 +317,7 @@ func fill(t *testing.T, dir, name string, size int, mtime time.Time) {
 
 func TestCacheIsBoundedOldestFirstAndReported(t *testing.T) {
 	l := newLab(t)
-	cache := filepath.Join(l.root, "cache")
+	cache := filepath.Join(l.root, "cache-root", "go")
 	fill(t, cache, "old/blob", 400, l.now.Add(-3*time.Hour))
 	fill(t, cache, "mid/blob", 400, l.now.Add(-2*time.Hour))
 	fill(t, cache, "new/blob", 400, l.now.Add(-1*time.Hour))
@@ -339,7 +345,7 @@ func TestCacheIsBoundedOldestFirstAndReported(t *testing.T) {
 
 func TestCacheStillOverBoundIsAFinding(t *testing.T) {
 	l := newLab(t)
-	cache := filepath.Join(l.root, "cache")
+	cache := filepath.Join(l.root, "cache-root", "go")
 	fill(t, cache, "huge/blob", 2000, l.now)
 	l.cfg.Health.Caches = []config.Cache{{Path: cache, MaxBytes: 900}}
 	rep := l.tick(t)
@@ -460,5 +466,115 @@ func TestFailedDeliveryIsRecorded(t *testing.T) {
 	rep := l.tick(t)
 	if len(rep.Alerted) != 1 || len(rep.Deliveries) != 1 || rep.Deliveries[0].Err == "" {
 		t.Fatalf("alerted=%v deliveries=%+v", rep.Alerted, rep.Deliveries)
+	}
+}
+
+// The cache path is inside the cache root lexically -- that was checked at
+// load -- but a symlink planted since makes it resolve elsewhere. Nothing
+// under it may be deleted.
+func TestCachePathThatResolvesOutsideTheRootDeletesNothing(t *testing.T) {
+	l := newLab(t)
+	victim := filepath.Join(l.root, "victim")
+	fill(t, victim, "a/blob", 1000, l.now.Add(-3*time.Hour))
+	fill(t, victim, "b/blob", 1000, l.now)
+	link := filepath.Join(l.cfg.Paths.CacheRoot, "go")
+	if err := os.Symlink(victim, link); err != nil {
+		t.Fatal(err)
+	}
+	l.cfg.Health.Caches = []config.Cache{{Path: link, MaxBytes: 10}}
+	rep := l.tick(t)
+	if !hasKey(rep, "cache_unsafe/") {
+		t.Fatalf("findings=%v", keys(rep))
+	}
+	if rep.Caches[0].ReclaimedCount != 0 {
+		t.Fatalf("reclaimed %d through a symlink", rep.Caches[0].ReclaimedCount)
+	}
+	for _, keep := range []string{"a", "b"} {
+		if _, err := os.Stat(filepath.Join(victim, keep)); err != nil {
+			t.Fatalf("%s was deleted through the symlinked cache path", keep)
+		}
+	}
+}
+
+// An entry that is itself a symlink is removed as a link and never followed.
+func TestSymlinkEntryIsNotFollowed(t *testing.T) {
+	l := newLab(t)
+	victim := filepath.Join(l.root, "victim")
+	fill(t, victim, "blob", 5000, l.now.Add(-5*time.Hour))
+	cache := filepath.Join(l.cfg.Paths.CacheRoot, "go")
+	if err := os.MkdirAll(cache, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, filepath.Join(cache, "old-link")); err != nil {
+		t.Fatal(err)
+	}
+	// The link's own mtime is its creation, i.e. wall-clock now (Chtimes
+	// would follow to the target). The other entry is dated after it, so
+	// the link is the oldest and the one reclamation reaches first.
+	fill(t, cache, "new/blob", 1000, time.Now().Add(time.Hour))
+	l.cfg.Health.Caches = []config.Cache{{Path: cache, MaxBytes: 500}}
+	rep := l.tick(t)
+	if _, err := os.Lstat(filepath.Join(cache, "old-link")); !errors.Is(err, os.ErrNotExist) {
+		t.Fatal("the link entry was not reclaimed")
+	}
+	if _, err := os.Stat(filepath.Join(victim, "blob")); err != nil {
+		t.Fatal("the link's target was deleted; a symlink entry must be removed as a link")
+	}
+	if rep.Caches[0].ReclaimedCount != 1 {
+		t.Fatalf("reclaimed=%d", rep.Caches[0].ReclaimedCount)
+	}
+}
+
+// A corrupt state document must not silence the tick. The fail-safe alert
+// goes out through the transports, bounded by the previous health document,
+// and the tick reports "could not look".
+func TestCorruptStateStillAlertsAndIsBounded(t *testing.T) {
+	l := newLab(t)
+	l.p.alive[100] = false // a real condition, to be carried in the fail-safe
+	if err := os.WriteFile(l.cfg.StatePath(), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rep, err := health.Tick(context.Background(), l.cfg, l.deps)
+	var obs *health.ObservationError
+	if !errors.As(err, &obs) {
+		t.Fatalf("err=%v, want ObservationError", err)
+	}
+	lines := l.alertLines(t)
+	// With the document unreadable the tick observes a fresh one, in which
+	// nothing has ever supervised; that finding rides in the fail-safe.
+	if len(lines) != 1 || lines[0].Kind != "state_unavailable" || !strings.Contains(lines[0].Detail, "never_supervised") {
+		t.Fatalf("alert lines=%+v; the fail-safe must go out on the first tick and carry the findings", lines)
+	}
+	if rep.StateAlertAt == nil {
+		t.Fatal("the fallback cadence was not recorded in the health document")
+	}
+	// Inside repeat_seconds: bounded by the previous health.json.
+	l.now = l.now.Add(time.Minute)
+	health.Tick(context.Background(), l.cfg, l.deps)
+	if n := len(l.alertLines(t)); n != 1 {
+		t.Fatalf("%d alerts inside repeat_seconds; the fallback cadence did not bound it", n)
+	}
+	// After repeat_seconds: again.
+	l.now = l.now.Add(time.Duration(l.cfg.Health.RepeatSeconds) * time.Second)
+	health.Tick(context.Background(), l.cfg, l.deps)
+	if n := len(l.alertLines(t)); n != 2 {
+		t.Fatalf("%d alerts after repeat_seconds, want 2", n)
+	}
+	// And with no previous health document at all: unconditionally.
+	os.Remove(l.cfg.HealthPath())
+	l.now = l.now.Add(time.Minute)
+	health.Tick(context.Background(), l.cfg, l.deps)
+	if n := len(l.alertLines(t)); n != 3 {
+		t.Fatalf("%d alerts with no fallback record, want 3 (alert now rather than never)", n)
+	}
+}
+
+func TestObservationErrorIsTyped(t *testing.T) {
+	l := newLab(t)
+	l.p.statErr = errors.New("EIO")
+	_, err := health.Tick(context.Background(), l.cfg, l.deps)
+	var obs *health.ObservationError
+	if !errors.As(err, &obs) || len(obs.Errors) == 0 {
+		t.Fatalf("err=%v", err)
 	}
 }

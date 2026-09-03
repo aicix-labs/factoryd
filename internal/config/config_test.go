@@ -19,8 +19,10 @@ const good = `{
   "paths": {
     "root": "/var/lib/factoryd/widgets",
     "producer_workdir": "/var/lib/factoryd/widgets/work",
-    "submit_repo": "/var/lib/factoryd/widgets/submit"
+    "submit_repo": "/var/lib/factoryd/widgets/submit",
+    "cache_root": "/var/cache/factoryd/widgets"
   },
+  "health": {"caches": [{"path": "/var/cache/factoryd/widgets/go", "max_bytes": 1}]},
   "credentials": {
     "producer": {"file": "/etc/factoryd/producer.token"},
     "reviewer": {"env": "FACTORYD_REVIEWER_TOKEN"}
@@ -109,10 +111,20 @@ func TestValidationFailures(t *testing.T) {
 		"syslog is not deliverable here":      {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "syslog"}`, "not implemented"},
 		"alert command without PATH":          {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "command", "command": ["notify"]}`, "PATH"},
 		"alert file relative path":            {`"path": "/var/log/factoryd/alerts.log"`, `"path": "alerts.log"`, "absolute"},
-		"cache without a bound":               {`"alerts":`, `"health": {"caches": [{"path": "/var/cache/factoryd/go"}]}, "alerts":`, "max_bytes"},
-		"cache relative path":                 {`"alerts":`, `"health": {"caches": [{"path": "go", "max_bytes": 1}]}, "alerts":`, "absolute"},
-		"disk headroom out of range":          {`"alerts":`, `"health": {"disk_min_free_percent": 100}, "alerts":`, "disk_min_free_percent"},
-		"negative unreviewed":                 {`"alerts":`, `"health": {"unreviewed_seconds": -1}, "alerts":`, "unreviewed_seconds"},
+		"cache without a bound":               {`"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go", "max_bytes": 1}]},`, `"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go"}]},`, "max_bytes"},
+		"cache relative path":                 {`"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go", "max_bytes": 1}]},`, `"health": {"caches": [{"path": "go", "max_bytes": 1}]},`, "absolute"},
+		"caches without a cache root": {`"submit_repo": "/var/lib/factoryd/widgets/submit",
+    "cache_root": "/var/cache/factoryd/widgets"`, `"submit_repo": "/var/lib/factoryd/widgets/submit"`, "cache_root"},
+		"cache root is /":                     {`"cache_root": "/var/cache/factoryd/widgets"`, `"cache_root": "/"`, "delete the host"},
+		"cache root is the factory root":      {`"cache_root": "/var/cache/factoryd/widgets"`, `"cache_root": "/var/lib/factoryd/widgets"`, "overlaps paths.root"},
+		"cache root above the factory root":   {`"cache_root": "/var/cache/factoryd/widgets"`, `"cache_root": "/var/lib"`, "overlaps paths.root"},
+		"cache root inside the submit repo":   {`"cache_root": "/var/cache/factoryd/widgets"`, `"cache_root": "/var/lib/factoryd/widgets/submit/.cache"`, "overlaps paths.submit_repo"},
+		"cache root holds a credential":       {`"cache_root": "/var/cache/factoryd/widgets"`, `"cache_root": "/etc/factoryd"`, "credentials.producer"},
+		"cache root holds the alert file":     {`"cache_root": "/var/cache/factoryd/widgets"`, `"cache_root": "/var/log/factoryd"`, "alerts[0] file"},
+		"cache outside the cache root":        {`{"path": "/var/cache/factoryd/widgets/go", "max_bytes": 1}`, `{"path": "/var/cache/other/go", "max_bytes": 1}`, "not inside paths.cache_root"},
+		"cache in a sibling sharing a prefix": {`{"path": "/var/cache/factoryd/widgets/go", "max_bytes": 1}`, `{"path": "/var/cache/factoryd/widgets-old/go", "max_bytes": 1}`, "not inside paths.cache_root"},
+		"disk headroom out of range":          {`"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go", "max_bytes": 1}]},`, `"health": {"disk_min_free_percent": 100},`, "disk_min_free_percent"},
+		"negative unreviewed":                 {`"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go", "max_bytes": 1}]},`, `"health": {"unreviewed_seconds": -1},`, "unreviewed_seconds"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -332,5 +344,20 @@ func TestDescribeDoesNotLeak(t *testing.T) {
 	}
 	if got := (config.CredentialRef{File: p}).Describe(); strings.Contains(got, "super-secret-token") {
 		t.Fatalf("Describe leaked the token: %q", got)
+	}
+}
+
+// A sibling that merely shares a string prefix with a protected path is not
+// inside it: /var/lib/factoryd/widgets-cache does not overlap
+// /var/lib/factoryd/widgets. Without this control the containment tests
+// above would also pass for a prefix comparison.
+func TestSharedPrefixSiblingIsNotAnOverlap(t *testing.T) {
+	body := strings.Replace(good, `"cache_root": "/var/cache/factoryd/widgets"`, `"cache_root": "/var/lib/factoryd/widgets-cache"`, 1)
+	body = strings.Replace(body, `{"path": "/var/cache/factoryd/widgets/go", "max_bytes": 1}`, `{"path": "/var/lib/factoryd/widgets-cache/go", "max_bytes": 1}`, 1)
+	if _, err := config.Load(write(t, body)); err != nil {
+		t.Fatalf("a sibling with a shared prefix was refused: %v", err)
+	}
+	if config.PathWithin("/a/bc", "/a/b") || !config.PathWithin("/a/b/c", "/a/b") || !config.PathWithin("/a/b", "/a/b") || !config.PathWithin("/x", "/") {
+		t.Fatal("PathWithin")
 	}
 }

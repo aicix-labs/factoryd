@@ -95,6 +95,13 @@ type Paths struct {
 	// producer must not be able to write it; doctor proves that by probe, as
 	// the producer, rather than assuming it (§4.4).
 	SubmitRepo string `json:"submit_repo"`
+	// CacheRoot is the one directory the factory may reclaim space in
+	// (§7). Every health.caches[].path must lie inside it, and it may not
+	// overlap the factory root, either repository, a credential, or an alert
+	// file. Reclamation deletes; a bound that could name anything else is a
+	// configuration that can destroy the host. Required when caches are
+	// declared.
+	CacheRoot string `json:"cache_root,omitempty"`
 }
 
 // Git configures the transport (SPEC.md §5.4).
@@ -510,6 +517,45 @@ func (c *Config) Validate() error {
 	}
 	if c.Paths.SubmitRepo != "" && c.Paths.SubmitRepo == c.Paths.ProducerWorkdir {
 		add("paths.submit_repo is the producer workdir; the two-directory boundary requires them to differ")
+	}
+
+	// --- cache root: the only place reclamation may delete ---
+	if len(c.Health.Caches) > 0 && c.Paths.CacheRoot == "" {
+		add("health.caches declared but paths.cache_root is empty; reclamation deletes, and only inside a dedicated cache root")
+	}
+	if cr := c.Paths.CacheRoot; cr != "" {
+		switch {
+		case !filepath.IsAbs(cr):
+			add("paths.cache_root %q is not absolute", cr)
+		case filepath.Clean(cr) == string(filepath.Separator):
+			add("paths.cache_root is /; reclamation would delete the host")
+		default:
+			protected := []struct{ name, path string }{
+				{"paths.root", c.Paths.Root},
+				{"paths.producer_workdir", c.Paths.ProducerWorkdir},
+				{"paths.submit_repo", c.Paths.SubmitRepo},
+				{"credentials.producer file", parentOf(c.Credentials.Producer.File)},
+				{"credentials.reviewer file", parentOf(c.Credentials.Reviewer.File)},
+			}
+			for i, a := range c.Alerts {
+				if a.Kind == "file" && a.Path != "" {
+					protected = append(protected, struct{ name, path string }{fmt.Sprintf("alerts[%d] file", i), parentOf(a.Path)})
+				}
+			}
+			for _, pr := range protected {
+				if pr.path == "" {
+					continue
+				}
+				if PathsOverlap(cr, pr.path) {
+					add("paths.cache_root %q overlaps %s %q; reclamation may not reach it", cr, pr.name, pr.path)
+				}
+			}
+			for i, cc := range c.Health.Caches {
+				if cc.Path != "" && filepath.IsAbs(cc.Path) && !PathWithin(cc.Path, cr) {
+					add("health.caches[%d] path %q is not inside paths.cache_root %q", i, cc.Path, cr)
+				}
+			}
+		}
 	}
 
 	switch c.Git.Transport {
@@ -939,6 +985,30 @@ func (c *Config) TurnEnv(role string, factoryd map[string]string, supervisorEnv 
 		out = append(out, k+"="+env[k])
 	}
 	return out
+}
+
+// PathWithin reports whether p is inside (or is) dir, lexically. Both are
+// cleaned; neither is resolved -- the physical check belongs to the moment
+// of use, where a symlink can still have changed since load.
+func PathWithin(p, dir string) bool {
+	p, dir = filepath.Clean(p), filepath.Clean(dir)
+	if p == dir {
+		return true
+	}
+	if dir == string(filepath.Separator) {
+		return true
+	}
+	return strings.HasPrefix(p, dir+string(filepath.Separator))
+}
+
+// PathsOverlap reports whether one path is inside the other, either way.
+func PathsOverlap(a, b string) bool { return PathWithin(a, b) || PathWithin(b, a) }
+
+func parentOf(p string) string {
+	if p == "" {
+		return ""
+	}
+	return filepath.Dir(p)
 }
 
 // LookPathIn resolves cmd against an explicit PATH, the way the process that

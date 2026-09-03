@@ -63,6 +63,10 @@ type Report struct {
 	Alerted    []string         `json:"alerted,omitempty"`
 	Recovered  []string         `json:"recovered,omitempty"`
 	Deliveries []DeliveryRecord `json:"deliveries,omitempty"`
+	// StateAlertAt is when the fail-safe "cadence record unavailable" alert
+	// last went out, kept here because the state document is exactly what
+	// is unavailable. It is the fallback cadence.
+	StateAlertAt *time.Time `json:"state_alert_at,omitempty"`
 	// Errors are failures of the tick itself: a state document it could not
 	// read, a volume it could not stat. They make the tick unhealthy: a tick
 	// that cannot look is not a tick that saw nothing.
@@ -74,6 +78,21 @@ type DeliveryRecord struct {
 	Key       string `json:"key"`
 	Transport string `json:"transport"`
 	Err       string `json:"error,omitempty"`
+}
+
+// ObservationError is returned by Tick, alongside the report it still wrote,
+// when something could not be looked at: a volume that would not stat, a
+// provider that would not answer, a state document that would not load.
+// It is a distinct type so the CLI can say "could not look" (exit 3) rather
+// than "unhealthy" (exit 1): the two are different failures with different
+// remedies, and folding them was a way for a blind tick to read as a
+// finding.
+type ObservationError struct {
+	Errors []string
+}
+
+func (e *ObservationError) Error() string {
+	return "the tick could not observe: " + strings.Join(e.Errors, "; ")
 }
 
 // Probes are the host facts the tick reads. They are an interface so that
@@ -120,6 +139,7 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Report, error) {
 	// file's existence: the tick's own cadence record creates the file, so a
 	// finding keyed on absence would be erased by the tick that reported it.
 	st, err := state.Load(cfg.StatePath(), cfg.Name)
+	stateErr := err
 	if err != nil {
 		rep.Errors = append(rep.Errors, "state: "+err.Error())
 		st = state.New(cfg.Name)
@@ -158,20 +178,52 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Report, error) {
 	// between the two loses at most one alert, which the repeat cadence
 	// resends; the reverse order could send the same alert on every tick.
 	var toAlert, recovered []Finding
-	updated, err := state.Update(cfg.StatePath(), cfg.Name, func(s *state.State) error {
-		toAlert, recovered = cadence(cfg, s, rep.Findings, at)
-		return nil
-	})
-	if err == nil {
-		st = updated // the cadence record the alerts quote is the one just written
+	var stateAlert *alert.Alert
+	if stateErr == nil {
+		updated, err := state.Update(cfg.StatePath(), cfg.Name, func(s *state.State) error {
+			toAlert, recovered = cadence(cfg, s, rep.Findings, at)
+			return nil
+		})
+		if err == nil {
+			st = updated // the cadence record the alerts quote is the one just written
+		} else {
+			stateErr = err
+			rep.Errors = append(rep.Errors, "state update: "+err.Error())
+			rep.Findings = append(rep.Findings, Finding{Key: "tick_error", Summary: "the tick could not observe something", Detail: "state update: " + err.Error()})
+			rep.Healthy = false
+		}
 	}
-	if err != nil {
-		rep.Errors = append(rep.Errors, "state update: "+err.Error())
-		rep.Healthy = false
+	if stateErr != nil {
+		// The cadence record is unavailable: a corrupt or unwritable state
+		// document. Without a fail-safe this tick would record the failure
+		// into health.json and stdout and alert nobody -- the journal-only
+		// failure the subsystem exists to prevent. So an alert goes out
+		// that depends on nothing but the transports, carrying every
+		// finding, bounded by the previous health document's record of
+		// when it last did so. If that too is unreadable, it goes out now.
+		toAlert, recovered = nil, nil
+		if prev, ok := readPrevious(cfg.HealthPath()); !ok || prev.StateAlertAt == nil ||
+			at.Sub(*prev.StateAlertAt) >= time.Duration(cfg.Health.RepeatSeconds)*time.Second {
+			detail := stateErr.Error()
+			for _, f := range rep.Findings {
+				if f.Key != "tick_error" {
+					detail += "\n" + f.Key + ": " + f.Summary
+				}
+			}
+			stateAlert = &alert.Alert{Factory: cfg.Name, At: at, Kind: "state_unavailable", Severity: "alert",
+				Summary: "the health tick cannot keep its cadence record; alerting without one", Detail: detail}
+			rep.StateAlertAt = &at
+		} else {
+			rep.StateAlertAt = prev.StateAlertAt
+		}
 	}
 
 	// 3. Deliver. Every transport, independently.
 	if deps.Alerts != nil {
+		if stateAlert != nil {
+			rep.Alerted = append(rep.Alerted, stateAlert.Kind)
+			rep.Deliveries = append(rep.Deliveries, deliver(ctx, deps.Alerts, stateAlert.Kind, *stateAlert)...)
+		}
 		for _, f := range toAlert {
 			cond := condFor(st, f.Key)
 			a := alert.Alert{Factory: cfg.Name, At: at, Kind: f.Key, Severity: "alert", Summary: f.Summary, Detail: f.Detail}
@@ -195,11 +247,26 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Report, error) {
 		}
 	}
 
-	// 4. Write the document, atomically.
+	// 4. Write the document, atomically; then say whether the tick could look.
 	if err := writeReport(cfg.HealthPath(), rep); err != nil {
 		return rep, fmt.Errorf("writing %s: %w", cfg.HealthPath(), err)
 	}
+	if len(rep.Errors) > 0 {
+		return rep, &ObservationError{Errors: rep.Errors}
+	}
 	return rep, nil
+}
+
+func readPrevious(path string) (Report, bool) {
+	body, err := os.ReadFile(path)
+	if err != nil {
+		return Report{}, false
+	}
+	var r Report
+	if err := json.Unmarshal(body, &r); err != nil {
+		return Report{}, false
+	}
+	return r, true
 }
 
 func everSupervised(st *state.State) bool {
@@ -369,6 +436,7 @@ func writePaths(cfg *config.Config) []string {
 			add(p)
 		}
 	}
+	add(cfg.Paths.CacheRoot)
 	for _, c := range cfg.Health.Caches {
 		add(c.Path)
 	}
@@ -400,8 +468,33 @@ func nearestExisting(p string) string {
 func reclaimCaches(cfg *config.Config, at time.Time, log io.Writer) ([]CacheReport, []Finding) {
 	var reps []CacheReport
 	var findings []Finding
+	// The cache root is resolved physically once per tick. A cache path or
+	// an entry that resolves outside it -- a symlink planted since load, or
+	// a bind mount -- is a finding and nothing under it is touched. Lexical
+	// containment was checked at load; this is the check at the moment of
+	// use, which is the only moment that counts for a deletion.
+	root, rootErr := physical(cfg.Paths.CacheRoot)
 	for _, c := range cfg.Health.Caches {
 		r := CacheReport{Path: c.Path, MaxBytes: c.MaxBytes}
+		if rootErr != nil {
+			r.Err = "cache root: " + rootErr.Error()
+			reps = append(reps, r)
+			findings = append(findings, Finding{Key: "cache_unsafe/" + c.Path, Summary: "cache root " + cfg.Paths.CacheRoot + " cannot be resolved; nothing reclaimed", Detail: rootErr.Error()})
+			continue
+		}
+		cp, err := physical(c.Path)
+		if err != nil && !errors.Is(err, os.ErrNotExist) {
+			r.Err = err.Error()
+			reps = append(reps, r)
+			findings = append(findings, Finding{Key: "cache_unsafe/" + c.Path, Summary: "cache " + c.Path + " cannot be resolved; nothing reclaimed", Detail: err.Error()})
+			continue
+		}
+		if err == nil && !config.PathWithin(cp, root) {
+			r.Err = fmt.Sprintf("resolves to %s, outside the cache root %s", cp, root)
+			reps = append(reps, r)
+			findings = append(findings, Finding{Key: "cache_unsafe/" + c.Path, Summary: "cache " + c.Path + " resolves outside the cache root; nothing reclaimed", Detail: r.Err})
+			continue
+		}
 		entries, err := cacheEntries(c.Path)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
@@ -427,9 +520,24 @@ func reclaimCaches(cfg *config.Config, at time.Time, log io.Writer) ([]CacheRepo
 			if r.Bytes <= c.MaxBytes || i == len(entries)-1 {
 				break
 			}
-			if err := os.RemoveAll(e.path); err != nil {
-				r.Err = fmt.Sprintf("removing %s: %v", e.path, err)
-				break
+			if e.link {
+				// A symlink entry is removed as a link. It is never followed:
+				// its target is not the cache's to reclaim.
+				if err := os.Remove(e.path); err != nil {
+					r.Err = fmt.Sprintf("removing link %s: %v", e.path, err)
+					break
+				}
+			} else {
+				ep, err := physical(e.path)
+				if err != nil || !config.PathWithin(ep, cp) {
+					r.Err = fmt.Sprintf("entry %s resolves outside the cache (%s); nothing further reclaimed", e.path, ep)
+					findings = append(findings, Finding{Key: "cache_unsafe/" + c.Path, Summary: "an entry of " + c.Path + " resolves outside it; reclamation stopped", Detail: r.Err})
+					break
+				}
+				if err := os.RemoveAll(e.path); err != nil {
+					r.Err = fmt.Sprintf("removing %s: %v", e.path, err)
+					break
+				}
 			}
 			r.Bytes -= e.bytes
 			r.ReclaimedBytes += e.bytes
@@ -449,6 +557,12 @@ type cacheEntry struct {
 	path  string
 	bytes int64
 	mtime time.Time
+	link  bool // the entry itself is a symlink
+}
+
+// physical resolves every symlink in p. It is what a deletion would act on.
+func physical(p string) (string, error) {
+	return filepath.EvalSymlinks(p)
 }
 
 func cacheEntries(dir string) ([]cacheEntry, error) {
@@ -460,6 +574,16 @@ func cacheEntries(dir string) ([]cacheEntry, error) {
 	for _, de := range des {
 		p := filepath.Join(dir, de.Name())
 		e := cacheEntry{path: p}
+		if de.Type()&os.ModeSymlink != 0 {
+			// Sized as the link itself; never followed.
+			info, err := os.Lstat(p)
+			if err != nil {
+				return nil, err
+			}
+			e.link, e.bytes, e.mtime = true, info.Size(), info.ModTime()
+			out = append(out, e)
+			continue
+		}
 		err := filepath.WalkDir(p, func(path string, d os.DirEntry, err error) error {
 			if err != nil {
 				return err

@@ -3,8 +3,10 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
+	"io"
 	"os"
 	"os/signal"
 	"syscall"
@@ -16,6 +18,33 @@ import (
 	"github.com/aicix-labs/factoryd/internal/health"
 	"github.com/aicix-labs/factoryd/internal/scm"
 )
+
+// tickOnce runs one tick and classifies it: 0 healthy, 1 findings, 3 could
+// not look -- an ObservationError, or a tick that could not run at all. The
+// report is printed in every case it exists, so "could not look" still
+// shows what was seen.
+func tickOnce(ctx context.Context, cfg *config.Config, deps health.Deps, asJSON bool, stdout, stderr io.Writer) int {
+	rep, err := health.Tick(ctx, cfg, deps)
+	if asJSON {
+		enc := json.NewEncoder(stdout)
+		enc.SetIndent("", "  ")
+		_ = enc.Encode(rep)
+	} else {
+		fmt.Fprintf(stdout, "%s %s", rep.At.Format(time.RFC3339), rep.Summary())
+	}
+	var obs *health.ObservationError
+	switch {
+	case errors.As(err, &obs):
+		fmt.Fprintf(stderr, "factoryd health: %v\n", err)
+		return exitConfig
+	case err != nil:
+		fmt.Fprintf(stderr, "factoryd health: %v\n", err)
+		return exitConfig
+	case !rep.Healthy:
+		return exitUnhealthy
+	}
+	return exitOK
+}
 
 // exitUnhealthy is the health verb's own code: the tick ran and found
 // something. It is distinct from exitConfig (the tick could not run) so that
@@ -64,25 +93,9 @@ func runHealth(args []string) int {
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	for {
-		rep, err := health.Tick(ctx, cfg, deps)
-		if err != nil {
-			fmt.Fprintf(os.Stderr, "factoryd health: %v\n", err)
-			if !*loop {
-				return exitConfig
-			}
-		}
-		if *asJSON {
-			enc := json.NewEncoder(os.Stdout)
-			enc.SetIndent("", "  ")
-			_ = enc.Encode(rep)
-		} else {
-			fmt.Printf("%s %s", rep.At.Format(time.RFC3339), rep.Summary())
-		}
+		code := tickOnce(ctx, cfg, deps, *asJSON, os.Stdout, os.Stderr)
 		if !*loop {
-			if !rep.Healthy {
-				return exitUnhealthy
-			}
-			return exitOK
+			return code
 		}
 		select {
 		case <-ctx.Done():

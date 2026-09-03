@@ -370,6 +370,9 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 			add("alert "+kind, d.Err, d.Transport+": probe alert delivered")
 		}
 	}
+	if cr := cfg.Paths.CacheRoot; cr != "" {
+		add("cache root", checkCacheRoot(cr), cr)
+	}
 	add("health thresholds", nil, fmt.Sprintf("alert after %d ticks, repeat every %ds; stale trigger %ds, turn grace %ds, disk headroom %d%%, %d bounded cache(s)",
 		cfg.Health.AlertAfter, cfg.Health.RepeatSeconds, cfg.Health.StaleTriggerSeconds, cfg.Health.TurnGraceSeconds, cfg.Health.DiskMinFreePercent, len(cfg.Health.Caches)))
 
@@ -641,4 +644,38 @@ func canonical(p string) (string, error) {
 		return "", err
 	}
 	return filepath.Clean(filepath.Join(real, rest)), nil
+}
+
+// checkCacheRoot: the one directory reclamation may delete in must exist,
+// be a real directory (not a symlink to somewhere else), be owned by the
+// user factoryd runs as, and not be writable by anyone else -- a group- or
+// world-writable cache root lets any local user plant a symlink for the
+// next tick to follow, and the physical check at reclamation is the last
+// line, not the only one.
+func checkCacheRoot(dir string) error {
+	fi, err := os.Lstat(dir)
+	if err != nil {
+		return err
+	}
+	if fi.Mode()&os.ModeSymlink != 0 {
+		return fmt.Errorf("is a symlink; the cache root must be a real directory")
+	}
+	if !fi.IsDir() {
+		return fmt.Errorf("is not a directory")
+	}
+	if fi.Mode().Perm()&0o022 != 0 {
+		return fmt.Errorf("is writable by group or others (%v); anyone could plant a symlink for reclamation to follow", fi.Mode().Perm())
+	}
+	if uid, ok := ownerUID(fi); ok && uid != os.Getuid() {
+		return fmt.Errorf("is owned by uid %d, not the uid factoryd runs as (%d)", uid, os.Getuid())
+	}
+	return nil
+}
+
+func ownerUID(fi os.FileInfo) (int, bool) {
+	st, ok := fi.Sys().(*syscall.Stat_t)
+	if !ok {
+		return 0, false
+	}
+	return int(st.Uid), true
 }

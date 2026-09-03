@@ -871,6 +871,25 @@ journal nobody read.
   directory's mtime is bumped by every walk) until under its bound. **The newest
   entry is never removed**: a single entry larger than the bound would otherwise
   be deleted and rebuilt on every tick; left over the bound, it is a finding.
+  **Reclamation deletes, so where it may delete is the first question.** Every
+  cache lies inside `paths.cache_root`, a dedicated factory-owned directory that
+  may not be `/` and may not overlap the factory root, either repository, a
+  credential, or an alert file — refused at load, lexically. At the moment of
+  use the check is physical: the cache root, the cache path and every entry are
+  resolved through their symlinks, and one that lands outside is a finding under
+  which nothing is deleted. A symlink entry is removed as a link, never followed.
+  `doctor` requires the cache root to be a real directory, owned by the factory
+  user, and not writable by anyone else — a world-writable cache root lets any
+  local user plant a symlink for the next tick.
+- **"Could not look" is exit 3, not a finding.** `Tick` returns a typed
+  observation error alongside the report it still wrote; the CLI maps it to 3.
+  An unhealthy factory and a blind tick have different remedies.
+- **A corrupt or unwritable state document must not silence the tick.** The
+  cadence record lives there; when it is unavailable a fail-safe alert goes out
+  that depends on nothing but the transports, carrying every finding, bounded by
+  the previous `health.json`'s record of when it last did so — and
+  unconditionally when that too is unreadable. Alerting on every tick is the
+  bounded failure; alerting never is the one v1 had.
 - Disk headroom is checked **once per volume**, over every path the factory
   writes: root, both repositories, the gate's declared paths, the caches, the
   alert files. A path that does not exist yet is checked through its nearest
@@ -976,6 +995,10 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §7 cadence | alert only after `alert_after` ticks; silence until `repeat_seconds`; one recovery; none for a condition never announced | the sequence of alert lines is alert, repeat, recovered — exactly three |
 | §7 delivery probe | `doctor` fails when the alert file cannot be appended, or the alert command exits non-zero — even when a second transport succeeds, which is named | a healthy run leaves the probe line **in the file** |
 | §7 fan-out | one transport failing does not suppress the next, and the failure is named | every transport failing is an error that names each |
+| §7 reclamation scope | a cache root of `/`, one overlapping the factory root, a repository, a credential or an alert file, or a cache outside the root → refused at load; a cache path or entry that **resolves** outside the root at reclamation time → nothing deleted, `cache_unsafe` | a sibling that merely shares a string prefix is accepted; a cache inside the root is reclaimed |
+| §7 symlink entry | a symlink entry is removed as a link; its target is intact | the link itself is gone and counted |
+| §7 could not look | a volume that will not stat, a provider that will not answer, a corrupt state document → `factoryd health` exits **3** | findings alone exit 1; a live supervisor exits 0 |
+| §7 state unavailable | a corrupt `state.json` with a working transport → a `state_unavailable` alert on the first tick, none inside `repeat_seconds`, one after it, and one immediately when no previous `health.json` exists | a readable document alerts on the ordinary cadence |
 | §4.4 gate is its own user | `gate.run_as` is empty, or names the producer's user → refuse at load | distinct users pass |
 | §4.4 turn env is owned | a reviewer credential present in the supervisor's environment reaches the producer's turn | the reviewer's turn receives that same variable, by name |
 | §4.4 declared `PATH` | the gate or turn command is found on doctor's own `PATH` but not on the declared one → doctor refuses; the turn refuses to start | found on the declared `PATH` passes |
