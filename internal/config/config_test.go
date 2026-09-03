@@ -70,6 +70,7 @@ func TestValidationFailures(t *testing.T) {
 		"previous schema version": {`"schema_version": 2`, `"schema_version": 1`, "schema_version"},
 		"no producer turn":        {`"producer": {"command": ["claude", "-p", "producer-brief"]}`, `"producer": {"command": []}`, "roles.producer.command"},
 		"warn at or above abort":  {`"gate":`, `"supervisor": {"spin_warn": 9, "spin_abort": 4}, "gate":`, "spin_warn"},
+		"negative fail abort":     {`"gate":`, `"supervisor": {"fail_abort": -1}, "gate":`, "fail_abort"},
 		"empty name":              {`"name": "widgets"`, `"name": ""`, "name"},
 		"unknown provider":        {`"provider": "github"`, `"provider": "bitbucket"`, "provider"},
 		"no target branch":        {`"target_branch": "main"`, `"target_branch": ""`, "target_branch"},

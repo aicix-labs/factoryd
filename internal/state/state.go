@@ -84,6 +84,11 @@ type RoleState struct {
 	// legitimately spans turns, and a guard that cannot tell "still working"
 	// from "achieving nothing" halts real work.
 	SpinCount int `json:"spin_count"`
+	// FailStreak is consecutive turns that exited non-zero or timed out
+	// without reporting progress. Unlike SpinCount it does not reset when the
+	// trigger is consumed: a turn that consumes its trigger and then fails
+	// leaves nothing pending, which reads as idle to every other signal.
+	FailStreak int `json:"fail_streak"`
 	// Pending are the triggers seen and not yet consumed, oldest first.
 	Pending []Pending `json:"pending,omitempty"`
 	// WatchMode records whether the watcher is event-driven or polling, so a
@@ -213,6 +218,9 @@ func (s *State) Validate() error {
 		}
 		if rs.SpinCount < 0 {
 			return fmt.Errorf("state: role %s has a negative spin count", r)
+		}
+		if rs.FailStreak < 0 {
+			return fmt.Errorf("state: role %s has a negative fail streak", r)
 		}
 		for i, p := range rs.Pending {
 			if p.Label == "" || p.Path == "" {

@@ -87,7 +87,7 @@ func newFixture(t *testing.T) *fixture {
 			Reviewer: config.RoleSpec{Command: []string{"true"}},
 		},
 		Supervisor: config.Supervisor{
-			SpinWarn: 2, SpinAbort: 4, PollIntervalSeconds: 1, BackoffSeconds: 1,
+			SpinWarn: 2, SpinAbort: 4, FailAbort: 3, PollIntervalSeconds: 1, BackoffSeconds: 1,
 			ForcePoll: true,
 		},
 		Alerts: []config.Alert{{Kind: "file", Path: filepath.Join(root, "alerts.log")}},
@@ -240,7 +240,7 @@ func TestSpinGuardHalts(t *testing.T) {
 	fx.wake(t)
 
 	r := &fakeRunner{act: func(_ int, _ supervise.Turn) supervise.TurnResult {
-		return supervise.TurnResult{ExitCode: 1}
+		return supervise.TurnResult{} // exit 0: ran, consumed nothing, progressed nothing
 	}}
 	s := fx.newSupervisor(t, r, 50)
 
@@ -303,7 +303,7 @@ func TestProgressOnceThenStallStillHalts(t *testing.T) {
 			_ = fx.progressQuiet()
 			return supervise.TurnResult{}
 		}
-		return supervise.TurnResult{ExitCode: 1}
+		return supervise.TurnResult{}
 	}}
 	s := fx.newSupervisor(t, r, 50)
 
@@ -338,7 +338,7 @@ func TestStaleProgressFileIsNotProgress(t *testing.T) {
 	fx.progress(t) // as if a previous run had advanced
 
 	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
-		return supervise.TurnResult{ExitCode: 1}
+		return supervise.TurnResult{}
 	}}
 	s := fx.newSupervisor(t, r, 50)
 
@@ -371,7 +371,7 @@ func TestOneRolesProgressDoesNotResetAnothers(t *testing.T) {
 		if err := fx.progressQuietFor("producer"); err != nil {
 			t.Error(err)
 		}
-		return supervise.TurnResult{ExitCode: 1}
+		return supervise.TurnResult{}
 	}}
 	s := fx.newSupervisor(t, r, 50)
 
@@ -394,11 +394,160 @@ func TestOneRolesProgressDoesNotResetAnothers(t *testing.T) {
 	}
 }
 
+// The production shape from issue #12: every turn consumes its trigger and then
+// fails. The spin guard never engages -- consumption resets it every time -- so
+// to every existing signal this is an idle factory with an empty queue, while
+// the work sits stranded. The fail streak is the counter that can see it.
+//
+// Each turn consumes one trigger and a fresh one is left for the next, so
+// consumption is genuine: the acted-on path is gone when the supervisor checks.
+func TestConsumedButFailedTurnsStillHalt(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+
+	names := []string{"wake", "question.md"}
+	r := &fakeRunner{act: func(n int, tr supervise.Turn) supervise.TurnResult {
+		for _, trig := range tr.Triggers {
+			os.Remove(trig.Path) // consume what we were woken for
+		}
+		next := filepath.Join(fx.inbox, names[n%2]) // leave a different one
+		if err := os.WriteFile(next, []byte("x"), 0o644); err != nil {
+			t.Error(err)
+		}
+		return supervise.TurnResult{ExitCode: 1}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	err := s.Run(ctx)
+	if !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted: turns that consumed their trigger and failed were never escalated", err)
+	}
+	if got := r.count(); got != 3 {
+		t.Fatalf("ran %d turns, want 3 (fail_abort)", got)
+	}
+
+	rs := fx.roleState(t)
+	// The distinguishing fact: the spin guard saw nothing.
+	if rs.SpinCount != 0 {
+		t.Fatalf("spin count = %d; this scenario must be invisible to the spin guard, or the test is not testing the gap", rs.SpinCount)
+	}
+	if !strings.Contains(rs.HaltReason, "fail_abort") {
+		t.Fatalf("halt reason does not name the fail guard: %q", rs.HaltReason)
+	}
+	if _, err := os.Stat(fx.cfg.StopPath("reviewer")); err != nil {
+		t.Fatalf("no stop sentinel: %v", err)
+	}
+}
+
+// A failure that reported progress is a partial step, not a stall. Same rule as
+// the spin guard: progress resets, consumption does not.
+func TestProgressResetsTheFailStreak(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		_ = fx.progressQuiet()
+		return supervise.TurnResult{ExitCode: 1}
+	}}
+	s := fx.newSupervisor(t, r, 8)
+
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); err != nil {
+		t.Fatalf("turns that failed but kept reporting progress were halted: %v", err)
+	}
+	if rs := fx.roleState(t); rs.FailStreak != 0 || rs.Halted {
+		t.Fatalf("fail_streak=%d halted=%v after eight failing-but-progressing turns", rs.FailStreak, rs.Halted)
+	}
+}
+
+// One failure is not a halt -- agents fail -- but it must not be silent either.
+func TestSingleConsumedFailureIsRecordedNotHalted(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+
+	r := &fakeRunner{act: func(_ int, tr supervise.Turn) supervise.TurnResult {
+		for _, trig := range tr.Triggers {
+			os.Remove(trig.Path)
+		}
+		return supervise.TurnResult{ExitCode: 1}
+	}}
+	s := fx.newSupervisor(t, r, 1)
+
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); err != nil {
+		t.Fatalf("a single failed turn halted the factory: %v", err)
+	}
+	rs := fx.roleState(t)
+	if rs.Halted {
+		t.Fatal("one failure halted the supervisor")
+	}
+	if rs.FailStreak != 1 {
+		t.Fatalf("fail_streak = %d after one consumed failure, want 1: the failure was not recorded", rs.FailStreak)
+	}
+	if rs.LastTurn == nil || rs.LastTurn.ExitCode == nil || *rs.LastTurn.ExitCode != 1 {
+		t.Fatalf("last turn does not record the non-zero exit: %+v", rs.LastTurn)
+	}
+}
+
+// A timeout is a failure for this purpose, whatever the exit code says.
+func TestTimedOutTurnsCountAsFailures(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+
+	names := []string{"wake", "question.md"}
+	r := &fakeRunner{act: func(n int, tr supervise.Turn) supervise.TurnResult {
+		for _, trig := range tr.Triggers {
+			os.Remove(trig.Path)
+		}
+		_ = os.WriteFile(filepath.Join(fx.inbox, names[n%2]), []byte("x"), 0o644)
+		return supervise.TurnResult{ExitCode: 0, TimedOut: true}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted: timed-out turns were not counted as failures", err)
+	}
+}
+
+// When a turn both leaves its trigger and fails, both counters climb. Whichever
+// threshold is reached first halts, and the reason names that guard -- an
+// operator reading the sentinel should not have to guess which rule fired.
+func TestBothGuardsClimbAndTheLowerThresholdWins(t *testing.T) {
+	fx := newFixture(t) // fail_abort=3 < spin_abort=4
+	fx.wake(t)
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		return supervise.TurnResult{ExitCode: 1}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted", err)
+	}
+	if got := r.count(); got != 3 {
+		t.Fatalf("ran %d turns, want 3 (the lower of the two thresholds)", got)
+	}
+	rs := fx.roleState(t)
+	if rs.SpinCount != 3 || rs.FailStreak != 3 {
+		t.Fatalf("spin=%d fail_streak=%d; both should have climbed together", rs.SpinCount, rs.FailStreak)
+	}
+	if !strings.Contains(rs.HaltReason, "fail_abort") {
+		t.Fatalf("halt reason names the wrong guard: %q", rs.HaltReason)
+	}
+}
+
 func TestSpinGuardBacksOffBeforeHalting(t *testing.T) {
 	fx := newFixture(t)
 	fx.wake(t)
 	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
-		return supervise.TurnResult{ExitCode: 1}
+		return supervise.TurnResult{}
 	}}
 	s := fx.newSupervisor(t, r, 50)
 

@@ -156,6 +156,13 @@ type Supervisor struct {
 	// SpinAbort is where it halts: writes the stop sentinel, records why, and
 	// exits. Never relaunch indefinitely.
 	SpinAbort int `json:"spin_abort,omitempty"`
+	// FailAbort is the number of consecutive turns that exited non-zero (or
+	// timed out) without reporting progress after which the supervisor halts.
+	// It is counted independently of trigger consumption: a turn that consumed
+	// its trigger and then failed leaves nothing to re-arm on, so the spin
+	// guard never sees it. Observed in production as a factory idle for 3.5h
+	// with completed work stranded and every signal green (issue #12).
+	FailAbort int `json:"fail_abort,omitempty"`
 	// PollIntervalSeconds is the watcher poll period, and the periodic
 	// re-check interval even when inotify is in use.
 	PollIntervalSeconds int `json:"poll_interval_seconds,omitempty"`
@@ -171,6 +178,7 @@ type Supervisor struct {
 const (
 	DefaultSpinWarn       = 3
 	DefaultSpinAbort      = 8
+	DefaultFailAbort      = 5
 	DefaultPollInterval   = 2
 	DefaultBackoffSeconds = 15
 	DefaultTurnTimeout    = 3600
@@ -231,6 +239,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Supervisor.SpinAbort == 0 {
 		c.Supervisor.SpinAbort = DefaultSpinAbort
+	}
+	if c.Supervisor.FailAbort == 0 {
+		c.Supervisor.FailAbort = DefaultFailAbort
 	}
 	if c.Supervisor.PollIntervalSeconds == 0 {
 		c.Supervisor.PollIntervalSeconds = DefaultPollInterval
@@ -358,6 +369,9 @@ func (c *Config) Validate() error {
 	case sv.SpinWarn >= sv.SpinAbort:
 		add("supervisor.spin_warn (%d) must be below spin_abort (%d), or the warning never precedes the halt",
 			sv.SpinWarn, sv.SpinAbort)
+	}
+	if sv.FailAbort <= 0 {
+		add("supervisor.fail_abort must be positive")
 	}
 	if sv.PollIntervalSeconds <= 0 {
 		add("supervisor.poll_interval_seconds must be positive")

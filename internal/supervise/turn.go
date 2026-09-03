@@ -167,9 +167,16 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 	// implementation of this rule.
 	progressed := after.After(before)
 
+	// A non-zero exit or a timeout is a failed turn whatever happened to the
+	// trigger. The spin guard cannot see a turn that consumed its trigger and
+	// then failed -- nothing is pending, so nothing re-arms and nothing counts.
+	// That is exactly the shape that idled a factory for 3.5h with finished
+	// work stranded and every signal green (issue #12).
+	failed := res.ExitCode != 0 || res.TimedOut
+
 	var halted bool
 	var haltReason string
-	spin := 0
+	spin, fails := 0, 0
 
 	if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
 		rs := st.Role(state.Role(s.role))
@@ -193,11 +200,27 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 		}
 		spin = rs.SpinCount
 
-		if spin >= s.cfg.Supervisor.SpinAbort {
+		// Progress resets this one too; consumption does not.
+		if failed && !progressed {
+			rs.FailStreak++
+		} else {
+			rs.FailStreak = 0
+		}
+		fails = rs.FailStreak
+
+		switch {
+		case spin >= s.cfg.Supervisor.SpinAbort:
 			halted = true
 			haltReason = fmt.Sprintf(
 				"%d consecutive turns consumed no trigger and reported no progress (spin_abort=%d); last trigger %s, last exit %d",
 				spin, s.cfg.Supervisor.SpinAbort, labels(triggers), res.ExitCode)
+		case fails >= s.cfg.Supervisor.FailAbort:
+			halted = true
+			haltReason = fmt.Sprintf(
+				"%d consecutive turns failed without reporting progress (fail_abort=%d); last trigger %s, last exit %d, timed out %v",
+				fails, s.cfg.Supervisor.FailAbort, labels(triggers), res.ExitCode, res.TimedOut)
+		}
+		if halted {
 			rs.Halted = true
 			rs.HaltReason = haltReason
 			rs.HaltedAt = ended
@@ -209,7 +232,17 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 
 	s.log.Info("turn finished",
 		"turn", turn.ID, "exit", res.ExitCode, "timed_out", res.TimedOut,
-		"consumed", didConsume, "progressed", progressed, "spin", spin)
+		"consumed", didConsume, "progressed", progressed, "spin", spin, "fail_streak", fails)
+
+	if failed && didConsume && !halted {
+		// The dangerous quiet case: the trigger is gone, so nothing will
+		// re-arm, and to every other signal this now looks like an idle
+		// factory. Say so at a level someone reads.
+		s.log.Warn("turn failed after consuming its trigger; nothing is pending and nothing will retry",
+			"turn", turn.ID, "exit", res.ExitCode, "timed_out", res.TimedOut,
+			"fail_streak", fails, "abort_at", s.cfg.Supervisor.FailAbort,
+			"workdir", s.cfg.TurnWorkdir(s.role))
+	}
 
 	switch {
 	case halted:

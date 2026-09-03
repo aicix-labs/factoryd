@@ -41,6 +41,7 @@ but these carry the same weight.
 | 12 | `doctor` reported healthy while the git and API identities disagreed | only the API identity was ever resolved | §4.1 verify the git transport identity |
 | 13 | A missing cache directory was reported as `gate FAILED`, exit 5 | a build that cannot write and a build that found a defect both exit non-zero | §9.6 environmental failure is not a red gate |
 | 14 | A real GitLab merge conflict was reported as a CI failure | the fixture was hand-written from documentation and said 405; the provider answers 422 | §9.7 fixtures are recorded, not written |
+| 15 | A factory idled 3.5h with completed work stranded and every signal green | a turn consumed its trigger, then exited 1; the spin guard resets on consumption, so nothing counted and nothing re-armed | §4.2 a failure counter independent of the trigger |
 
 Item 11 failed closed only because the reviewer credential happened to lack
 repository write scope. With it, the push would have succeeded as the wrong
@@ -171,6 +172,22 @@ and silent. Therefore:
 - **halt at `spin_abort`** (default 6–10): write the stop sentinel, record the reason
   in health *and* in the log, exit. Never relaunch indefinitely.
 - **preserve the trigger** on abort. It is the only evidence a signal arrived.
+
+**A failed turn is a failure whether or not it consumed its trigger.** The spin
+guard keys on the trigger, and that gives it a blind spot with a production
+incident behind it (§1, item 15): a turn that consumes its trigger and then
+exits non-zero leaves nothing pending, so nothing re-arms, the spin counter
+resets on consumption, and every signal reads as an idle factory with an empty
+queue — while finished work sits stranded in the workdir. It idled for 3.5 hours.
+
+So the supervisor keeps a second counter, **independent of consumption**:
+consecutive turns that exited non-zero or timed out without reporting progress.
+Progress resets it; consuming the trigger does not. It halts at `fail_abort`
+(default 5) exactly as the spin guard halts at `spin_abort`, with a reason that
+names which guard fired. A single such failure is not a halt — agents fail — but
+it is logged at a level someone reads, saying that nothing is pending and
+nothing will retry, and it is recorded in state for the health tick (§4.5) to
+act on.
 
 ### 4.3 Watcher
 
