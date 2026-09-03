@@ -1,0 +1,16 @@
+{
+  "source": {
+    "recorded": true,
+    "provider": "github",
+    "provider_version": "api 2022-11-28",
+    "recorded_at": "2026-09-01T10:00:00Z"
+  },
+  "exchanges": [
+    {
+      "method": "GET",
+      "path": "/repos/acme/widgets/pulls?head=acme:producer/nothing-here\u0026per_page=100\u0026state=open",
+      "status": 200,
+      "body": []
+    }
+  ]
+}

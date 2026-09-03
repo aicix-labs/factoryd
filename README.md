@@ -39,12 +39,12 @@ pretending.
 | 3 | Versioned state document, process handles, `doctor` | **done** |
 | 4 | Supervisor (both roles, one implementation), spin/abort, progress | **done** |
 | 5a | Git transport (https), the owned environment, the two-directory boundary, `doctor`'"'"'s probe | **done** |
-| 5b | `submit`: materialize, gate, open the Draft PR/MR, signal | not started |
+| 5b | `submit`: materialize, gate, open the Draft PR/MR, signal | **done** |
 | 6 | Health, alert transports, resource guards | not started |
 | 7 | Status page | not started |
 
-`factoryd submit`, `signal`, `audit` and `status` exit non-zero with "not
-implemented in this build". A subcommand that silently did nothing would be
+`factoryd signal`, `audit` and `status` exit non-zero with "not implemented in
+this build". A subcommand that silently did nothing would be
 indistinguishable from one that ran and found nothing to do.
 
 ## What works today

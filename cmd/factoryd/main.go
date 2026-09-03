@@ -28,6 +28,8 @@ var usage = `factoryd - config-driven code review factories
 usage:
   factoryd doctor    --config <f>                    verify a factory could actually run
   factoryd supervise --config <f> --role <r>         run one role's loop
+  factoryd submit    --config <f>                    gate and open the producer's declared change
+                                                     exits 0 submitted, 3 config/identity, 4 nothing, 5 gate red
   factoryd scm       --config <f> <verb>...         drive the provider directly
   factoryd version
 
@@ -52,7 +54,7 @@ global flags:
   --role <r>       producer or reviewer; selects the credential (default reviewer)
   --json           machine-readable output where supported
 
-not yet implemented in this build: submit, signal, audit, status.
+not yet implemented in this build: signal, audit, status.
 They exit ` + fmt.Sprint(exitConfig) + ` rather than pretending to work.
 `
 
@@ -70,6 +72,8 @@ func main() {
 		os.Exit(runDoctor(args))
 	case "supervise":
 		os.Exit(runSupervise(args))
+	case "submit":
+		os.Exit(runSubmit(args))
 	case "scm":
 		os.Exit(runSCM(args))
 	case "version":
@@ -78,7 +82,7 @@ func main() {
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		os.Exit(exitOK)
-	case "submit", "signal", "audit", "status":
+	case "signal", "audit", "status":
 		// Named explicitly so the failure says what is missing. A subcommand
 		// that silently did nothing would be indistinguishable from one that
 		// ran and found nothing to do.

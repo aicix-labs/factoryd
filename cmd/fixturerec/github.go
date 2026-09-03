@@ -328,6 +328,15 @@ func (t *githubTarget) prepare(ctx context.Context, sc scenario) (*world, error)
 		w.Redactor = t.redactor(n, sha, "", false)
 		return w, nil
 
+	case "branch_only":
+		sha, err := changeBranch()
+		if err != nil {
+			return nil, err
+		}
+		w.HeadSHA = sha
+		w.Redactor = t.redactor(0, sha, "", false)
+		return w, nil
+
 	case "draft_change":
 		if _, err := changeBranch(); err != nil {
 			return nil, err
@@ -480,6 +489,11 @@ func (t *githubTarget) redactor(number int, head, stale string, asReviewer bool)
 	if stale != "" {
 		r.Map(stale, conformance.StaleSHA)
 	}
+	// The head= filter names the OWNER, and on a scratch repo owned by the
+	// same account the reviewer logs in as, the owner string is also the
+	// username string. Map the query form first, so the owner mapping wins
+	// there and the username mapping does not rewrite it to producer-bot.
+	r.MapPattern(regexp.MustCompile(`head=`+regexp.QuoteMeta(t.owner)+`:`), "head="+placeholderOwner+":")
 	r.Map(t.owner+"/"+t.repo, placeholderOwner+"/"+placeholderRepo)
 	r.Map(t.repo, placeholderRepo)
 	r.Map(t.owner, placeholderOwner)

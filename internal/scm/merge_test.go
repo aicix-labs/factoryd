@@ -120,17 +120,19 @@ func (f *fakeDriver) IsAncestor(context.Context, string, string) (bool, error) {
 	return f.ancestor, f.ancestErr
 }
 
-func (f *fakeDriver) ListOpen(context.Context) ([]Change, error)                 { panic("unused") }
-func (f *fakeDriver) Get(context.Context, ChangeID) (Change, error)              { panic("unused") }
-func (f *fakeDriver) Diff(context.Context, ChangeID) ([]FileDiff, error)         { panic("unused") }
-func (f *fakeDriver) Pipeline(context.Context, ChangeID) (PipelineStatus, error) { panic("unused") }
-func (f *fakeDriver) Comment(context.Context, ChangeID, string) error            { panic("unused") }
-func (f *fakeDriver) SetDraft(context.Context, ChangeID, bool) error             { panic("unused") }
-func (f *fakeDriver) PostAudit(context.Context, ChangeID, string, Audit) error   { panic("unused") }
-func (f *fakeDriver) Audits(context.Context, ChangeID, string) ([]Audit, error)  { panic("unused") }
-func (f *fakeDriver) WhoamiWith(context.Context, string) (Identity, error)       { panic("unused") }
-func (f *fakeDriver) GitCredential(string) GitCredential                         { panic("unused") }
-func (f *fakeDriver) Whoami(context.Context) (Identity, error)                   { panic("unused") }
+func (f *fakeDriver) ListOpen(context.Context) ([]Change, error)                     { panic("unused") }
+func (f *fakeDriver) Get(context.Context, ChangeID) (Change, error)                  { panic("unused") }
+func (f *fakeDriver) Diff(context.Context, ChangeID) ([]FileDiff, error)             { panic("unused") }
+func (f *fakeDriver) Pipeline(context.Context, ChangeID) (PipelineStatus, error)     { panic("unused") }
+func (f *fakeDriver) Comment(context.Context, ChangeID, string) error                { panic("unused") }
+func (f *fakeDriver) SetDraft(context.Context, ChangeID, bool) error                 { panic("unused") }
+func (f *fakeDriver) PostAudit(context.Context, ChangeID, string, Audit) error       { panic("unused") }
+func (f *fakeDriver) Audits(context.Context, ChangeID, string) ([]Audit, error)      { panic("unused") }
+func (f *fakeDriver) FindOpenBySource(context.Context, string) (Change, bool, error) { panic("unused") }
+func (f *fakeDriver) OpenDraft(context.Context, DraftSpec) (Change, error)           { panic("unused") }
+func (f *fakeDriver) WhoamiWith(context.Context, string) (Identity, error)           { panic("unused") }
+func (f *fakeDriver) GitCredential(string) GitCredential                             { panic("unused") }
+func (f *fakeDriver) Whoami(context.Context) (Identity, error)                       { panic("unused") }
 
 func TestMergeVerified(t *testing.T) {
 	ctx := context.Background()

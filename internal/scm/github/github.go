@@ -349,6 +349,44 @@ func (d *Driver) IsAncestor(ctx context.Context, sha, ref string) (bool, error) 
 	}
 }
 
+func (d *Driver) FindOpenBySource(ctx context.Context, branch string) (scm.Change, bool, error) {
+	// head=owner:branch filters server-side; one page is all it can return.
+	var page []ghPull
+	path := d.repoPath("/pulls?state=open&per_page=100&head=" + url.QueryEscape(d.owner+":"+branch))
+	if _, err := d.c.Do(ctx, http.MethodGet, path, nil, &page); err != nil {
+		return scm.Change{}, false, fmt.Errorf("github find-open %s: %w", branch, err)
+	}
+	for _, p := range page {
+		if p.Head.Ref == branch && p.State == "open" {
+			return p.toChange(), true, nil
+		}
+	}
+	return scm.Change{}, false, nil
+}
+
+func (d *Driver) OpenDraft(ctx context.Context, spec scm.DraftSpec) (scm.Change, error) {
+	if spec.SourceBranch == "" || spec.TargetBranch == "" || spec.Title == "" {
+		return scm.Change{}, fmt.Errorf("github open-draft: source, target and title are required")
+	}
+	var p ghPull
+	_, err := d.c.Do(ctx, http.MethodPost, d.repoPath("/pulls"), map[string]any{
+		"title": spec.Title, "body": spec.Body,
+		"head": spec.SourceBranch, "base": spec.TargetBranch,
+		"draft": true,
+	}, &p)
+	if err != nil {
+		return scm.Change{}, fmt.Errorf("github open-draft %s: %w", spec.SourceBranch, err)
+	}
+	c := p.toChange()
+	// The provider is asked, not trusted: a repository that does not support
+	// drafts silently opens a ready PR, which hands the producer's work to the
+	// merge path without a reviewer's act.
+	if !c.Draft {
+		return scm.Change{}, fmt.Errorf("github open-draft %s: the provider opened %s as ready, not as a draft; refusing to continue", spec.SourceBranch, c.ID)
+	}
+	return c, nil
+}
+
 // ---------- write verbs ----------
 
 func (d *Driver) Comment(ctx context.Context, id scm.ChangeID, body string) error {

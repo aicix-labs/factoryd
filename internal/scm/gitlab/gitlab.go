@@ -359,6 +359,43 @@ func (d *Driver) IsAncestor(ctx context.Context, sha, ref string) (bool, error) 
 	return base.ID == sha, nil
 }
 
+func (d *Driver) FindOpenBySource(ctx context.Context, branch string) (scm.Change, bool, error) {
+	var mrs []glMR
+	path := d.projPath("/merge_requests?state=opened&per_page=100&source_branch=" + url.QueryEscape(branch))
+	if _, err := d.c.Do(ctx, http.MethodGet, path, nil, &mrs); err != nil {
+		return scm.Change{}, false, fmt.Errorf("gitlab find-open %s: %w", branch, err)
+	}
+	for _, m := range mrs {
+		if m.SourceBranch == branch {
+			return m.toChange(), true, nil
+		}
+	}
+	return scm.Change{}, false, nil
+}
+
+func (d *Driver) OpenDraft(ctx context.Context, spec scm.DraftSpec) (scm.Change, error) {
+	if spec.SourceBranch == "" || spec.TargetBranch == "" || spec.Title == "" {
+		return scm.Change{}, fmt.Errorf("gitlab open-draft: source, target and title are required")
+	}
+	title := spec.Title
+	if !isDraftTitle(title) {
+		title = draftPrefix + title
+	}
+	var m glMR
+	_, err := d.c.Do(ctx, http.MethodPost, d.projPath("/merge_requests"), map[string]any{
+		"source_branch": spec.SourceBranch, "target_branch": spec.TargetBranch,
+		"title": title, "description": spec.Body,
+	}, &m)
+	if err != nil {
+		return scm.Change{}, fmt.Errorf("gitlab open-draft %s: %w", spec.SourceBranch, err)
+	}
+	c := m.toChange()
+	if !c.Draft {
+		return scm.Change{}, fmt.Errorf("gitlab open-draft %s: the provider opened !%s as ready, not as a draft; refusing to continue", spec.SourceBranch, c.ID)
+	}
+	return c, nil
+}
+
 // ---------- write verbs ----------
 
 func (d *Driver) Comment(ctx context.Context, id scm.ChangeID, body string) error {
