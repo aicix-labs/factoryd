@@ -487,13 +487,19 @@ inferred its remote from the workdir would verify one thing and push to another:
 "git": {
   "remote": "https://gitlab.example.com/acme/widgets.git",
   "transport": "https",
-  "ssh_key_file": "/etc/factoryd/widgets/producer_ed25519"
+  "ssh_key_file": "/etc/factoryd/widgets/producer_ed25519",
+  "known_hosts_file": "/etc/factoryd/widgets/known_hosts",
+  "proxy": "",
+  "ca_file": ""
 }
 ```
 
 `transport` is `https` or `ssh`. For `https` the credential is
-`credentials.producer` — the same one the API uses, and no other. For `ssh` it is
-`ssh_key_file`, which is required for that transport and ignored otherwise.
+`credentials.producer` — the same one the API uses, and no other. For `ssh`,
+`ssh_key_file` and `known_hosts_file` are required and ignored otherwise.
+`proxy` and `ca_file` are the **only** way a proxy or an alternative trust store
+reaches the transport: empty means direct connection and the system trust store,
+and nothing ambient can widen either (see the environment rule below).
 
 **Isolation is part of the contract, not a precaution.** Every git invocation
 must run with inherited credential sources suppressed:
@@ -504,9 +510,17 @@ must run with inherited credential sources suppressed:
   remote URL with the credential embedded, and never argv** —
   `/proc/<pid>/cmdline` is world-readable, so a token on a command line is
   readable by anything on the host.
-- **ssh:** `IdentitiesOnly=yes`, `IdentityAgent=none`, and an explicit
-  `IdentityFile`. An agent holding the reviewer's key is the same failure as a
-  credential helper holding the reviewer's token.
+- **ssh:** `-F /dev/null` first — without it, `~/.ssh/config` and the system
+  ssh config still apply, and a `ProxyCommand` or `ProxyJump` there routes the
+  connection through a host factoryd never chose, with the effective URL
+  unchanged. Then, on that clean base: `IdentitiesOnly=yes`,
+  `IdentityAgent=none`, an explicit `IdentityFile`, and an explicit
+  `UserKnownHostsFile` with `StrictHostKeyChecking=yes` — the host-key policy is
+  factoryd's, pinned in configuration, because trust-on-first-use inside an
+  unowned home directory is one more ambient input. An agent holding the
+  reviewer's key is the same failure as a credential helper holding the
+  reviewer's token; a ProxyCommand in a dotfile is the same failure as
+  `http_proxy` in the environment.
 
 **The invariant.** *A verification is valid only for an operation it shares an
 environment with, and only while nothing can change that environment in
@@ -582,9 +596,23 @@ So the git environment is isolated to the same standard as the credential:
   this section policed the local config with a denylist, which satisfies the
   letter of the invariant and not the substance: the verification and the
   operation still shared configuration that factoryd did not own.
-- Inherited `GIT_*` variables are dropped, not merged. `GIT_TERMINAL_PROMPT=0`
-  and an inert `GIT_ASKPASS`, so a missing credential fails rather than waiting
-  for a human who is not there.
+- **The git process environment is constructed in full, exactly as the gate's
+  is (§4.4).** An earlier draft dropped inherited `GIT_*` variables, which is a
+  denylist wearing an environment's clothes: `http_proxy`, `https_proxy`,
+  `all_proxy`, `NO_PROXY`, `SSL_CERT_FILE`, `SSL_CERT_DIR` and `CURL_CA_BUNDLE`
+  all steer git's HTTPS transport and none of them starts with `GIT_`. A filter
+  keyed on a prefix owns the prefix, not the environment — and a `doctor` run
+  from a terminal and a `submit` run as a service would still transport through
+  different proxies while both reported the same green.
+
+  So every git and ssh process starts from an environment factoryd builds:
+  `PATH` and `HOME` from configuration, the `GIT_CONFIG_*`/`GIT_TERMINAL_PROMPT`
+  and inert-`GIT_ASKPASS` settings above, and nothing else. A proxy or TLS
+  override reaches the transport only through a typed factory config field
+  (`git.proxy`, `git.ca_file`) that declares it — never through whatever the
+  parent process was started with. `doctor` and `submit` build this environment
+  from the same configuration, so "which proxy" stops being a property of who
+  launched the process.
 - The transport is set explicitly, never inherited.
 
 And the effective target is checked, not the configured one — **inside the
@@ -749,7 +777,7 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | requirement | must be shown to fail when | positive control |
 |---|---|---|
 | §4.4 git identity (https) | an ambient `credential.helper` resolves the remote to a non-producer account | the same check passes with the producer credential configured |
-| §4.4 git identity (ssh) | an agent or default key authenticates as a non-producer account | passes with `IdentitiesOnly` and the producer key |
+| §4.4 git identity (ssh) | an agent, default key, or `~/.ssh/config` `IdentityFile` authenticates as a non-producer account | passes with `-F /dev/null`, `IdentitiesOnly` and the producer key |
 | §4.4 identity is undecidable | the helper returns nothing, or the greeting cannot be parsed | a resolvable transport reports a login |
 | §4.4 credential never in argv | the credential appears in the spawned git process's `/proc/<pid>/cmdline` | **the credential is present in the channel it should use** — otherwise "absent from argv" passes for a submit that never supplied it at all |
 | §4.4 `fetch` is covered too | an ambient credential is used for fetch, not only push | fetch succeeds under the producer credential |
@@ -762,6 +790,9 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §4.4 gate env agreement | `doctor` and `submit` resolve a `${VAR}` path to different values — including when run from **different processes with different ambient environments**, which is the case that made an allowlist unworkable | both resolve it to the same path from the same config |
 | §5.4 local config allowlist | **any** key outside the allowlist is present in the workdir's local config → refuse | a clone carrying only allowlisted keys pushes normally |
 | §5.4 the URL check is not enough | `http.<url>.proxy`, `http.sslVerify=false` or `http.sslCAInfo` is set — the effective URL and project still match, and submit must still refuse | the same push succeeds once the setting is removed |
+| §5.4 ambient proxy env | `https_proxy`/`all_proxy` set in the parent environment routes nothing: identity, target, fetch and push are all unaffected, because the git process never receives them | `git.proxy` declared in config **does** take effect — proving the transport honours a proxy when one is actually declared, so "unaffected" is not a transport that ignores proxies entirely |
+| §5.4 ambient ssh config | a `ProxyCommand` in `~/.ssh/config` (or the system ssh config) is never executed by any factoryd ssh invocation | the same `ProxyCommand` in a config passed without `-F /dev/null` executes — proving the probe can detect execution at all |
+| §5.4 host-key policy | a remote presenting a key absent from the configured `UserKnownHostsFile` is refused, not learned | the pinned key connects |
 | §4.4 the boundary holds | the producer principal **can** write `paths.submit_repo` → `doctor` fails | the same probe succeeds against `paths.producer_workdir`, so "cannot write" is not a broken probe |
 | §4.4 no boundary at all | the producer runs with submit's own authority → `doctor` fails rather than reporting a separation it cannot enforce | a genuinely separated pair passes |
 | §4.4 the race is gone | `.git/config` in the **producer workdir** is replaced — with a proxy, a rewrite, anything — at any moment, including after every check and while the push is running: the push is unaffected, because git never reads that file | the identical setting placed in `paths.submit_repo`'s config **does** refuse, proving the test can detect it at all |
