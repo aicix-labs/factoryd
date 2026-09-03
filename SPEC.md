@@ -133,15 +133,16 @@ and found nothing to do.
 - declared paths exist and are writable; every path in
   `gate.required_writable_paths` is a writable directory **or is absent with a
   writable nearest existing ancestor**, since submit creates it (§4.4);
-- the workdir's local git config carries **only** allowlisted keys, and the
-  clone is one factoryd created (§5.4) — reported here as a preflight, enforced
-  again inside the transport before every operation, because the producer can
-  edit it in between;
+- **the producer cannot write `paths.submit_repo`** — established by running a
+  write probe through the same mechanism the producer turn runs under, with the
+  same probe succeeding against `paths.producer_workdir` as its control (§4.4);
+- the submit repository's local git config carries **only** allowlisted keys
+  (§5.4) — defence in depth, since the producer cannot reach that file;
 - `gate.env` declares `PATH`, and every `${VAR}` referenced by a declared path
   is set in it — `doctor` resolves those paths against the same fully-declared
   environment `submit` will give the gate, not against its own (§4.4);
 - the target repo is reachable;
-- the workdir is a clone, not a worktree (§4.4).
+- `paths.submit_repo` is a clone, not a worktree (§4.4).
 
 It exits non-zero on any failure and names which.
 
@@ -188,6 +189,13 @@ The producer may run in a sandbox with **no network and a read-only `.git`**
 plain file in the same directory succeeds). Do not attempt to widen that sandbox.
 Instead the producer declares intent in plain files and `factoryd submit`, running
 outside the sandbox, does the git and network work:
+
+That observation is what prompted the design; it is **not** what the design rests
+on. A sandbox that permitted the producer to write its `.git` must change
+nothing, because submit does not use it — see the two-directory boundary below.
+A safety property inferred from how one sandbox happened to behave is an
+assumption, not a boundary, and it would go quiet the day someone changed the
+sandbox.
 
 ```
 .producer-branch       branch name — required when changes exist; refuse to guess; refuse the target branch
@@ -304,15 +312,47 @@ An empty list is legal and means the gate needs nothing beyond its workdir. It i
 a claim the operator makes, and a wrong one shows up as an exit 3 rather than a
 mystery.
 
-**The workdir must be a clone factoryd created, not a git worktree.** A worktree
-keeps its refs in the parent repository, outside the sandbox, so the producer
-cannot write them. `doctor` must check this.
+**Git never runs in a repository the producer can write.** There are two
+directories, and the separation is the boundary:
 
-"Factoryd created" is the other half, and it is a §5.4 requirement rather than a
-convenience: a clone made by someone else arrives with a `.git/config` nobody
-owns. The allowlist check would reject it, which is the correct outcome but a
-confusing one to meet for the first time on a live factory — so the ownership is
-stated here, where the workdir is.
+| | `paths.producer_workdir` | `paths.submit_repo` |
+|---|---|---|
+| written by | the producer | factoryd only |
+| contains | source the producer edits | the clone every git command runs in |
+| its `.git` | ignored entirely; may not exist | factoryd's, and the only one git reads |
+
+Submit copies the producer's **source tree** into the submit repository and does
+all of its git work there. The copy excludes git control data — any path named
+`.git`, at any depth, file or directory — and refuses a symlink that resolves
+outside the tree. Nothing the producer wrote can reach the configuration git
+reads, because it is not copied and the destination is not writable by the
+producer.
+
+This replaces an earlier design in which the producer's own clone was validated
+before each operation. That was a time-of-check-to-time-of-use race and could not
+be fixed by checking harder: submit read `.git/config`, approved it, then started
+a git process that read the file again, and the producer could replace it
+atomically in between. "Factoryd created" is provenance at one instant, not
+ownership over time, and a cooperative lock between a factory and the agent it
+is sandboxing is not a boundary. The allowlist of §5.4 still applies to the
+submit repository, but as defence in depth over a file the producer cannot
+reach — not as the mechanism.
+
+**The boundary is verified by probe, not by assertion.** `doctor` runs a write
+probe **through exactly the mechanism the producer turn runs under** — the same
+sandbox wrapper, the same user — and requires it to fail against
+`paths.submit_repo`. The same probe must **succeed** against
+`paths.producer_workdir`: without that control, "the producer cannot write it"
+is indistinguishable from a probe that cannot write anything.
+
+If the producer turn runs with the same authority as submit, there is no
+boundary to verify and `doctor` fails, saying so. An unenforced separation
+recorded as enforced is worse than none: it is the two-party split on paper with
+nothing holding it up.
+
+**The submit repository must be a clone, not a git worktree.** A worktree keeps
+its refs in the parent repository, so the refs submit writes would land outside
+the directory whose ownership was just established.
 
 ### 4.5 Reconciler / health tick
 
@@ -512,9 +552,11 @@ So the git environment is isolated to the same standard as the credential:
 
   So the local configuration is **default-deny**:
 
-  - The workdir is a clone **factoryd created**, whose `.git/config` factoryd
-    wrote. Ownership first; the check below exists because the producer can
-    edit it afterwards.
+  - Git runs only in `paths.submit_repo`, which the producer cannot write
+    (§4.4). That is the boundary. The allowlist below is defence in depth over a
+    file the producer cannot reach — checking a file the producer *could* write
+    would be a time-of-check-to-time-of-use race, since git rereads it after the
+    check.
   - Before every fetch and every push, submit reads the repository's effective
     local configuration and **refuses if any key outside this allowlist is
     present**:
@@ -720,7 +762,11 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §4.4 gate env agreement | `doctor` and `submit` resolve a `${VAR}` path to different values — including when run from **different processes with different ambient environments**, which is the case that made an allowlist unworkable | both resolve it to the same path from the same config |
 | §5.4 local config allowlist | **any** key outside the allowlist is present in the workdir's local config → refuse | a clone carrying only allowlisted keys pushes normally |
 | §5.4 the URL check is not enough | `http.<url>.proxy`, `http.sslVerify=false` or `http.sslCAInfo` is set — the effective URL and project still match, and submit must still refuse | the same push succeeds once the setting is removed |
-| §5.4 rewrite added mid-turn | a rewrite is added to `.git/config` **after** `doctor` passed and before the push — the per-operation check must catch what the preflight could not | the same push succeeds with no rewrite added |
+| §4.4 the boundary holds | the producer principal **can** write `paths.submit_repo` → `doctor` fails | the same probe succeeds against `paths.producer_workdir`, so "cannot write" is not a broken probe |
+| §4.4 no boundary at all | the producer runs with submit's own authority → `doctor` fails rather than reporting a separation it cannot enforce | a genuinely separated pair passes |
+| §4.4 the race is gone | `.git/config` in the **producer workdir** is replaced — with a proxy, a rewrite, anything — at any moment, including after every check and while the push is running: the push is unaffected, because git never reads that file | the identical setting placed in `paths.submit_repo`'s config **does** refuse, proving the test can detect it at all |
+| §4.4 control data never crosses | a `.git` anywhere in the producer tree, at any depth, is copied into the submit repository | an ordinary source tree copies intact |
+| §4.4 symlink escape | a symlink in the producer tree resolving outside it is followed | a symlink within the tree is preserved |
 | §4.4 gate paths | a declared path exists as a non-directory, or cannot be created → exit **3** | a genuinely red gate still exits **5**, and an absent-but-creatable path is created and passes |
 | §4.4 unset `${VAR}` | a referenced variable is unset → refuse | a set variable resolves and passes |
 | §4.1 doctor covers the above | each condition above, reached through `doctor` rather than only through unit tests | a healthy factory passes every check |
