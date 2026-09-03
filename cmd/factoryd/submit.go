@@ -65,9 +65,10 @@ func runSubmit(args []string) int {
 
 	r, err := submit.Run(ctx, cfg, submit.Deps{
 		Driver: driver, Transport: transport,
-		Git:      &submit.RepoGit{Cfg: cfg},
-		Gate:     submit.GateExec{},
-		Producer: producer, Reviewer: reviewer,
+		Git:       &submit.RepoGit{Cfg: cfg},
+		Gate:      submit.GateExec{},
+		Provision: submit.GateProvisioner{Cfg: cfg},
+		Producer:  producer, Reviewer: reviewer,
 		Log: os.Stderr,
 	})
 	if err != nil {

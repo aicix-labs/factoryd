@@ -412,3 +412,51 @@ func TestPushLandsOnTheRemote(t *testing.T) {
 		t.Fatal("the branch did not land on the remote")
 	}
 }
+
+// exec.Command resolves a bare "git" against the PARENT's PATH before the
+// child's Env is consulted. A wrapper first on factoryd's inherited PATH would
+// run and receive the producer's credential despite the constructed
+// environment. The transport must resolve git from the declared PATH and run
+// it by absolute path; the wrapper must never execute.
+func TestGitIsResolvedFromTheDeclaredPathNotTheAmbientOne(t *testing.T) {
+	l := newLab(t)
+	trap := t.TempDir()
+	marker := filepath.Join(trap, "wrapper-ran")
+	wrapper := "#!/bin/sh\necho ran > " + marker + "\nexec /usr/bin/git \"$@\"\n"
+	if err := os.WriteFile(filepath.Join(trap, "git"), []byte(wrapper), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The wrapper is FIRST on the process's PATH...
+	t.Setenv("PATH", trap+string(os.PathListSeparator)+os.Getenv("PATH"))
+	// ...and absent from the declared one.
+	l.cfg.Gate.Env["PATH"] = "/usr/bin:/bin"
+
+	tr := l.transport("tok")
+	if strings.HasPrefix(tr.Git, trap) {
+		t.Fatalf("the transport resolved git to the ambient wrapper %s", tr.Git)
+	}
+	if !filepath.IsAbs(tr.Git) {
+		t.Fatalf("git is not an absolute path: %q", tr.Git)
+	}
+	if err := tr.Guard(); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := tr.Identity(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(marker); err == nil {
+		t.Fatal("the ambient git wrapper ran during a transport operation")
+	}
+
+	// Control: with the trap ON the declared PATH, it is what runs -- proving
+	// the test can detect the wrapper executing at all.
+	l.cfg.Gate.Env["PATH"] = trap + string(os.PathListSeparator) + "/usr/bin:/bin"
+	tr2 := l.transport("tok")
+	if !strings.HasPrefix(tr2.Git, trap) {
+		t.Fatalf("with the wrapper on the declared PATH the transport still chose %s", tr2.Git)
+	}
+	_ = tr2.Guard()
+	if _, err := os.Stat(marker); err != nil {
+		t.Fatal("the wrapper on the declared PATH did not run; the marker mechanism does not detect execution")
+	}
+}

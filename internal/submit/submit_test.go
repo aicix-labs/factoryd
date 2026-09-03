@@ -78,11 +78,35 @@ func (g *fakeGate) Run(_ context.Context, _ *config.Config, exe string, env []st
 	return g.exit, g.err
 }
 
+type fakeProvisioner struct {
+	err   error
+	paths []string
+}
+
+func (p *fakeProvisioner) Provision(_ context.Context, path string) error {
+	p.paths = append(p.paths, path)
+	return p.err
+}
+
 type fakeDriver struct {
 	scm.Driver
 	found  *scm.Change
+	after  *scm.Change // what Get returns after the push; nil means found
 	opened *scm.DraftSpec
 	calls  *[]string
+}
+
+func (d *fakeDriver) Get(_ context.Context, id scm.ChangeID) (scm.Change, error) {
+	if d.calls != nil {
+		*d.calls = append(*d.calls, "get")
+	}
+	if d.after != nil {
+		return *d.after, nil
+	}
+	if d.found != nil {
+		return *d.found, nil
+	}
+	return scm.Change{ID: id, Draft: true, State: scm.StateOpen}, nil
 }
 
 func (d *fakeDriver) FindOpenBySource(_ context.Context, branch string) (scm.Change, bool, error) {
@@ -99,7 +123,7 @@ func (d *fakeDriver) OpenDraft(_ context.Context, spec scm.DraftSpec) (scm.Chang
 		*d.calls = append(*d.calls, "open")
 	}
 	d.opened = &spec
-	return scm.Change{ID: "42", SourceBranch: spec.SourceBranch, TargetBranch: spec.TargetBranch, Draft: true, State: scm.StateOpen}, nil
+	return scm.Change{ID: "42", SourceBranch: spec.SourceBranch, TargetBranch: spec.TargetBranch, Draft: true, State: scm.StateOpen, Author: "producer-bot"}, nil
 }
 
 // ---------- fixture ----------
@@ -113,6 +137,7 @@ type lab struct {
 	git  *fakeGit
 	gate *fakeGate
 	drv  *fakeDriver
+	prov *fakeProvisioner
 	log  *bytes.Buffer
 }
 
@@ -140,8 +165,9 @@ func newLab(t *testing.T) *lab {
 	l.git = &fakeGit{commitOK: "abc123"}
 	l.gate = &fakeGate{exit: 0, calls: calls}
 	l.drv = &fakeDriver{calls: calls}
+	l.prov = &fakeProvisioner{}
 	l.deps = submit.Deps{
-		Driver: l.drv, Transport: l.tr, Git: l.git, Gate: l.gate,
+		Driver: l.drv, Transport: l.tr, Git: l.git, Gate: l.gate, Provision: l.prov,
 		Producer: scm.Identity{ID: "1", Login: "producer-bot"},
 		Reviewer: scm.Identity{ID: "2", Login: "factory-reviewer"},
 		Log:      l.log,
@@ -239,8 +265,8 @@ func TestSubmitOrdering(t *testing.T) {
 		t.Fatalf("transport calls = %s, want %s", got, want)
 	}
 	all := strings.Join(*l.gate.calls, ",")
-	if all != "gate,find,open" {
-		t.Fatalf("gate/driver order = %s, want gate,find,open", all)
+	if all != "find,gate,open" {
+		t.Fatalf("driver/gate order = %s, want find,gate,open (the existing change is checked before anything is pushed)", all)
 	}
 }
 
@@ -333,7 +359,8 @@ func TestGatePathThatCannotBeCreatedIsExit3(t *testing.T) {
 	l := newLab(t)
 	l.edit(t, "f")
 	l.declare(t, "producer/fix", "msg")
-	l.cfg.Gate.RequiredWritablePaths = []string{"/proc/factoryd-cannot-create/x"}
+	// Unresolvable: references a variable gate.env does not set.
+	l.cfg.Gate.RequiredWritablePaths = []string{"${NOPE}/cache"}
 	_, err := submit.Run(context.Background(), l.cfg, l.deps)
 	if exitOf(t, err) != submit.ExitConfig {
 		t.Fatalf("exit %d, want 3: %v", exitOf(t, err), err)
@@ -428,7 +455,7 @@ func TestSecondSubmissionUpdatesTheExistingDraft(t *testing.T) {
 	l := newLab(t)
 	l.edit(t, "f")
 	l.declare(t, "producer/fix", "msg")
-	l.drv.found = &scm.Change{ID: "7", SourceBranch: "producer/fix", Draft: true, State: scm.StateOpen}
+	l.drv.found = &scm.Change{ID: "7", SourceBranch: "producer/fix", TargetBranch: "main", Draft: true, State: scm.StateOpen, Author: "producer-bot"}
 	r, err := submit.Run(context.Background(), l.cfg, l.deps)
 	if err != nil {
 		t.Fatal(err)
@@ -438,5 +465,151 @@ func TestSecondSubmissionUpdatesTheExistingDraft(t *testing.T) {
 	}
 	if l.drv.opened != nil {
 		t.Fatal("OpenDraft was called although a draft already existed")
+	}
+}
+
+// ---------- the five findings from the second review ----------
+
+// A declared gate path is provisioned FOR the gate and proven writable BY the
+// gate right before the gate runs. CopyTree cleared the work tree; created as
+// factoryd's, build/out is root-owned and the gate's first write fails -- which
+// would be reported as a red branch. Unprovisionable is exit 3, gate never ran.
+func TestUnprovisionableGatePathIsExit3NotARedGate(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "f")
+	l.declare(t, "producer/fix", "msg")
+	l.prov.err = errors.New("factoryd-gate (uid 995) cannot write build/out after provisioning")
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if exitOf(t, err) != submit.ExitConfig {
+		t.Fatalf("exit %d, want 3: a host permission problem was reported as the producer's fault: %v", exitOf(t, err), err)
+	}
+	if l.gate.ran {
+		t.Fatal("the gate ran against a path it cannot write")
+	}
+	if len(l.prov.paths) != 1 || !strings.HasSuffix(l.prov.paths[0], "build/out") {
+		t.Fatalf("provisioned %v, want the declared path", l.prov.paths)
+	}
+}
+
+// An existing change is validated BEFORE the push. A reviewer who marked it
+// ready has taken it out of the producer's hands; pushing would put new code
+// into it.
+func TestExistingChangeNotOursRefusesBeforePush(t *testing.T) {
+	base := scm.Change{ID: "7", SourceBranch: "producer/fix", TargetBranch: "main", Draft: true, State: scm.StateOpen, Author: "producer-bot"}
+	cases := map[string]func(c *scm.Change){
+		"marked ready":   func(c *scm.Change) { c.Draft = false },
+		"wrong target":   func(c *scm.Change) { c.TargetBranch = "release" },
+		"closed":         func(c *scm.Change) { c.State = scm.StateClosed },
+		"another author": func(c *scm.Change) { c.Author = "someone-else" },
+	}
+	for name, mutate := range cases {
+		t.Run(name, func(t *testing.T) {
+			l := newLab(t)
+			l.edit(t, "f")
+			l.declare(t, "producer/fix", "msg")
+			c := base
+			mutate(&c)
+			l.drv.found = &c
+			_, err := submit.Run(context.Background(), l.cfg, l.deps)
+			if exitOf(t, err) != submit.ExitConfig {
+				t.Fatalf("exit %d, want 3: %v", exitOf(t, err), err)
+			}
+			if len(l.tr.pushed) != 0 {
+				t.Fatalf("pushed into a change that is %s", name)
+			}
+			if l.gate.ran {
+				t.Fatal("the gate ran for a change that would never be pushed")
+			}
+		})
+	}
+}
+
+// The race: the change was ours at the check and is ready by the push. The
+// push has landed; nothing here can undo it. It must be reported loudly as an
+// infrastructure failure, never as success.
+func TestChangeMarkedReadyDuringSubmissionIsReportedNotSwallowed(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "f")
+	l.declare(t, "producer/fix", "msg")
+	ours := scm.Change{ID: "7", SourceBranch: "producer/fix", TargetBranch: "main", Draft: true, State: scm.StateOpen, Author: "producer-bot"}
+	ready := ours
+	ready.Draft = false
+	l.drv.found = &ours
+	l.drv.after = &ready
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if exitOf(t, err) != submit.ExitConfig || !strings.Contains(err.Error(), "between the check and the push") {
+		t.Fatalf("exit %d: %v", exitOf(t, err), err)
+	}
+}
+
+// The provider's response to OpenDraft is validated in full.
+func TestOpenDraftResponseIsValidatedInFull(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "f")
+	l.declare(t, "producer/fix", "msg")
+	wrong := &fakeDriver{calls: l.gate.calls}
+	l.deps.Driver = wrongTargetDriver{fakeDriver: wrong}
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if exitOf(t, err) != submit.ExitConfig || !strings.Contains(err.Error(), "not the change that was requested") {
+		t.Fatalf("exit %d: %v", exitOf(t, err), err)
+	}
+}
+
+type wrongTargetDriver struct{ *fakeDriver }
+
+func (d wrongTargetDriver) OpenDraft(_ context.Context, spec scm.DraftSpec) (scm.Change, error) {
+	return scm.Change{ID: "42", SourceBranch: spec.SourceBranch, TargetBranch: "release", Draft: true, State: scm.StateOpen, Author: "producer-bot"}, nil
+}
+
+// roles.producer.workdir overrides the default; submit must read and copy
+// from where the producer actually ran, or it reports "nothing" while the
+// declared work sits elsewhere.
+func TestSubmitHonoursTheProducerWorkdirOverride(t *testing.T) {
+	l := newLab(t)
+	override := filepath.Join(l.root, "elsewhere")
+	if err := os.MkdirAll(override, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	l.cfg.Roles.Producer.Workdir = override
+	// The work is in the override, not the default.
+	if err := os.WriteFile(filepath.Join(override, "real.go"), []byte("x"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(override, submit.BranchFile), []byte("producer/fix\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(override, submit.CommitMsgFile), []byte("msg\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if r.Exit != submit.ExitSubmitted {
+		t.Fatalf("exit %d, want 0: the override's declared work was not seen", r.Exit)
+	}
+	if !exists(filepath.Join(l.cfg.Paths.SubmitRepo, "real.go")) {
+		t.Fatal("the override's tree was not the one copied")
+	}
+}
+
+// A red gate whose wake cannot be written leaves the reviewer unsignalled --
+// the stall again, one step later. It is an infrastructure failure, exit 3.
+func TestRedGateWithUnsignallableReviewerIsExit3(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "f")
+	l.declare(t, "producer/fix", "msg")
+	l.gate.exit = 1
+	// The question can be written; the wake cannot: a directory sits where
+	// the file must go.
+	if err := os.MkdirAll(filepath.Join(l.cfg.InboxDir(), "wake"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if exitOf(t, err) != submit.ExitConfig || !strings.Contains(err.Error(), "could not be signalled") {
+		t.Fatalf("exit %d: %v", exitOf(t, err), err)
+	}
+	if !exists(filepath.Join(l.cfg.InboxDir(), "question.md")) {
+		t.Fatal("the question was not written before the wake failed")
 	}
 }

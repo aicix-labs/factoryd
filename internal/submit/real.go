@@ -5,6 +5,7 @@ import (
 	"context"
 	"fmt"
 	"io"
+	"os"
 	"os/exec"
 	"os/user"
 	"strconv"
@@ -13,6 +14,7 @@ import (
 	"time"
 
 	"github.com/aicix-labs/factoryd/internal/config"
+	"github.com/aicix-labs/factoryd/internal/doctor"
 	"github.com/aicix-labs/factoryd/internal/gittransport"
 )
 
@@ -31,7 +33,11 @@ func (g *RepoGit) run(ctx context.Context, args ...string) (string, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, timeout)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "git", args...)
+	exe, err := gittransport.GitBinary(g.Cfg)
+	if err != nil {
+		return "", err
+	}
+	cmd := exec.CommandContext(ctx, exe, args...)
 	cmd.Dir = g.Cfg.Paths.SubmitRepo
 	cmd.Env = gittransport.Environment(g.Cfg)
 	var out, errb bytes.Buffer
@@ -153,4 +159,33 @@ func asExitError(err error, target **exec.ExitError) bool {
 		err = u.Unwrap()
 	}
 	return false
+}
+
+// GateProvisioner creates a declared gate path, gives it to the gate user, and
+// proves the gate can write it by attempting a write as that identity -- the
+// same probe doctor uses, immediately before the gate runs rather than at some
+// earlier moment the provisioning has since overtaken.
+type GateProvisioner struct {
+	Cfg *config.Config
+}
+
+func (g GateProvisioner) Provision(ctx context.Context, path string) error {
+	if err := os.MkdirAll(path, 0o755); err != nil {
+		return err
+	}
+	prober, err := doctor.NewProber(g.Cfg.Gate.RunAs)
+	if err != nil {
+		return err
+	}
+	if err := prober.Own(path); err != nil {
+		return fmt.Errorf("giving %s to the gate: %w", path, err)
+	}
+	can, err := prober.CanWrite(ctx, path)
+	if err != nil {
+		return fmt.Errorf("undecided whether the gate can write %s: %w", path, err)
+	}
+	if !can {
+		return fmt.Errorf("%s cannot write %s after provisioning; the gate's first write would fail and be misreported as a red branch", prober.Describe(), path)
+	}
+	return nil
 }

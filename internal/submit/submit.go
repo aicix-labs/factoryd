@@ -107,12 +107,26 @@ type GateRunner interface {
 	Run(ctx context.Context, cfg *config.Config, exe string, env []string, out io.Writer) (exit int, err error)
 }
 
+// Provisioner prepares a declared gate path for the gate identity and proves
+// it: created, owned by the gate, and writable BY the gate -- verified by a
+// write attempt as that identity, immediately before the gate runs.
+//
+// CopyTree clears the work tree, so a relative declared path is recreated
+// each submission. Created by MkdirAll alone it is factoryd's, root-owned,
+// and the gate's first write fails -- which the gate reports as a non-zero
+// exit, which submit would report as a red branch. A permission error on the
+// host, presented as the producer's fault: exactly the misreport §9.6 forbids.
+type Provisioner interface {
+	Provision(ctx context.Context, path string) error
+}
+
 // Deps are everything Run touches in the world.
 type Deps struct {
 	Driver    scm.Driver
 	Transport Transport
 	Git       Git
 	Gate      GateRunner
+	Provision Provisioner
 	// Reviewer resolves the reviewer's identity, for the distinctness check.
 	Reviewer scm.Identity
 	// Producer is the producer's API identity, already resolved.
@@ -133,7 +147,7 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	if deps.Now == nil {
 		deps.Now = func() time.Time { return time.Now().UTC() }
 	}
-	if deps.Driver == nil || deps.Transport == nil || deps.Git == nil || deps.Gate == nil {
+	if deps.Driver == nil || deps.Transport == nil || deps.Git == nil || deps.Gate == nil || deps.Provision == nil {
 		return Result{}, fail(ExitConfig, "submit: missing a dependency")
 	}
 
@@ -156,7 +170,11 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	fmt.Fprintf(log, "identity: %s (git and API agree)\n", deps.Producer)
 
 	// 2. Intent. The producer declares it in plain files; submit never guesses.
-	work := cfg.Paths.ProducerWorkdir
+	// The directory the producer actually ran in. roles.producer.workdir may
+	// override paths.producer_workdir; the supervisor and doctor honour it,
+	// and reading the default here would report "nothing to submit" while
+	// the declared work sat elsewhere.
+	work := cfg.TurnWorkdir("producer")
 	msg, hasWork, err := readControl(filepath.Join(work, CommitMsgFile))
 	if err != nil {
 		return Result{}, wrap(ExitConfig, err, "reading %s", CommitMsgFile)
@@ -190,7 +208,22 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	}
 	fmt.Fprintf(log, "intent: branch %s, message %q\n", branch, firstLine(msg))
 
-	// 3. Materialise into the repository the producer cannot write.
+	// 3. An existing change on this branch is validated BEFORE anything is
+	// pushed to it. The lookup keys on the source branch; that alone says
+	// nothing about whether the change is still ours to push to. If a
+	// reviewer has marked it ready, a push would put new code into a change
+	// that has left the producer's hands.
+	existing, found, err := deps.Driver.FindOpenBySource(ctx, branch)
+	if err != nil {
+		return Result{}, wrap(ExitConfig, err, "looking for an open change on %s", branch)
+	}
+	if found {
+		if err := changeIsOurs(existing, branch, cfg.TargetBranch, deps.Producer); err != nil {
+			return Result{}, wrap(ExitConfig, err, "an open change already exists on %s and is not one this producer may update", branch)
+		}
+	}
+
+	// 4. Materialise into the repository the producer cannot write.
 	if err := deps.Transport.Guard(); err != nil {
 		return Result{}, wrap(ExitConfig, err, "the submit repository failed its guard before any git ran")
 	}
@@ -212,15 +245,18 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	}
 	fmt.Fprintf(log, "materialised: %s at %s\n", branch, sha)
 
-	// 4. The gate's paths, re-checked immediately before the gate runs: a
-	// missing one exits 3, not 5. A misconfigured host is not a red branch.
+	// 5. The gate's paths, provisioned FOR THE GATE and proven writable BY the
+	// gate immediately before it runs. CopyTree just cleared the work tree,
+	// so a relative path no longer exists; created as factoryd's it would be
+	// unwritable by the gate, and the gate's failure would be reported as a
+	// red branch. A missing or unprovisionable path exits 3, not 5.
 	for _, p := range cfg.Gate.RequiredWritablePaths {
 		resolved, err := cfg.ResolveGatePath(p)
 		if err != nil {
 			return Result{}, wrap(ExitConfig, err, "gate path %s", p)
 		}
-		if err := os.MkdirAll(resolved, 0o755); err != nil {
-			return Result{}, wrap(ExitConfig, err, "gate path %s cannot be created", p)
+		if err := deps.Provision.Provision(ctx, resolved); err != nil {
+			return Result{}, wrap(ExitConfig, err, "gate path %s could not be provisioned for the gate", p)
 		}
 	}
 	exe, err := config.LookPathIn(cfg.Gate.Env["PATH"], cfg.Gate.Command[0])
@@ -228,7 +264,7 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		return Result{}, wrap(ExitConfig, err, "gate command")
 	}
 
-	// 5. The gate, as the gate's own identity, in the constructed environment.
+	// 6. The gate, as the gate's own identity, in the constructed environment.
 	env := cfg.GateEnv(map[string]string{
 		"FACTORYD_FACTORY": cfg.Name, "FACTORYD_ROLE": "gate",
 		"FACTORYD_BRANCH": branch, "FACTORYD_TARGET_BRANCH": cfg.TargetBranch,
@@ -248,25 +284,37 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		if err := os.WriteFile(filepath.Join(cfg.InboxDir(), "question.md"), []byte(q), 0o644); err != nil {
 			return Result{}, wrap(ExitConfig, err, "gate red, and the question could not be written")
 		}
-		_ = touch(filepath.Join(cfg.InboxDir(), "wake"))
+		if err := touch(filepath.Join(cfg.InboxDir(), "wake")); err != nil {
+			// The reviewer would never learn of the question. A red gate
+			// nobody is told about is the stall again, one step later.
+			return Result{}, wrap(ExitConfig, err, "gate red, and the reviewer could not be signalled")
+		}
 		return Result{Exit: ExitGateRed, Reason: fmt.Sprintf("gate exited %d; not pushing a red branch", gateExit), Branch: branch}, nil
 	}
 	fmt.Fprintf(log, "gate: green\n")
 
-	// 6. Push, through the transport's own guard, as the producer.
+	// 7. Push, through the transport's own guard, as the producer.
 	if err := deps.Transport.Push(ctx, "+refs/heads/"+branch+":refs/heads/"+branch); err != nil {
 		return Result{}, wrap(ExitConfig, err, "pushing %s", branch)
 	}
 	fmt.Fprintf(log, "pushed: %s\n", branch)
 
-	// 7. Create-or-update the Draft. Idempotent on the branch.
-	existing, found, err := deps.Driver.FindOpenBySource(ctx, branch)
-	if err != nil {
-		return Result{}, wrap(ExitConfig, err, "looking for an open change on %s", branch)
-	}
+	// 8. Create-or-update the Draft, idempotent on the branch.
 	var change scm.Change
 	if found {
-		change = existing
+		// The window between the pre-push check and the push is real: a
+		// reviewer can mark the change ready in it. Re-read it now. If it
+		// changed underneath the push, the push has already landed on a
+		// change that left the producer's hands -- unrecoverable here, so it
+		// is reported as an infrastructure failure, loudly, not as success.
+		now, err := deps.Driver.Get(ctx, existing.ID)
+		if err != nil {
+			return Result{}, wrap(ExitConfig, err, "re-reading %s after the push", existing.ID)
+		}
+		if err := changeIsOurs(now, branch, cfg.TargetBranch, deps.Producer); err != nil {
+			return Result{}, wrap(ExitConfig, err, "change %s changed state between the check and the push; the push landed on it and a human must look", existing.ID)
+		}
+		change = now
 		fmt.Fprintf(log, "draft: updated %s\n", change.ID)
 	} else {
 		change, err = deps.Driver.OpenDraft(ctx, scm.DraftSpec{
@@ -276,10 +324,15 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		if err != nil {
 			return Result{}, wrap(ExitConfig, err, "opening the draft for %s", branch)
 		}
+		// The provider's response is validated in full, not just its draft
+		// flag: the change it opened must be the one that was asked for.
+		if err := changeIsOurs(change, branch, cfg.TargetBranch, deps.Producer); err != nil {
+			return Result{}, wrap(ExitConfig, err, "the provider opened %s but it is not the change that was requested", change.ID)
+		}
 		fmt.Fprintf(log, "draft: opened %s\n", change.ID)
 	}
 
-	// 8. Signal the reviewer and retire the control files.
+	// 9. Signal the reviewer and retire the control files.
 	if err := touch(filepath.Join(cfg.InboxDir(), "wake")); err != nil {
 		return Result{}, wrap(ExitConfig, err, "signalling the reviewer")
 	}
@@ -352,4 +405,24 @@ func authorEmail(id scm.Identity, cfg *config.Config) string {
 
 func touch(path string) error {
 	return os.WriteFile(path, []byte(time.Now().UTC().Format(time.RFC3339)+"\n"), 0o644)
+}
+
+// changeIsOurs is what makes an existing or newly opened change safe to push
+// to: open, still a draft, on this branch, into the configured target, and
+// authored by this producer. Any one of these failing means the change is not
+// the producer's to update.
+func changeIsOurs(c scm.Change, branch, target string, producer scm.Identity) error {
+	switch {
+	case c.State != scm.StateOpen:
+		return fmt.Errorf("change %s is %v, not open", c.ID, c.State)
+	case !c.Draft:
+		return fmt.Errorf("change %s is no longer a draft; a reviewer has marked it ready and it has left the producer's hands", c.ID)
+	case c.SourceBranch != branch:
+		return fmt.Errorf("change %s is from %q, not %q", c.ID, c.SourceBranch, branch)
+	case c.TargetBranch != target:
+		return fmt.Errorf("change %s targets %q, not the configured %q", c.ID, c.TargetBranch, target)
+	case c.Author != "" && producer.Login != "" && c.Author != producer.Login:
+		return fmt.Errorf("change %s was opened by %q, not by this producer %q", c.ID, c.Author, producer.Login)
+	}
+	return nil
 }
