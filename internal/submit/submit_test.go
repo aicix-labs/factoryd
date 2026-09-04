@@ -1166,3 +1166,37 @@ func TestGateIsRefusedIfProvisioningOpenedTheHome(t *testing.T) {
 		t.Fatalf("gate ran=%v pushed=%v after the home was opened by provisioning", l.gate.ran, l.tr.pushed)
 	}
 }
+
+// The differing-CWD regression: a relative producer HOME, with submit
+// running from a directory that is not the producer workdir. The probe
+// must not be made against the wrong directory and come back green;
+// submit refuses the home as relative, before the gate.
+func TestRelativeProducerHomeIsRefusedFromADifferentCWD(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "fix")
+	l.cfg.Roles.Producer.Env = map[string]string{"PATH": "/usr/bin", "HOME": "private"}
+	// Plant a closed "private" under the producer workdir (what the turn
+	// means) AND an open one under submit's own cwd (what a naive probe
+	// would see).
+	if err := os.MkdirAll(filepath.Join(l.work, "private"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(elsewhere, "private"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wd, _ := os.Getwd()
+	if err := os.Chdir(elsewhere); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(wd) })
+	l.prov.traversable = false // a naive probe would report green
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if err == nil || exitOf(t, err) != submit.ExitConfig || !strings.Contains(err.Error(), "relative") {
+		t.Fatalf("err=%v; a relative home must be refused, not probed in the wrong directory", err)
+	}
+	if len(l.prov.probed) != 0 || l.gate.ran || len(l.tr.pushed) != 0 {
+		t.Fatalf("probed=%v gate=%v pushed=%v", l.prov.probed, l.gate.ran, l.tr.pushed)
+	}
+}

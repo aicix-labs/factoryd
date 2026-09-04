@@ -957,3 +957,48 @@ func TestAlertProbeActuallyDelivers(t *testing.T) {
 		t.Fatalf("alert file does not hold the probe:\n%s", body)
 	}
 }
+
+// A relative producer HOME names a directory under the producer workdir to
+// the turn and a directory under doctor's own working directory to a probe.
+// It is never probed: doctor fails the check outright, and the gate prober
+// is not asked about a path it would resolve in the wrong place.
+func TestRelativeProducerHomeIsAFailureNotAProbe(t *testing.T) {
+	cfg := fixture(t)
+	cfg.Roles.Producer.Env["HOME"] = "private"
+	var asked []string
+	deps := healthyDeps(cfg, nil)
+	inner := deps.NewProber
+	deps.NewProber = func(ra *config.RunAs) (doctor.Prober, error) {
+		p, err := inner(ra)
+		if err != nil {
+			return nil, err
+		}
+		return recordingProber{p, &asked}, nil
+	}
+	r := doctor.RunWith(context.Background(), cfg, deps)
+	failed := failedNames(r)
+	found := false
+	for _, n := range failed {
+		if n == "producer home" {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("a relative home did not fail doctor; failures=%v\n%s", failed, r)
+	}
+	for _, a := range asked {
+		if a == "private" || strings.HasSuffix(a, "/private") {
+			t.Fatalf("the gate prober was asked to traverse the relative home (%q), resolved in the wrong directory", a)
+		}
+	}
+}
+
+type recordingProber struct {
+	doctor.Prober
+	asked *[]string
+}
+
+func (p recordingProber) CanTraverse(ctx context.Context, path string) (bool, error) {
+	*p.asked = append(*p.asked, path)
+	return p.Prober.CanTraverse(ctx, path)
+}

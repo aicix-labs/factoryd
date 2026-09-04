@@ -285,7 +285,15 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	// after. So the gate identity is asked NOW, with the producer quiesced,
 	// whether it can traverse that home -- and a yes is a boundary failure
 	// (exit 3), not a red branch: nothing the producer wrote is judged.
-	if home := cfg.Roles.Producer.Env["HOME"]; home != "" {
+	// The home comes through one helper that refuses a relative value: to
+	// the turn a relative HOME is under the producer workdir; to this
+	// process it would be under its own working directory, and a probe
+	// green about the wrong directory is worse than none.
+	home, herr := cfg.ProducerHome()
+	if herr != nil {
+		return Result{}, wrap(ExitConfig, herr, "producer home")
+	}
+	if home != "" {
 		can, err := deps.Provision.GateCanTraverse(ctx, home)
 		if err != nil {
 			return Result{}, wrap(ExitConfig, err, "probing whether the gate can traverse the producer's home %s", home)
@@ -302,7 +310,7 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	// declared path, say -- would grant the gate exactly the traversal
 	// just refused, after the probe and before the gate. Judged before any
 	// ownership changes; Validate's lexical check is the first lock.
-	if home := cfg.Roles.Producer.Env["HOME"]; home != "" {
+	if home != "" {
 		physHome := gittransport.PhysicalPrefix(home)
 		for _, p := range cfg.Gate.RequiredWritablePaths {
 			resolved, err := cfg.ResolveGatePath(p)
@@ -326,7 +334,7 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	// 5c. Defense in depth: provisioning changed ownership under the gate;
 	// the boundary is asked again after it, so a path that reached the home
 	// by a route neither lock saw still refuses the gate.
-	if home := cfg.Roles.Producer.Env["HOME"]; home != "" {
+	if home != "" {
 		can, err := deps.Provision.GateCanTraverse(ctx, home)
 		if err != nil {
 			return Result{}, wrap(ExitConfig, err, "re-probing the producer's home %s after provisioning", home)

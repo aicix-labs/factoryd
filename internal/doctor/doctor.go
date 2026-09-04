@@ -277,7 +277,11 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 		// nor listable and passes a read probe, while producer-authored gate
 		// code that knows the path $HOME/.codex/auth.json reads it all the
 		// same. Search permission is the exposure.
-		if home := cfg.Roles.Producer.Env["HOME"]; home != "" {
+		if home, herr := cfg.ProducerHome(); herr != nil {
+			// Never probed against the wrong directory: a relative home is a
+			// failure, not a skipped check.
+			add("producer home", herr, cfg.Roles.Producer.Env["HOME"])
+		} else if home != "" {
 			if can, err := gate.CanTraverse(ctx, home); err != nil {
 				add("gate cannot traverse producer home", fmt.Errorf("undecided: %v", err), home)
 			} else if can {
