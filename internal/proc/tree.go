@@ -9,10 +9,13 @@ import (
 	"strings"
 )
 
-// Node is one process in a tree read from /proc.
+// Node is one process in a tree read from /proc. It carries the executable
+// name (/proc/<pid>/comm), never the command line: arguments routinely hold
+// tokens and sensitive input, and the status page that shows this tree is
+// unauthenticated by design.
 type Node struct {
 	PID      int     `json:"pid"`
-	Command  string  `json:"command"`
+	Exe      string  `json:"exe"`
 	Children []*Node `json:"children,omitempty"`
 }
 
@@ -35,14 +38,14 @@ func Tree(pid int) (*Node, error) {
 			continue
 		}
 		byParent[ppid] = append(byParent[ppid], p)
-		cmd[p] = commandOf(p)
+		cmd[p] = exeOf(p)
 	}
 	if _, ok := cmd[pid]; !ok {
 		return nil, nil
 	}
 	var build func(int, int) *Node
 	build = func(p, depth int) *Node {
-		n := &Node{PID: p, Command: cmd[p]}
+		n := &Node{PID: p, Exe: cmd[p]}
 		if depth > 32 {
 			return n
 		}
@@ -54,13 +57,12 @@ func Tree(pid int) (*Node, error) {
 	return build(pid, 0), nil
 }
 
-func commandOf(pid int) string {
-	b, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "cmdline"))
-	if err != nil || len(b) == 0 {
-		if c, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "comm")); err == nil {
-			return strings.TrimSpace(string(c))
-		}
+// exeOf is the kernel's short executable name. It is what a process is,
+// not what it was told; the latter is never read here.
+func exeOf(pid int) string {
+	c, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "comm"))
+	if err != nil {
 		return ""
 	}
-	return strings.TrimRight(strings.ReplaceAll(string(b), "\x00", " "), " ")
+	return strings.TrimSpace(string(c))
 }

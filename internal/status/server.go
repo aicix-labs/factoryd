@@ -105,6 +105,8 @@ func Text(s Snapshot) string {
 		sb.WriteString("\n")
 	}
 	switch {
+	case s.Health.Err != "":
+		fmt.Fprintf(&sb, "health    UNREADABLE: %s\n", s.Health.Err)
 	case !s.Health.Present:
 		sb.WriteString("health    none\n")
 	default:
@@ -195,7 +197,7 @@ small{color:#666}
 <h2>Right now</h2>
 {{template "roles" .}}
 <h2>Health</h2>
-{{if not .Health.Present}}<p class="bad">no health document</p>{{else}}
+{{if .Health.Err}}<p class="bad">unreadable: {{.Health.Err}}</p>{{else if not .Health.Present}}<p class="bad">no health document</p>{{else}}
 <p class="{{if .Health.Healthy}}ok{{else}}bad{{end}}">{{if .Health.Healthy}}healthy{{else}}{{len .Health.Findings}} finding(s){{end}}{{if .Health.Stale}} <span class="warn">STALE</span>{{end}} <small>{{.Health.AgeText}} ago</small></p>
 {{if .Health.Findings}}<ul>{{range .Health.Findings}}<li><code>{{.Key}}</code> {{.Summary}}</li>{{end}}</ul>{{end}}
 <table>{{range .Health.Volumes}}<tr><td>volume</td><td><code>{{.Path}}</code></td><td>{{pct .FreePercent}} free</td></tr>{{end}}
@@ -216,6 +218,6 @@ small{color:#666}
 {{if or $v.Spin $v.Fails}}<br><small>spin {{$v.Spin}}, fail streak {{$v.Fails}}</small>{{end}}
 {{if $v.Tree}}<div class="tree">{{template "tree" $v.Tree}}</div>{{end}}
 </td></tr>{{end}}</table>{{end}}
-{{define "tree"}}{{.PID}} {{.Command}}{{range .Children}}
+{{define "tree"}}{{.PID}} {{.Exe}}{{range .Children}}
   └ {{template "tree" .}}{{end}}{{end}}
 `))

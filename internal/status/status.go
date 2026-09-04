@@ -48,14 +48,22 @@ type Snapshot struct {
 	Errors []string `json:"errors,omitempty"`
 }
 
+// SupervisorView is the supervisor handle as the page shows it: the pid and
+// when it started. Not proc.Ref itself, whose descriptive Command field is
+// the supervisor's own argv -- and the page is unauthenticated.
+type SupervisorView struct {
+	PID       int       `json:"pid"`
+	StartedAt time.Time `json:"started_at"`
+}
+
 // RoleView is one role's supervisor and turn.
 type RoleView struct {
-	Supervisor *proc.Ref  `json:"supervisor,omitempty"`
-	Alive      *bool      `json:"alive,omitempty"` // nil when there is no supervisor to ask about
-	Tree       *proc.Node `json:"process_tree,omitempty"`
-	WatchMode  string     `json:"watch_mode,omitempty"`
-	Halted     bool       `json:"halted"`
-	HaltReason string     `json:"halt_reason,omitempty"`
+	Supervisor *SupervisorView `json:"supervisor,omitempty"`
+	Alive      *bool           `json:"alive,omitempty"` // nil when there is no supervisor to ask about
+	Tree       *proc.Node      `json:"process_tree,omitempty"`
+	WatchMode  string          `json:"watch_mode,omitempty"`
+	Halted     bool            `json:"halted"`
+	HaltReason string          `json:"halt_reason,omitempty"`
 
 	Turn    *TurnView     `json:"turn,omitempty"`
 	Pending []PendingView `json:"pending,omitempty"`
@@ -82,9 +90,13 @@ type PendingView struct {
 	AgeText string        `json:"age_text"`
 }
 
-// HealthView is the health document as the page sees it.
+// HealthView is the health document as the page sees it. Absent and
+// unreadable are different answers: "the tick never ran" and "there is a
+// record I cannot read" call for different actions, and the second is
+// reported as an error the page shows.
 type HealthView struct {
 	Present  bool                 `json:"present"`
+	Err      string               `json:"error,omitempty"`
 	Stale    bool                 `json:"stale"` // older than two health intervals
 	AgeText  string               `json:"age_text,omitempty"`
 	Healthy  bool                 `json:"healthy"`
@@ -120,6 +132,12 @@ type Collector struct {
 
 	mu      sync.Mutex
 	changes ChangesView
+	// attempted is when the provider was last ASKED, whatever it answered.
+	// The throttle keys on it, not on the last good list's time: after a
+	// failure that time is already older than the TTL, and a throttle keyed
+	// on it would ask again on every reload -- precisely while the
+	// provider is down.
+	attempted time.Time
 }
 
 // New returns a collector for cfg.
@@ -154,8 +172,9 @@ func (c *Collector) Collect(ctx context.Context) Snapshot {
 	for _, r := range state.Roles {
 		rs := st.Role(r)
 		role := string(r)
-		v := RoleView{Supervisor: rs.Supervisor, WatchMode: rs.WatchMode, Halted: rs.Halted, HaltReason: rs.HaltReason, Spin: rs.SpinCount, Fails: rs.FailStreak}
+		v := RoleView{WatchMode: rs.WatchMode, Halted: rs.Halted, HaltReason: rs.HaltReason, Spin: rs.SpinCount, Fails: rs.FailStreak}
 		if rs.Supervisor != nil {
+			v.Supervisor = &SupervisorView{PID: rs.Supervisor.PID, StartedAt: rs.Supervisor.StartedAt}
 			alive, err := c.deps.Alive(*rs.Supervisor)
 			if err != nil {
 				s.Errors = append(s.Errors, role+" liveness: "+err.Error())
@@ -189,6 +208,9 @@ func (c *Collector) Collect(ctx context.Context) Snapshot {
 	}
 
 	s.Health = c.readHealth(now)
+	if s.Health.Err != "" {
+		s.Errors = append(s.Errors, "health document: "+s.Health.Err)
+	}
 	s.Changes = c.readChanges(ctx, now)
 	s.NeedsMe = needsMe(c.cfg, s, st)
 	s.Working = working(s)
@@ -202,12 +224,15 @@ func turnView(t *state.Turn, now time.Time) *TurnView {
 
 func (c *Collector) readHealth(now time.Time) HealthView {
 	body, err := os.ReadFile(c.cfg.HealthPath())
-	if err != nil {
+	if errors.Is(err, os.ErrNotExist) {
 		return HealthView{}
+	}
+	if err != nil {
+		return HealthView{Present: true, Err: err.Error()}
 	}
 	var rep health.Report
 	if err := json.Unmarshal(body, &rep); err != nil {
-		return HealthView{}
+		return HealthView{Present: true, Err: "not valid JSON: " + err.Error()}
 	}
 	age := now.Sub(rep.At)
 	return HealthView{Present: true, Stale: age > 2*time.Duration(c.cfg.Health.IntervalSeconds)*time.Second, AgeText: ageText(age),
@@ -220,9 +245,10 @@ func (c *Collector) readChanges(ctx context.Context, now time.Time) ChangesView 
 	}
 	c.mu.Lock()
 	defer c.mu.Unlock()
-	if !c.changes.AsOf.IsZero() && now.Sub(c.changes.AsOf) < c.deps.ChangesTTL {
+	if !c.attempted.IsZero() && now.Sub(c.attempted) < c.deps.ChangesTTL {
 		return c.changes
 	}
+	c.attempted = now
 	open, err := c.deps.ListOpen(ctx)
 	v := ChangesView{AsOf: now}
 	if err != nil {
@@ -259,7 +285,7 @@ func needsMe(cfg *config.Config, s Snapshot, st *state.State) []string {
 		case v.Supervisor == nil:
 			out = append(out, fmt.Sprintf("%s has never been supervised", r))
 		case v.Alive != nil && !*v.Alive:
-			out = append(out, fmt.Sprintf("%s supervisor %s is dead and did not halt", r, v.Supervisor))
+			out = append(out, fmt.Sprintf("%s supervisor pid %d is dead and did not halt", r, v.Supervisor.PID))
 		}
 	}
 	if s.Verdict != nil && s.Verdict.Kind == state.VerdictOperatorGated {
@@ -269,6 +295,8 @@ func needsMe(cfg *config.Config, s Snapshot, st *state.State) []string {
 		out = append(out, "a question is waiting in the inbox")
 	}
 	switch {
+	case s.Health.Err != "":
+		// already listed under "status could not read"
 	case !s.Health.Present:
 		out = append(out, "no health document; the health tick has never run here")
 	case s.Health.Stale:
@@ -285,7 +313,7 @@ func needsMe(cfg *config.Config, s Snapshot, st *state.State) []string {
 }
 
 func working(s Snapshot) bool {
-	if len(s.Errors) > 0 || !s.Health.Present || s.Health.Stale || !s.Health.Healthy {
+	if len(s.Errors) > 0 || !s.Health.Present || s.Health.Err != "" || s.Health.Stale || !s.Health.Healthy {
 		return false
 	}
 	for _, r := range state.Roles {

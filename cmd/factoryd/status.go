@@ -92,6 +92,11 @@ func runStatus(args []string) int {
 		fmt.Fprintf(os.Stderr, "factoryd status: listen %s: %v\n", *serve, err)
 		return exitConfig
 	}
+	if host, _, err := net.SplitHostPort(*serve); err == nil {
+		if ip := net.ParseIP(host); host == "" || (ip != nil && !ip.IsLoopback()) {
+			fmt.Fprintf(os.Stderr, "factoryd status: WARNING: %s is not a loopback address and the page has no authentication; anyone who can reach it sees the factory's state\n", *serve)
+		}
+	}
 	hs := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()

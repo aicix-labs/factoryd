@@ -947,6 +947,19 @@ Implementation notes (step 7):
 - One-shot `factoryd status --config f` prints the same document as text and
   exits 0 working / 1 not; `--json` prints the endpoint's document; `--serve`
   hosts both. Several `--config` flags make one page.
+- **The page is unauthenticated, so nothing that reaches it may carry a command
+  line.** Arguments routinely hold tokens. The process tree shows each process by
+  executable name (`/proc/<pid>/comm`), never `cmdline`; the supervisor is shown
+  as pid and start time, never as the `proc.Ref` whose descriptive `Command` is
+  its own argv. `--serve` on a non-loopback address prints a warning saying so.
+- **Absent and unreadable are different answers.** No health document means the
+  tick never ran; a health document that exists and cannot be read or parsed is
+  named as such, is an error the page shows, and means *not working* — it must
+  not read as "the tick never ran here".
+- **The provider throttle keys on the last attempt, not the last good answer.**
+  After a failed refresh the last good list's time is already older than the
+  TTL; a throttle keyed on it would ask the provider on every reload — precisely
+  while the provider is down.
 
 ---
 
@@ -1034,6 +1047,9 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §8 read-only | every file under the factory root is byte- and mtime-identical after collecting and serving, with triggers, a question and a stop sentinel present to tempt consumption; POST is refused | the page and the JSON rendered, the provider was asked once |
 | §8 needs me | a dead supervisor, a halt, a stop sentinel, never supervised, an operator-gated verdict, a waiting question, no / stale / unhealthy health, an unreachable provider, an unreadable state document → each named | a healthy factory has an empty list and reads *working* |
 | §8 provider down | a failed refresh keeps the last good list visible with its own time beside the error | a refresh after the TTL is made; a reload inside it is not |
+| §8 throttle after failure | a failed refresh followed by reloads inside the TTL → the provider is asked **no** further time; after the TTL, once | — the positive control is the refresh after the TTL |
+| §8 unreadable health | a health document that is not JSON, or cannot be read → named, an error, *not working*, and not "the tick never ran" | an absent document reads as absent |
+| §8 no command lines | a secret planted in the supervisor's recorded argv and in a live child's arguments appears in none of HTML, JSON or text | the child **is** shown, by pid and executable name |
 | §7 root replaced after doctor | the root itself, or its renamed parent, replaced by a symlink after `doctor` passed → `cache_unsafe`, nothing deleted | — |
 | §7 symlink entry | a symlink entry is removed as a link; its target is intact | the link itself is gone and counted |
 | §7 could not look | a volume that will not stat, a provider that will not answer, a corrupt state document → `factoryd health` exits **3** | findings alone exit 1; a live supervisor exits 0 |

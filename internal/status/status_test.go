@@ -4,10 +4,12 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -50,7 +52,7 @@ func newLab(t *testing.T) *lab {
 	l.deps = status.Deps{
 		Alive: func(r proc.Ref) (bool, error) { return l.alive[r.PID], nil },
 		Tree: func(pid int) (*proc.Node, error) {
-			return &proc.Node{PID: pid, Command: "factoryd supervise", Children: []*proc.Node{{PID: pid + 1, Command: "claude -p"}}}, nil
+			return &proc.Node{PID: pid, Exe: "factoryd", Children: []*proc.Node{{PID: pid + 1, Exe: "claude"}}}, nil
 		},
 		Now: func() time.Time { return l.now },
 		ListOpen: func(context.Context) ([]scm.Change, error) {
@@ -193,7 +195,7 @@ func TestNeedsMeNamesEachCondition(t *testing.T) {
 		want         string
 		stillWorking bool
 	}{
-		"dead supervisor": {func(l *lab, t *testing.T) { l.alive[100] = false }, "producer supervisor pid 100 (start token t) is dead", false},
+		"dead supervisor": {func(l *lab, t *testing.T) { l.alive[100] = false }, "producer supervisor pid 100 is dead", false},
 		"halted": {func(l *lab, t *testing.T) {
 			l.state(t, func(s *state.State) { r := s.Role(state.RoleReviewer); r.Halted, r.HaltReason = true, "spin abort" })
 		}, "reviewer supervisor halted: spin abort", false},
@@ -315,7 +317,7 @@ func TestJSONEndpointMatchesSnapshot(t *testing.T) {
 	page, _ := http.Get(ts.URL + "/")
 	body, _ := io.ReadAll(page.Body)
 	page.Body.Close()
-	for _, want := range []string{"NOT WORKING", "reviewer supervisor", "supervisor DEAD", "producer/fix-abc", "factoryd supervise"} {
+	for _, want := range []string{"NOT WORKING", "reviewer supervisor", "supervisor DEAD", "producer/fix-abc", "factoryd"} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("page lacks %q:\n%s", want, body)
 		}
@@ -325,5 +327,108 @@ func TestJSONEndpointMatchesSnapshot(t *testing.T) {
 func TestServerRefusesNoFactories(t *testing.T) {
 	if _, err := status.NewServer(nil); !errors.Is(err, status.ErrNoFactories) {
 		t.Fatalf("err=%v", err)
+	}
+}
+
+// After a failed refresh the throttle must still hold: a reload inside the
+// TTL asks the provider nothing. Keyed on the last good list's time it
+// would ask on every reload -- precisely while the provider is down.
+func TestFailedRefreshDoesNotDisableTheThrottle(t *testing.T) {
+	l := newLab(t)
+	c := status.New(l.cfg, l.deps)
+	c.Collect(context.Background()) // good, lists=1
+	l.now = l.now.Add(2 * time.Minute)
+	l.listErr = errors.New("502")
+	c.Collect(context.Background()) // refresh fails, lists=2
+	l.now = l.now.Add(10 * time.Second)
+	for i := 0; i < 5; i++ {
+		c.Collect(context.Background())
+	}
+	if l.lists != 2 {
+		t.Fatalf("provider asked %d times; reloads inside the TTL after a failure must not ask again", l.lists)
+	}
+	l.now = l.now.Add(time.Minute)
+	c.Collect(context.Background())
+	if l.lists != 3 {
+		t.Fatalf("provider asked %d times; after the TTL it must be asked again", l.lists)
+	}
+}
+
+// A health record that exists and cannot be read is not "the tick never
+// ran". It is named, it is an error the page shows, and the factory is
+// not working.
+func TestUnreadableHealthIsNamedNotAbsent(t *testing.T) {
+	l := newLab(t)
+	if err := os.WriteFile(l.cfg.HealthPath(), []byte("{not json"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s := l.collect()
+	if !s.Health.Present || s.Health.Err == "" || s.Working {
+		t.Fatalf("health=%+v working=%v", s.Health, s.Working)
+	}
+	joined := strings.Join(s.NeedsMe, "\n")
+	if strings.Contains(joined, "never run here") || !strings.Contains(joined, "could not read: health document") {
+		t.Fatalf("needs=%v", s.NeedsMe)
+	}
+	if !strings.Contains(status.Text(s), "UNREADABLE") {
+		t.Fatalf("text:\n%s", status.Text(s))
+	}
+	if os.Getuid() != 0 {
+		if err := os.Chmod(l.cfg.HealthPath(), 0); err != nil {
+			t.Fatal(err)
+		}
+		s = l.collect()
+		if !s.Health.Present || !strings.Contains(s.Health.Err, "permission denied") || s.Working {
+			t.Fatalf("health=%+v working=%v", s.Health, s.Working)
+		}
+	}
+}
+
+// The page is unauthenticated by design, so nothing that reaches it may
+// carry a command line. A secret planted in the supervisor's recorded argv
+// and in a live child's arguments must appear in none of HTML, JSON, or
+// text; the child is shown by executable name only.
+func TestNoCommandLineReachesAnyOutput(t *testing.T) {
+	l := newLab(t)
+	const secret = "SECRET-TOKEN-7f3a9c"
+	child := exec.Command("sh", "-c", "sleep 30 # "+secret)
+	if err := child.Start(); err != nil {
+		t.Skipf("no sh: %v", err)
+	}
+	defer func() { child.Process.Kill(); child.Wait() }()
+	self, err := proc.Self("supervise")
+	if err != nil {
+		t.Fatal(err)
+	}
+	self.Command = "factoryd supervise --token=" + secret // as a real Self() would record argv
+	l.state(t, func(s *state.State) {
+		s.Role(state.RoleProducer).Supervisor = &self
+		s.Role(state.RoleProducer).CurrentTurn = &state.Turn{ID: "p-1", StartedAt: l.now, Process: &proc.Ref{PID: child.Process.Pid, Command: "claude --key=" + secret}}
+	})
+	l.alive[self.PID] = true
+	l.deps.Tree = proc.Tree // the real tree, under this test process
+
+	srv, _ := status.NewServer([]*status.Collector{status.New(l.cfg, l.deps)})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	var outputs = map[string]string{}
+	for _, path := range []string{"/", "/status.json"} {
+		resp, err := http.Get(ts.URL + path)
+		if err != nil {
+			t.Fatal(err)
+		}
+		b, _ := io.ReadAll(resp.Body)
+		resp.Body.Close()
+		outputs[path] = string(b)
+	}
+	outputs["text"] = status.Text(l.collect())
+	for name, out := range outputs {
+		if strings.Contains(out, secret) {
+			t.Fatalf("%s carries a command-line secret:\n%s", name, out)
+		}
+	}
+	// Positive control: the child IS shown, by executable name.
+	if !strings.Contains(outputs["/status.json"], fmt.Sprintf(`"pid": %d`, child.Process.Pid)) || !strings.Contains(outputs["/status.json"], `"exe": "sh"`) {
+		t.Fatalf("the live child is not shown by pid and executable name:\n%s", outputs["/status.json"])
 	}
 }
