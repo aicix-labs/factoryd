@@ -93,10 +93,8 @@ func (r *ExecRunner) Run(ctx context.Context, t Turn, started func(proc.Ref)) (T
 	// switch: a new network namespace is root's to create, and the turn
 	// inherits an empty one it cannot leave. Without the privilege, the
 	// turn must not start connected instead.
-	if spec.Sandbox != nil && spec.Sandbox.NoNetwork {
-		if err := applyNoNetwork(cmd.SysProcAttr); err != nil {
-			return TurnResult{ExitCode: -1}, fmt.Errorf("exec: %s turn: sandbox.no_network: %w", r.Role, err)
-		}
+	if err := ApplySandbox(spec, cmd.SysProcAttr); err != nil {
+		return TurnResult{ExitCode: -1}, fmt.Errorf("exec: %s turn: %w", r.Role, err)
 	}
 	// The producer runs as its own OS identity -- the same mechanism doctor's
 	// write probe uses, so what the probe verified is what the turn runs as.
@@ -301,6 +299,20 @@ func (r *ExecRunner) env(t Turn) ([]string, error) {
 // credentialFor resolves an OS user to the credential the turn is started
 // with. Resolved at launch, not at load, so a user deleted since doctor ran
 // fails here by name.
+// ApplySandbox applies a role's declared sandbox to a process about to be
+// started as that role: the turn command, and anything else factoryd runs
+// as the producer in the producer's tree -- the refresh helper (#41
+// review). One function, so a second path cannot start connected while
+// the first is sealed. Without the privilege it refuses, never falls back.
+func ApplySandbox(spec config.RoleSpec, attr *syscall.SysProcAttr) error {
+	if spec.Sandbox != nil && spec.Sandbox.NoNetwork {
+		if err := applyNoNetwork(attr); err != nil {
+			return fmt.Errorf("sandbox.no_network: %w", err)
+		}
+	}
+	return nil
+}
+
 // CredentialFor is exported for its test; it is not part of the runner's API.
 func CredentialFor(name string) (*syscall.Credential, error) { return credentialFor(name) }
 

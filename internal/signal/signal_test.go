@@ -403,3 +403,91 @@ func TestVerdictCarriesTheBranchAndItsFamily(t *testing.T) {
 		t.Fatalf("state=%+v err=%v", st.LastVerdict, err)
 	}
 }
+
+// The cycle finishes on the merge of ITS change, by id: an older member of
+// the family or an unrelated draft merging says nothing about the
+// producer's workdir (#35, #41 review).
+func TestMergeFinishesOnlyTheCycleOfThatChange(t *testing.T) {
+	l := newLab(t)
+	if _, err := state.Update(l.cfg.StatePath(), l.cfg.Name, func(st *state.State) error {
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.Family, c.Digest, c.ChangeID = "feat/x", "feat/x-abc", "99" // not the change being signalled
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.run(t, "merged", "auto", "clean"); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if st.Cycle.Phase != state.CycleOpen || st.Cycle.ChangeID != "99" {
+		t.Fatalf("a merge of change 42 finished the cycle of change 99: %+v", st.Cycle)
+	}
+	// Now the cycle IS change 42.
+	l2 := newLab(t)
+	if _, err := state.Update(l2.cfg.StatePath(), l2.cfg.Name, func(st *state.State) error {
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.Family, c.Digest, c.ChangeID = "feat/x", "feat/x-abc", "42"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l2.run(t, "merged", "auto", "clean"); err != nil {
+		t.Fatal(err)
+	}
+	st, _ = state.Load(l2.cfg.StatePath(), l2.cfg.Name)
+	if st.Cycle.Phase != state.CycleFinished {
+		t.Fatalf("the merge of the cycle's own change did not finish it: %+v", st.Cycle)
+	}
+	// And changes-requested on it does not.
+	l3 := newLab(t)
+	if _, err := state.Update(l3.cfg.StatePath(), l3.cfg.Name, func(st *state.State) error {
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.ChangeID = "42"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l3.run(t, "changes-requested", "auto", "needs work"); err != nil {
+		t.Fatal(err)
+	}
+	st, _ = state.Load(l3.cfg.StatePath(), l3.cfg.Name)
+	if st.Cycle.Phase != state.CycleOpen {
+		t.Fatalf("changes-requested finished the cycle: %+v", st.Cycle)
+	}
+}
+
+// A merged verdict that names the immutable branch of a cycle still
+// "submitting" finishes it: the same draft, seen before submit recorded
+// its id (#41 review).
+func TestMergeOfASubmittingCyclesBranchFinishesIt(t *testing.T) {
+	l := newLab(t)
+	if _, err := state.Update(l.cfg.StatePath(), l.cfg.Name, func(st *state.State) error {
+		c := st.SetCycle(state.CycleSubmitting, time.Now())
+		c.Family, c.Digest = "producer/fix", "producer/fix-abc"
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := l.run(t, "merged", "auto", "clean"); err != nil {
+		t.Fatal(err)
+	}
+	st, _ := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if st.Cycle.Phase != state.CycleFinished || st.Cycle.ChangeID != "42" {
+		t.Fatalf("cycle %+v, want finished 42", st.Cycle)
+	}
+	// A different branch: not this cycle's draft.
+	l2 := newLab(t)
+	state.Update(l2.cfg.StatePath(), l2.cfg.Name, func(st *state.State) error {
+		c := st.SetCycle(state.CycleSubmitting, time.Now())
+		c.Family, c.Digest = "producer/other", "producer/other-def"
+		return nil
+	})
+	if _, err := l2.run(t, "merged", "auto", "clean"); err != nil {
+		t.Fatal(err)
+	}
+	st, _ = state.Load(l2.cfg.StatePath(), l2.cfg.Name)
+	if st.Cycle.Phase != state.CycleSubmitting {
+		t.Fatalf("a merge of another branch finished a submitting cycle: %+v", st.Cycle)
+	}
+}

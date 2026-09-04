@@ -137,6 +137,64 @@ type RoleState struct {
 // Bool is a pointer to b, for the tri-state fields.
 func Bool(b bool) *bool { return &b }
 
+// Cycle phases. Refresh runs only at CycleNew and CycleFinished: every
+// other phase names work the producer may still be doing, or a state this
+// build cannot vouch for.
+const (
+	// CycleNew: the workdir is at Base and nothing has touched it.
+	CycleNew = "new"
+	// CycleWorking: a producer turn has started on this cycle. Its edits,
+	// declared or not, are the producer's work and are never reset away.
+	CycleWorking = "working"
+	// CycleSubmitting: submit has validated an intent and is about to push
+	// and open a draft. Written BEFORE the push, so a crash between the
+	// draft's creation and the record of it leaves this, not nothing.
+	CycleSubmitting = "submitting"
+	// CycleOpen: a draft is open for ChangeID. Supersession moves ChangeID
+	// to the newest member of the family.
+	CycleOpen = "open"
+	// CycleFinished: the draft named by ChangeID merged.
+	CycleFinished = "finished"
+	// CycleClean: a turn consumed its trigger and declared nothing, or
+	// declared a tree identical to the target. The cycle produced no
+	// change; the next brief starts a new one. Without this a no-op turn
+	// left "working" behind for good, and the stale workdir returned (#41
+	// review). Undeclared edits do not survive it: an edit the producer
+	// wanted would have been declared (#12).
+	CycleClean = "clean"
+	// CycleUnknown: the document predates the record, or the record was
+	// unreadable. Unknown authorizes nothing; the operator's forced refresh
+	// starts the next cycle.
+	CycleUnknown = "unknown"
+)
+
+// Cycle is the producer's work cycle.
+type Cycle struct {
+	Phase string `json:"phase"`
+	// Base is the target-branch commit the workdir was refreshed to.
+	Base string `json:"base,omitempty"`
+	// Family and Digest identify the declared change being submitted: the
+	// declared branch name and the content-derived immutable branch.
+	Family string `json:"family,omitempty"`
+	Digest string `json:"digest,omitempty"`
+	// ChangeID is the open draft, newest in the family.
+	ChangeID  string    `json:"change_id,omitempty"`
+	Note      string    `json:"note,omitempty"`
+	StartedAt time.Time `json:"started_at"`
+	UpdatedAt time.Time `json:"updated_at"`
+}
+
+// SetCycle moves the cycle to phase, keeping identifiers unless the phase
+// starts over.
+func (s *State) SetCycle(phase string, now time.Time) *Cycle {
+	if s.Cycle == nil || phase == CycleNew {
+		s.Cycle = &Cycle{StartedAt: now}
+	}
+	s.Cycle.Phase = phase
+	s.Cycle.UpdatedAt = now
+	return s.Cycle
+}
+
 // Halt is a cleared halt, kept for the record.
 type Halt struct {
 	Reason    string    `json:"reason"`
@@ -281,6 +339,12 @@ type State struct {
 
 	// LastVerdict is the most recent verdict recorded, whatever it was.
 	LastVerdict *Verdict `json:"last_verdict,omitempty"`
+	// Cycle is the producer's work cycle: the durable, write-ahead record of
+	// where the workdir stands between a refresh and a merge (#35). It is
+	// never inferred from absence: a document that predates it loads as
+	// CycleUnknown, and only a refresh forced by the operator starts a new
+	// one from there.
+	Cycle *Cycle `json:"cycle,omitempty"`
 
 	// Health is the cadence record of the health tick: for each standing
 	// condition, when it was first seen and last alerted. It lives here, under
@@ -311,6 +375,7 @@ func New(factory string) *State {
 	for _, r := range Roles {
 		s.Roles[r] = &RoleState{}
 	}
+	s.Cycle = &Cycle{Phase: CycleNew}
 	return s
 }
 
@@ -354,6 +419,16 @@ func (s *State) Validate() error {
 			if p.FirstSeen.IsZero() {
 				return fmt.Errorf("state: role %s pending[%d] (%s) has no first-seen time; a pending trigger with no age cannot be escalated", r, i, p.Label)
 			}
+		}
+	}
+	if c := s.Cycle; c != nil {
+		switch c.Phase {
+		case CycleNew, CycleWorking, CycleSubmitting, CycleOpen, CycleFinished, CycleClean, CycleUnknown:
+		default:
+			return fmt.Errorf("state: cycle phase %q is not one this build knows", c.Phase)
+		}
+		if c.Phase == CycleOpen && c.ChangeID == "" {
+			return errors.New("state: cycle is open with no change id")
 		}
 	}
 	if v := s.LastVerdict; v != nil && !ValidVerdictKind(v.Kind) {
@@ -400,6 +475,11 @@ func Load(path, factory string) (*State, error) {
 	}
 	if s.Factory == "" {
 		s.Factory = factory
+	}
+	// A document written before the cycle record existed says nothing about
+	// the producer's workdir. Unknown, explicitly: never "no draft".
+	if s.Cycle == nil {
+		s.Cycle = &Cycle{Phase: CycleUnknown, Note: "state predates the cycle record; `factoryd refresh --force` starts a new cycle"}
 	}
 	if err := s.Validate(); err != nil {
 		return nil, fmt.Errorf("%s: %w", path, err)

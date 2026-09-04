@@ -31,6 +31,9 @@ usage:
   factoryd doctor    --config <f>                    verify a factory could actually run
   factoryd supervise --config <f> --role <r>         run one role's loop
   factoryd submit    --config <f>                    gate and open the producer's declared change
+  factoryd refresh   --config <f> [--force]          bring the producer's workdir to the target branch
+                                                     (refused while a change is in flight; the
+                                                     producer supervisor does this before a turn)
                                                      exits 0 submitted, 3 config/identity, 4 nothing, 5 gate red
   factoryd health    --config <f> [--loop] [--json]  one model-free tick: detect, alert, write health.json
                                                      exits 0 healthy, 1 findings, 3 could not look
@@ -80,6 +83,10 @@ func main() {
 		os.Exit(runDoctor(args))
 	case "supervise":
 		os.Exit(runSupervise(args))
+	case "refresh":
+		os.Exit(runRefresh(args))
+	case "_refresh":
+		os.Exit(runRefreshHelper(args))
 	case "submit":
 		os.Exit(runSubmit(args))
 	case "health":

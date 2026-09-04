@@ -48,6 +48,20 @@ func (g *RepoGit) run(ctx context.Context, args ...string) (string, error) {
 	return out.String(), nil
 }
 
+// Bundle writes ref to path as a git bundle and returns the sha ref names.
+// The bundle carries the ref under its own name, so the producer-side fetch
+// asks for exactly that ref (refresh.ApplyLocal).
+func (g *RepoGit) Bundle(ctx context.Context, path, ref string) (string, error) {
+	if _, err := g.run(ctx, "bundle", "create", path, ref); err != nil {
+		return "", err
+	}
+	out, err := g.run(ctx, "rev-parse", "--verify", ref+"^{commit}")
+	if err != nil {
+		return "", err
+	}
+	return strings.TrimSpace(out), nil
+}
+
 func (g *RepoGit) Checkout(ctx context.Context, branch, start string) error {
 	// -B: create or reset. A previous submission of the same branch is
 	// superseded by the producer's current tree, not merged with it.

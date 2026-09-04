@@ -93,6 +93,53 @@ operator ──brief──▶ ┌───────────┐
                           └──▶ back to PRODUCER (supervisor relaunches)
 ```
 
+**REFRESH precedes a producer turn** (#35). The producer's workdir is a clone
+that nothing else brings forward: the producer holds no provider credential and
+may run without network, and factoryd never runs git as itself in a directory
+the producer can write (§4.4). So before a producer turn, at the start of a
+cycle, the supervisor fetches the target branch into its own clone, writes a
+git bundle under `<root>/refresh/` where the producer can read it, and starts
+this binary's `_refresh` verb *as the producer*, under the producer's declared
+sandbox exactly as a turn gets it, in the producer's workdir. The helper
+replaces the repository — the old `.git` and every hook, filter and config in
+it go first, and git runs with the system and global config disabled, so no
+producer-controlled configuration executes during the reset — fetches from the
+bundle, points the branch, resets hard, and cleans everything untracked or
+ignored (a stale `.producer-branch` would be a resubmission). The result is
+verified by sha, not by the helper's exit.
+
+**When** is decided by the *cycle*, a durable, write-ahead record in state and
+never by absence. `cycle.phase` is `new` after a refresh (at `base`), `working`
+once a turn has started on the tree, `submitting` from the moment submit has
+validated an intent and *before* it pushes (so a crash between the draft's
+creation and the record of it leaves a phase that forbids a refresh), `open`
+with the draft's `change_id` (supersession moves the id to the newest member of
+the family), `finished` when the verdict `merged` names *that* id — a merge of
+an older member or an unrelated draft changes nothing — and `clean` when a turn
+consumed its trigger and declared nothing, or declared a tree identical to the
+target: the cycle produced no change, and the next brief starts a new one
+(undeclared edits do not survive it; an edit the producer wanted would have
+been declared, §6.2). The open draft is recorded *before* the reviewer is
+woken, and both orderings converge: a `merged` verdict already on file for the
+change finishes the cycle at record time, and a `merged` verdict naming the
+immutable branch of a cycle still `submitting` finishes it from the signal
+side. Refresh runs only at `new`, `finished` and `clean`; `working` keeps a
+first turn's edits through the retry that follows its failure; a document
+written before the record existed loads as `unknown`, and unknown authorizes
+nothing. A refresh that fails is a failed
+turn on the streak (exit 1002), and the agent does not run over a tree the step
+could not prepare. `factoryd refresh --config <f>` is the same step by hand,
+refused outside `new`/`finished`/`clean` unless `--force`d, which is the
+operator's acknowledgement that the tree is not wanted and starts the next
+cycle. Decision, apply and record happen inside one state update, under the
+document's exclusive lock, and the producer's turn start decides, refreshes
+and marks the cycle `working` under that same lock — so an operator's
+non-forced refresh and a turn that starts between its decision and its apply
+cannot interleave: whichever holds the lock first wins, the other sees its
+record, and a decision is never acted on for a tree someone else may be
+editing by then. Anything
+the producer wants to keep across cycles belongs under the cache root.
+
 Both agent roles are **one-shot turns**. Neither polls, waits, or loops. The
 supervisors own all continuity. This is the single most important change from v1,
 where each agent was told to "run forever" and reliably did not.

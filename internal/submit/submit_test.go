@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/aicix-labs/factoryd/internal/signal"
+	"github.com/aicix-labs/factoryd/internal/state"
+	"github.com/aicix-labs/factoryd/internal/supervise"
 	"io"
 	"os"
 	"os/exec"
@@ -287,6 +290,12 @@ func TestSubmitOpensADraftAndSignals(t *testing.T) {
 	}
 	if r.Branch != want {
 		t.Fatalf("result branch = %s, want %s", r.Branch, want)
+	}
+	// The cycle names the open draft (#35): supersession moves the id, the
+	// merge of that id finishes the cycle, and a refresh under an open
+	// draft is refused.
+	if st, err := state.Load(l.cfg.StatePath(), l.cfg.Name); err != nil || st.Cycle == nil || st.Cycle.Phase != state.CycleOpen || st.Cycle.ChangeID != "42" || st.Cycle.Family != "producer/fix" || st.Cycle.Digest != want {
+		t.Fatalf("cycle not recorded as open: %+v %v", st.Cycle, err)
 	}
 	if l.drv.opened == nil || l.drv.opened.Title != "gate: match command position" || l.drv.opened.TargetBranch != "main" {
 		t.Fatalf("draft spec = %+v", l.drv.opened)
@@ -1212,5 +1221,185 @@ func TestDeclaredFamilyInvertsImmutableBranch(t *testing.T) {
 		if got := submit.DeclaredFamily(plain); got != plain {
 			t.Fatalf("DeclaredFamily(%q) = %q, want unchanged", plain, got)
 		}
+	}
+}
+
+// The cycle says "submitting" before the push, so a crash between the
+// draft's creation and the record of it leaves a phase that forbids a
+// refresh, never an absence that permits one (#41 review). Proved by a
+// push that fails: the record is already there.
+func TestCycleIsRecordedAsSubmittingBeforeThePush(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "gate: match command position\n\nlonger body")
+	var seen *state.Cycle
+	l.tr.onPush = func() {
+		st, err := state.Load(l.cfg.StatePath(), l.cfg.Name)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		seen = st.Cycle
+		panic("crash during the push")
+	}
+	func() {
+		defer func() { recover() }()
+		submit.Run(context.Background(), l.cfg, l.deps)
+	}()
+	want := submit.ImmutableBranch("producer/fix", "abc123")
+	if seen == nil || seen.Phase != state.CycleSubmitting || seen.Family != "producer/fix" || seen.Digest != want {
+		t.Fatalf("cycle at push time = %+v, want submitting %s/%s", seen, "producer/fix", want)
+	}
+	st, _ := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if st.Cycle == nil || st.Cycle.Phase != state.CycleSubmitting {
+		t.Fatalf("after the crash the cycle is %+v, want submitting", st.Cycle)
+	}
+}
+
+// reviewerDriver is the fast reviewer's view of the provider for the
+// interleaving test: the draft submit just opened, mergeable at once.
+type reviewerDriver struct {
+	scm.Driver
+	change scm.Change
+}
+
+func (d *reviewerDriver) Provider() string { return "fake" }
+func (d *reviewerDriver) Get(context.Context, scm.ChangeID) (scm.Change, error) {
+	return d.change, nil
+}
+func (d *reviewerDriver) Diff(context.Context, scm.ChangeID) ([]scm.FileDiff, error) {
+	return []scm.FileDiff{{Path: "src/a.go", Added: 1, Patch: "+++ b/src/a.go\n+package a\n"}}, nil
+}
+func (d *reviewerDriver) Audits(context.Context, scm.ChangeID, string) ([]scm.Audit, error) {
+	return nil, nil
+}
+func (d *reviewerDriver) SetDraft(context.Context, scm.ChangeID, bool) error { return nil }
+func (d *reviewerDriver) Merge(context.Context, scm.ChangeID, string) (scm.ProviderMerge, error) {
+	return scm.ProviderMerged("m3rge"), nil
+}
+func (d *reviewerDriver) IsAncestor(context.Context, string, string) (bool, error) { return true, nil }
+func (d *reviewerDriver) Comment(context.Context, scm.ChangeID, string) error      { return nil }
+
+// The reviewer is woken only after the open draft is recorded, and a
+// reviewer fast enough to merge and signal inside the wake itself leaves
+// the cycle finished, not open (#41 review). The merge runs through the
+// real signal.Run, deterministically, from the Wake hook.
+func TestReviewerWokenAfterTheRecordAndAMergeInsideTheWakeConverges(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "gate: match command position\n\nlonger body")
+	want := submit.ImmutableBranch("producer/fix", "abc123")
+	var atWake *state.Cycle
+	l.deps.Wake = func() error {
+		st, err := state.Load(l.cfg.StatePath(), l.cfg.Name)
+		if err != nil {
+			return err
+		}
+		atWake = st.Cycle
+		// The fast reviewer: review, merge, signal -- before submit returns.
+		rd := &reviewerDriver{change: scm.Change{ID: "42", State: scm.StateOpen, Draft: false, Author: "producer-bot", AuthorID: "1",
+			HeadSHA: "abc123", SourceBranch: want, TargetBranch: "main"}}
+		_, err = signal.Run(context.Background(), l.cfg, signal.Deps{Driver: rd, Reviewer: scm.Identity{ID: "2", Login: "factory-reviewer"}},
+			signal.Request{ID: "42", Kind: "merged", SHA: "auto", Summary: "clean"})
+		return err
+	}
+	r, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if err != nil || r.Exit != submit.ExitSubmitted {
+		t.Fatalf("r=%+v err=%v\n%s", r, err, l.log)
+	}
+	if atWake == nil || atWake.Phase != state.CycleOpen || atWake.ChangeID != "42" {
+		t.Fatalf("at the wake the cycle was %+v, want open 42: the reviewer was woken before the record", atWake)
+	}
+	st, _ := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if st.Cycle == nil || st.Cycle.Phase != state.CycleFinished || st.Cycle.ChangeID != "42" {
+		t.Fatalf("after a merge inside the wake the cycle is %+v, want finished 42", st.Cycle)
+	}
+}
+
+// The other ordering, forced: the merged verdict for the draft is on file
+// before submit records the open draft. The record converges to finished.
+func TestAMergedVerdictAlreadyOnFileFinishesTheCycleAtRecordTime(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "gate: match command position\n\nlonger body")
+	if _, err := state.Update(l.cfg.StatePath(), l.cfg.Name, func(st *state.State) error {
+		st.LastVerdict = &state.Verdict{ChangeID: "42", Kind: state.VerdictMerged, MergeCommit: "m3rge"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	if r, err := submit.Run(context.Background(), l.cfg, l.deps); err != nil || r.Exit != submit.ExitSubmitted {
+		t.Fatalf("r=%+v err=%v", r, err)
+	}
+	st, _ := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if st.Cycle == nil || st.Cycle.Phase != state.CycleFinished {
+		t.Fatalf("cycle %+v, want finished: the record buried the verdict", st.Cycle)
+	}
+}
+
+// A turn that declared nothing, or a tree identical to the target, ends
+// the cycle clean; a tree already submitted names its draft (#41 review).
+func TestNoWorkTurnsEndTheCycleCleanAndAnAlreadySubmittedTreeNamesItsDraft(t *testing.T) {
+	l := newLab(t)
+	if _, err := state.Update(l.cfg.StatePath(), l.cfg.Name, func(st *state.State) error {
+		st.SetCycle(state.CycleWorking, time.Now())
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// No intent, through the supervisor's after-turn step (never builds deps).
+	after := submit.AfterTurn(l.cfg, func(context.Context) (submit.Deps, error) {
+		t.Fatal("deps built for a no-intent turn")
+		return submit.Deps{}, nil
+	})
+	if msg, err := after(context.Background(), supervise.Turn{}, supervise.TurnResult{}); err != nil || !strings.Contains(msg, "no intent") {
+		t.Fatalf("%q %v", msg, err)
+	}
+	st, _ := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if st.Cycle.Phase != state.CycleClean {
+		t.Fatalf("after a no-intent turn the cycle is %s, want clean", st.Cycle.Phase)
+	}
+
+	// Identical tree: declared, but nothing to commit.
+	l2 := newLab(t)
+	state.Update(l2.cfg.StatePath(), l2.cfg.Name, func(st *state.State) error { st.SetCycle(state.CycleWorking, time.Now()); return nil })
+	l2.declare(t, "producer/fix", "msg")
+	l2.git.nothing = true
+	if r, err := submit.Run(context.Background(), l2.cfg, l2.deps); err != nil || r.Exit != submit.ExitNothing {
+		t.Fatalf("r=%+v err=%v", r, err)
+	}
+	st, _ = state.Load(l2.cfg.StatePath(), l2.cfg.Name)
+	if st.Cycle.Phase != state.CycleClean {
+		t.Fatalf("after an identical-tree turn the cycle is %s, want clean", st.Cycle.Phase)
+	}
+
+	// Already submitted: the same tree is an open draft.
+	l3 := newLab(t)
+	state.Update(l3.cfg.StatePath(), l3.cfg.Name, func(st *state.State) error { st.SetCycle(state.CycleWorking, time.Now()); return nil })
+	l3.edit(t, "src/a.go")
+	l3.declare(t, "producer/fix", "msg")
+	want := submit.ImmutableBranch("producer/fix", "abc123")
+	l3.drv.family = []scm.Change{{ID: "41", State: scm.StateOpen, Draft: true, Author: "producer-bot", AuthorID: "1", SourceBranch: want, TargetBranch: "main"}}
+	r, err := submit.Run(context.Background(), l3.cfg, l3.deps)
+	if err != nil || r.Exit != submit.ExitNothing || r.Change == nil || r.Change.ID != "41" {
+		t.Fatalf("r=%+v err=%v\n%s", r, err, l3.log)
+	}
+	st, _ = state.Load(l3.cfg.StatePath(), l3.cfg.Name)
+	if st.Cycle.Phase != state.CycleOpen || st.Cycle.ChangeID != "41" {
+		t.Fatalf("after an already-submitted turn the cycle is %+v, want open 41", st.Cycle)
+	}
+
+	// A no-op turn while a draft is open says nothing about the draft.
+	l4 := newLab(t)
+	state.Update(l4.cfg.StatePath(), l4.cfg.Name, func(st *state.State) error {
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.ChangeID = "7"
+		return nil
+	})
+	after4 := submit.AfterTurn(l4.cfg, func(context.Context) (submit.Deps, error) { return submit.Deps{}, nil })
+	after4(context.Background(), supervise.Turn{}, supervise.TurnResult{})
+	st, _ = state.Load(l4.cfg.StatePath(), l4.cfg.Name)
+	if st.Cycle.Phase != state.CycleOpen {
+		t.Fatalf("a no-intent turn changed an open cycle to %s", st.Cycle.Phase)
 	}
 }

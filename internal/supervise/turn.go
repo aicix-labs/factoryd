@@ -203,16 +203,32 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 	before := s.progressMTime()
 	s.log.Info("turn starting", "turn", turn.ID, "triggers", labels(triggers))
 
-	res, runErr := s.runner.Run(ctx, turn, func(p proc.Ref) {
-		if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
-			if t := st.Role(state.Role(s.role)).CurrentTurn; t != nil && t.ID == turn.ID {
-				t.Process = &p
-			}
-			return nil
-		}); err != nil {
-			s.log.Warn("could not record the turn's process", "turn", turn.ID, "err", err)
+	var res TurnResult
+	var runErr error
+	skipped := false
+	if s.beforeTurn != nil {
+		msg, err := s.beforeTurn(ctx, turn)
+		if err != nil && ctx.Err() == nil {
+			// The agent does not run over a tree the step could not prepare.
+			// A failed turn, on the streak, with the triggers left pending.
+			s.log.Error("before-turn step failed; the turn does not run and counts as failed", "turn", turn.ID, "err", err)
+			res, skipped = TurnResult{ExitCode: ExitBeforeTurnFailed}, true
+		} else if msg != "" {
+			s.log.Info("before-turn step", "turn", turn.ID, "result", msg)
 		}
-	})
+	}
+	if !skipped {
+		res, runErr = s.runner.Run(ctx, turn, func(p proc.Ref) {
+			if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+				if t := st.Role(state.Role(s.role)).CurrentTurn; t != nil && t.ID == turn.ID {
+					t.Process = &p
+				}
+				return nil
+			}); err != nil {
+				s.log.Warn("could not record the turn's process", "turn", turn.ID, "err", err)
+			}
+		})
+	}
 
 	ended := s.now()
 
