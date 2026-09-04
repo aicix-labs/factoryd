@@ -27,14 +27,17 @@
   },
   "gate": {
     "command": [
-      "true"
+      "bash",
+      "-c",
+      "set -e; go build ./... && go vet ./... && go test -count=1 ./... && unformatted=$(find . -path ./.git -prune -o -name '*.go' -print0 | xargs -0 -r gofmt -l) && test -z \"$unformatted\" || { echo \"unformatted: $unformatted\"; exit 1; }"
     ],
     "env": {
-      "PATH": "/usr/bin:/bin",
-      "HOME": "/var/lib/factoryd/widgets"
+      "PATH": "/usr/local/go/bin:/usr/bin:/bin",
+      "HOME": "/var/lib/factoryd/widgets",
+      "GOCACHE": "/var/cache/factoryd/widgets/go"
     },
     "required_writable_paths": [
-      "build/out"
+      "${GOCACHE}"
     ],
     "run_as": {
       "user": "factoryd-gate"

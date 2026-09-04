@@ -232,6 +232,10 @@ func (r *ExecRunner) env(t Turn) []string {
 		"FACTORYD_PROGRESS":      r.Config.ProgressPath(r.Role),
 		"FACTORYD_TRIGGERS":      labels(t.Triggers),
 		"FACTORYD_TRIGGER_PATHS": strings.Join(trigPaths, string(os.PathListSeparator)),
+		// The config this turn was started from, so a turn that drives
+		// factoryd's own verbs (the reviewer: scm, audit, signal) does not
+		// have to be told by hand (canary issue #22).
+		"FACTORYD_CONFIG": r.Config.Path(),
 	}
 	// Constructed, never inherited: os.Environ() is consulted for exactly the
 	// reviewer's credential name and nothing else (Config.TurnEnv).

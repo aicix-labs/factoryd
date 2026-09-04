@@ -3,7 +3,9 @@ set -u
 log() { echo "reviewer-turn: $*" >&2; }
 C="$FACTORYD_CONFIG"
 log "triggers=${FACTORYD_TRIGGERS:-} uid=$(id -u)"
-id=$(factoryd scm -config "$C" list-open 2>/dev/null | awk -F'\t' '$2 ~ /accept\/session/ {print $1; exit}')
+# Match the branch FAMILY by prefix: submit pushes <declared>-<tree>, never
+# the declared name itself, so an exact match could never fire.
+id=$(factoryd scm -config "$C" list-open 2>/dev/null | awk -F'\t' '$2 ~ /^accept\/session-/ {print $1; exit}')
 [ -n "$id" ] || { log "no open change for accept/session"; exit 1; }
 sha=$(factoryd scm -config "$C" get "$id" 2>/dev/null | awk '$1=="head" {print $2; exit}')
 log "reviewing $id at $sha"

@@ -82,8 +82,33 @@ CLIs in the turn commands changes nothing below except who writes the code.
 because its producer is a script. A producer that is itself a hosted-model CLI
 (codex, claude) must reach its own API and **must not** set it — see SPEC §4.4.
 
+### The GitLab run, by the canary session (2026-09-04)
+
+The session migrating the prod-next factory built a second factory against
+`aicix/factoryd-fixtures` with production-style paths and ran the same cycle:
+`doctor` 48 checks (sandbox proved from inside); brief → sandboxed producer turn
+(uid 996, network unreachable) → gate green → pushed as the producer (id 28) →
+draft !63 → reviewer turn as factoryd itself → `session-fixation CLEARED` on the
+exact head → `signal merged` → merged as `1e6d6f64`, verified by ancestry; GitLab
+independently reports `1e6d6f64` as `main`'s head, carrying the producer's exact
+file, `merged_by` the reviewer (id 5), not the producer.
+
+Two things this record did not cover and that run did: **restart continuity** —
+the producer supervisor was stopped for the whole review; on restart it read and
+consumed the waiting verdict, and replaced the dead supervisor record by pid and
+start token, never argv; and **failing correctly** — the reviewer halted after
+five consecutive failed turns with a loud sentinel and the wake trigger
+preserved, and a restart was refused by the sentinel (§1 row 15, observed).
+
+It also found three things fixtures could not: a real gate cannot walk `.git`
+(#21: the example gate was `true`, which cannot fail this way — the shipped
+gates are now real and prune `.git`); `FACTORYD_CONFIG` was needed by the
+reviewer turn but injected by hand (#22: the runner injects it); and a reviewer
+turn must match the branch **family by prefix**, because the pushed name is
+`<declared>-<tree>`, never the declared name.
+
 ### Not yet done
 
-- The second pass with real agent CLIs in `roles.*.command` (the operator names
-  the CLI and the account per role).
-- GitLab: the same run on `aicix/factoryd-fixtures`.
+- The second pass with real agent CLIs in `roles.*.command`: codex under its
+  own OS account with its own auth (the operator has agreed to the account;
+  the OpenAI login for it is the remaining choice).

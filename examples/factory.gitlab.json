@@ -28,8 +28,9 @@
   },
   "gate": {
     "command": [
-      "make",
-      "check"
+      "bash",
+      "-c",
+      "set -e; go build ./... && go vet ./... && go test -count=1 ./... && unformatted=$(find . -path ./.git -prune -o -name '*.go' -print0 | xargs -0 -r gofmt -l) && test -z \"$unformatted\" || { echo \"unformatted: $unformatted\"; exit 1; }"
     ],
     "env": {
       "PATH": "/usr/local/go/bin:/usr/local/bin:/usr/bin:/bin",
