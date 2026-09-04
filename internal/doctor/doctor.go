@@ -267,6 +267,21 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 				add("gate cannot read "+cred.name+" credential", nil, cred.file)
 			}
 		}
+		// The producer's HOME holds whatever model credential its agent CLI
+		// keeps (codex: ~/.codex/auth.json). The gate runs producer-authored
+		// code; it must not be able to read that either. "The home happens
+		// to be 0700" is not evidence -- the canary found codex creating
+		// .codex as 0775 beside a 0600 auth.json -- so this is probed as the
+		// gate, like the two provider credentials are.
+		if home := cfg.Roles.Producer.Env["HOME"]; home != "" {
+			if can, err := gate.CanRead(ctx, home); err != nil {
+				add("gate cannot read producer home", fmt.Errorf("undecided: %v", err), home)
+			} else if can {
+				add("gate cannot read producer home", fmt.Errorf("%s CAN read %s; producer-authored build code could read the producer's model credential", gate.Describe(), home), home)
+			} else {
+				add("gate cannot read producer home", nil, home)
+			}
+		}
 		provisioned := 0
 		for _, p := range cfg.Gate.RequiredWritablePaths {
 			resolved, err := cfg.ResolveGatePath(p)

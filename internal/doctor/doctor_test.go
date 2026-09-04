@@ -103,6 +103,15 @@ func healthyDeps(cfg *config.Config, listErr error) doctor.Deps {
 			if ra != nil && ra.User == "outbox-locked" {
 				return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true}, readable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
 			}
+			if ra != nil && ra.User == "gate-reads-home" {
+				w := map[string]bool{}
+				for _, p := range cfg.Gate.RequiredWritablePaths {
+					if r, err := cfg.ResolveGatePath(p); err == nil {
+						w[r] = true
+					}
+				}
+				return fakeProber{name: "fake-gate (uid 4343)", writable: w, readable: map[string]bool{cfg.Roles.Producer.Env["HOME"]: true}}, nil
+			}
 			if ra != nil && ra.User == "factoryd-gate" {
 				w := map[string]bool{}
 				for _, p := range cfg.Gate.RequiredWritablePaths {
@@ -163,7 +172,7 @@ func fixture(t *testing.T) *config.Config {
 		Gate: config.Gate{Command: []string{gate}, Env: map[string]string{"PATH": "/usr/bin:/bin"},
 			RunAs: &config.RunAs{User: "factoryd-gate"}, RequiredWritablePaths: []string{"build/out"}},
 		Roles: config.Roles{
-			Producer: config.RoleSpec{Command: []string{gate}, Env: map[string]string{"PATH": os.Getenv("PATH")}, RunAs: &config.RunAs{User: "nobody"}},
+			Producer: config.RoleSpec{Command: []string{gate}, Env: map[string]string{"PATH": os.Getenv("PATH"), "HOME": filepath.Join(root, "producer-home")}, RunAs: &config.RunAs{User: "nobody"}},
 			Reviewer: config.RoleSpec{Command: []string{gate}, Env: map[string]string{"PATH": os.Getenv("PATH")}},
 		},
 		Supervisor: config.Supervisor{
@@ -351,6 +360,13 @@ func TestIndividualFailuresAreCaught(t *testing.T) {
 			mutate:   func(t *testing.T, c *config.Config) {},
 			contain:  errors.New("no cgroup v2"),
 			wantName: "containment",
+		},
+		{
+			// The gate can read the producer's HOME: producer-authored build
+			// code could read the model credential kept there.
+			name:     "gate can read the producer home",
+			mutate:   func(t *testing.T, c *config.Config) { c.Gate.RunAs = &config.RunAs{User: "gate-reads-home"} },
+			wantName: "gate cannot read producer home",
 		},
 		{
 			name:     "no alert transport",

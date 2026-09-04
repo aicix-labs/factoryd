@@ -107,8 +107,38 @@ reviewer turn but injected by hand (#22: the runner injects it); and a reviewer
 turn must match the branch **family by prefix**, because the pushed name is
 `<declared>-<tree>`, never the declared name.
 
+### The second pass, with a real model (canary session, 2026-09-04)
+
+Codex ran as `factoryd-producer` — its own OS account (nologin, locked
+password), its own `0700` home, its own `0600` `auth.json` obtained by device
+auth, the CLI binaries copied root-owned to `/usr/local/lib/factoryd/codex/bin`
+and nothing borrowed from the operator's home. `doctor`: 53 checks on prod-next,
+still including *producer cannot read producer credential* and *… reviewer
+credential*: the producer holds a model credential and no provider credential.
+On the scratch repo: brief → Codex tightened `SessionValid` and added a
+table-driven test, declared intent → immutable branch
+`accept/session-format-9c1db05bba`, gate green, pushed as the producer (id 28),
+draft !64 → reviewer (id 5) classified both files as escalate, recorded the
+adversarial pass on the exact head, `signal merged` → `b7c7bfbc`, verified by
+ancestry, GitLab's own head and `merged_by`. The code that landed is the
+model's, not a fixture. Two corrections the run made to the stand-ins:
+`no_network` is absent for a hosted-model producer, and the reviewer matches
+the branch family by prefix.
+
+### Operating notes from the runs
+
+- **Never run `git` as root in the producer's clone.** git refuses a
+  repository owned by someone else ("dubious ownership"), and the honest
+  reading of that refusal is that the repository is not yours: it is the
+  producer's. Use `sudo -u factoryd-producer git -C <clone> …`, and do not add
+  a `safe.directory` exception. The refusal is silent in effect — a reset that
+  did nothing let a turn start on an unclean clone — so read git's output.
+- The producer's home must be unreadable by the gate identity; `doctor` now
+  proves it (*gate cannot read producer home*). Codex created `.codex` as
+  `0775` beside a `0600` `auth.json`; the `0700` home is what keeps the gate
+  out, and it is probed, not assumed.
+
 ### Not yet done
 
-- The second pass with real agent CLIs in `roles.*.command`: codex under its
-  own OS account with its own auth (the operator has agreed to the account;
-  the OpenAI login for it is the remaining choice).
+- Nothing on factoryd's side. The prod-next cutover (service units, stopping
+  the legacy factory) is the canary session's.
