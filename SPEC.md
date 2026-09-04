@@ -836,17 +836,71 @@ not the second, and a stalled factory was recorded correctly every 15 minutes in
 journal nobody read.
 
 - Configurable transports: command, webhook, file, syslog. Multiple, best-effort,
-  independent — one failing must not suppress the others.
+  independent — one failing must not suppress the others. **This build delivers
+  through `file` and `command`**; a config naming `webhook` or `syslog` is refused
+  at load, because a transport that is accepted and never delivers is the failure
+  this section exists to prevent. They arrive when they can be delivered.
 - **An unconfigured transport is a startup error, not a silent default.** If nothing
-  can receive an alert, say so loudly at boot.
+  can receive an alert, say so loudly at boot. `doctor` goes further: it delivers
+  a probe alert through every transport and fails on any that does not arrive,
+  because "the path looks writable" is not "the alert landed".
 - Escalating cadence: alert after N intervals, repeat at a longer interval so it nags
-  without becoming noise.
+  without becoming noise. One recovery when a condition clears, none for a condition
+  that was never announced. The cadence record lives in `state.json`, under the same
+  lock as everything else, and is written **before** the alert goes out: a crash
+  between the two loses one alert, which the repeat resends; the reverse order
+  would send the same alert on every tick.
+- `factoryd health` is the tick: one observation, or `--loop`. It writes
+  `<root>/health.json` atomically and exits **0** healthy, **1** findings, **3**
+  could not look. A tick that could not observe something (a volume it cannot
+  stat, a provider it cannot reach) is **unhealthy**, not quiet: a tick that
+  cannot look is not a tick that saw nothing.
+- Conditions: supervisor registered and not alive and not halted; liveness that
+  cannot be determined; a halted role (until an operator clears it); a turn past
+  its timeout **plus grace** (the supervisor should have ended it, so the
+  supervisor is stuck); a trigger unconsumed past the stale threshold; an open
+  change untouched past the unreviewed threshold — or with no timestamp at all,
+  which is an unknown age, not a recent one; no state document at all.
 - **Resource guards** are part of health, not an afterthought: disk headroom on every
   volume the factory writes to, agent-turn duration, and cache growth. The predecessor
   filled a 232 GB volume to 96% with no signal; the first symptom would have been a
   confusing build failure.
 - The factory must bound its own caches (per-turn build caches, clones, worktrees) and
   report what it reclaimed. Growth without a bound is a defect, not a tuning issue.
+  Each declared cache is reclaimed oldest entry first (by newest *file* mtime — a
+  directory's mtime is bumped by every walk) until under its bound. **The newest
+  entry is never removed**: a single entry larger than the bound would otherwise
+  be deleted and rebuilt on every tick; left over the bound, it is a finding.
+  **Reclamation deletes, so where it may delete is the first question.** Every
+  cache lies inside `paths.cache_root`, a dedicated factory-owned directory that
+  may not be `/` and may not overlap the factory root, either repository, a
+  credential, or an alert file — refused at load, lexically. At the moment of
+  use, **deletion is bound to an opened, verified directory handle, not to a
+  path.** The tick opens the cache root without following a final symlink,
+  verifies on the handle that it is a directory owned by the factory user and
+  writable by nobody else, binds an `os.Root` to it and checks that the bound
+  root is the same inode it verified; every listing, sizing and removal is then
+  relative to that handle and refuses to follow a symlink out of it. Nothing an
+  untrusted writer does to the path afterwards — a symlink at the cache, at the
+  root, or at the root's renamed parent — changes what is deleted, because the
+  path is not consulted again. A resolved-path comparison would not give this:
+  a root swapped for a symlink resolves *consistently* under the victim, and
+  containment against a moved root passes. A symlink entry is removed as a
+  link, never followed. `doctor` performs the same open-and-verify; it
+  establishes doctor's environment, and the tick repeats it at every deletion.
+- **"Could not look" is exit 3, not a finding.** `Tick` returns a typed
+  observation error alongside the report it still wrote; the CLI maps it to 3.
+  An unhealthy factory and a blind tick have different remedies.
+- **A corrupt or unwritable state document must not silence the tick.** The
+  cadence record lives there; when it is unavailable a fail-safe alert goes out
+  that depends on nothing but the transports, carrying every finding, bounded by
+  the previous `health.json`'s record of when it last did so — and
+  unconditionally when that too is unreadable. Alerting on every tick is the
+  bounded failure; alerting never is the one v1 had.
+- Disk headroom is checked **once per volume**, over every path the factory
+  writes: root, both repositories, the gate's declared paths, the caches, the
+  alert files. A path that does not exist yet is checked through its nearest
+  existing ancestor, because that is the volume it will land on.
 
 ---
 
@@ -940,6 +994,20 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §4.4 check-to-push race | a draft is marked ready **while the gate runs** → no push at all, nothing opened, nothing closed | the identical run with no flip pushes exactly once, non-force, to the content-derived branch |
 | §4.4 unknown owner is not ours | a change in the family with **no author**, or a producer with **no login** → refuse before the gate | the same change carrying the producer's login is accepted and updated |
 | §4.4 supersession never writes | the earlier draft goes ready the instant **after submit's last read of it** → `Close` is never invoked; the new content still opens as its own draft naming the old one | the old draft *is* named in the new body and the result — so "never closed" is not a supersession that never happened |
+| §7 dead supervisor | the supervisor handle no longer refers to a live process and the role did not halt → finding | the same handle alive → no finding; a halted role is `halted`, not `supervisor_dead` |
+| §7 liveness unknown | `/proc` cannot answer → finding, not "alive" | — the positive control is the alive case above |
+| §7 disk headroom | a volume below the headroom → one finding **per volume**, not per path on it | the same paths on two volumes → two observations, one finding |
+| §7 a volume the tick cannot see | `statfs` fails → the tick is **unhealthy** with a tick error | the same volume readable → healthy |
+| §7 bounded cache | a cache over its bound → the oldest entry is removed and **reported**; the newest is never removed and a cache still over bound is a finding | a cache under its bound after reclamation is not a finding |
+| §7 cadence | alert only after `alert_after` ticks; silence until `repeat_seconds`; one recovery; none for a condition never announced | the sequence of alert lines is alert, repeat, recovered — exactly three |
+| §7 delivery probe | `doctor` fails when the alert file cannot be appended, or the alert command exits non-zero — even when a second transport succeeds, which is named | a healthy run leaves the probe line **in the file** |
+| §7 fan-out | one transport failing does not suppress the next, and the failure is named | every transport failing is an error that names each |
+| §7 reclamation scope | a cache root of `/`, one overlapping the factory root, a repository, a credential or an alert file, or a cache outside the root → refused at load; a cache path or entry that **resolves** outside the root at reclamation time → nothing deleted, `cache_unsafe` | a sibling that merely shares a string prefix is accepted; a cache inside the root is reclaimed |
+| §7 deletion follows the handle | the cache root is replaced by a symlink to a victim **after** it was opened and verified, before anything is deleted → the real root is reclaimed and the victim is intact, links included; the root swapped **between** the no-follow open and the bind → refused | the same root untouched reclaims exactly the oldest entry |
+| §7 root replaced after doctor | the root itself, or its renamed parent, replaced by a symlink after `doctor` passed → `cache_unsafe`, nothing deleted | — |
+| §7 symlink entry | a symlink entry is removed as a link; its target is intact | the link itself is gone and counted |
+| §7 could not look | a volume that will not stat, a provider that will not answer, a corrupt state document → `factoryd health` exits **3** | findings alone exit 1; a live supervisor exits 0 |
+| §7 state unavailable | a corrupt `state.json` with a working transport → a `state_unavailable` alert on the first tick, none inside `repeat_seconds`, one after it, and one immediately when no previous `health.json` exists | a readable document alerts on the ordinary cadence |
 | §4.4 gate is its own user | `gate.run_as` is empty, or names the producer's user → refuse at load | distinct users pass |
 | §4.4 turn env is owned | a reviewer credential present in the supervisor's environment reaches the producer's turn | the reviewer's turn receives that same variable, by name |
 | §4.4 declared `PATH` | the gate or turn command is found on doctor's own `PATH` but not on the declared one → doctor refuses; the turn refuses to start | found on the declared `PATH` passes |

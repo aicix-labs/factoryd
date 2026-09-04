@@ -27,7 +27,13 @@ import (
 // factoryd-owned submit repository, the fully declared gate environment, and
 // the producer's separate identity are all required and none has a default
 // that would be safe to assume.
-const SchemaVersion = 3
+//
+// Bumped to 4 for health (SPEC.md §7): the alert transports a build cannot
+// deliver through are refused at load rather than accepted and never used,
+// and the health block names the volumes and caches the factory is bounded
+// by. A v3 config that listed a webhook it could not send would have passed
+// validation and alerted nobody.
+const SchemaVersion = 4
 
 // Config is one factory.
 type Config struct {
@@ -55,6 +61,8 @@ type Config struct {
 	// to report it recorded the stall correctly into a journal nobody read --
 	// which is what v1 did for two hours and twenty minutes.
 	Alerts []Alert `json:"alerts"`
+	// Health configures the periodic, model-free tick (§4.5, §7).
+	Health Health `json:"health"`
 
 	// path is where this config was loaded from; used in diagnostics.
 	path string
@@ -87,6 +95,13 @@ type Paths struct {
 	// producer must not be able to write it; doctor proves that by probe, as
 	// the producer, rather than assuming it (§4.4).
 	SubmitRepo string `json:"submit_repo"`
+	// CacheRoot is the one directory the factory may reclaim space in
+	// (§7). Every health.caches[].path must lie inside it, and it may not
+	// overlap the factory root, either repository, a credential, or an alert
+	// file. Reclamation deletes; a bound that could name anything else is a
+	// configuration that can destroy the host. Required when caches are
+	// declared.
+	CacheRoot string `json:"cache_root,omitempty"`
 }
 
 // Git configures the transport (SPEC.md §5.4).
@@ -169,6 +184,17 @@ type Roles struct {
 	Reviewer RoleSpec `json:"reviewer"`
 }
 
+// Spec returns the role's spec; an unknown role is the zero spec.
+func (r Roles) Spec(role string) RoleSpec {
+	switch role {
+	case "producer":
+		return r.Producer
+	case "reviewer":
+		return r.Reviewer
+	}
+	return RoleSpec{}
+}
+
 // RoleSpec is one agent turn.
 type RoleSpec struct {
 	// Command is argv for a single turn. It must exit; a command told to "run
@@ -235,6 +261,15 @@ const (
 	DefaultBackoffSeconds = 15
 	DefaultTurnTimeout    = 3600
 	DefaultGateTimeout    = 900
+
+	DefaultHealthInterval  = 60
+	DefaultAlertAfter      = 3
+	DefaultRepeatSeconds   = 1800
+	DefaultStaleTrigger    = 900
+	DefaultTurnGrace       = 120
+	DefaultUnreviewed      = 0
+	DefaultDiskMinFree     = 10
+	DefaultAlertCmdTimeout = 30
 )
 
 // Gate is the build/vet/test command submit runs before pushing anything.
@@ -267,12 +302,86 @@ type Gate struct {
 
 // Alert is one alert transport.
 type Alert struct {
-	// Kind is one of command, webhook, file, syslog.
-	Kind    string   `json:"kind"`
+	// Kind is one of file, command. (webhook and syslog are named by the
+	// spec and not implemented in this build; a config that lists one is
+	// refused at load, because a transport that is accepted and never
+	// delivers is the failure the alert subsystem exists to prevent.)
+	Kind string `json:"kind"`
+	// Command is argv for kind command. It receives the alert as JSON on
+	// stdin and must exit 0; anything else is a delivery failure.
 	Command []string `json:"command,omitempty"`
-	URL     string   `json:"url,omitempty"`
-	Path    string   `json:"path,omitempty"`
-	Tag     string   `json:"tag,omitempty"`
+	// Env is the command's WHOLE environment. PATH is required.
+	Env map[string]string `json:"env,omitempty"`
+	// TimeoutSeconds bounds the command. Zero means the default.
+	TimeoutSeconds int `json:"timeout_seconds,omitempty"`
+	// Path is the file kind's destination: one JSON line appended per alert.
+	Path string `json:"path,omitempty"`
+}
+
+// AlertKinds this build can deliver through.
+var AlertKinds = []string{"file", "command"}
+
+// Health configures the health tick (SPEC.md §7). Every threshold has a
+// default, because the tick must run on a config that predates the knob; none
+// may be zero after Load, because a zero threshold is a check that cannot
+// fail or one that always does.
+type Health struct {
+	// IntervalSeconds is the tick period when health runs as a loop.
+	IntervalSeconds int `json:"interval_seconds,omitempty"`
+	// AlertAfter is the number of consecutive ticks a condition must hold
+	// before the first alert. One transient tick is not an incident.
+	AlertAfter int `json:"alert_after,omitempty"`
+	// RepeatSeconds is how often a standing condition is alerted again. It
+	// nags; it does not flood.
+	RepeatSeconds int `json:"repeat_seconds,omitempty"`
+	// StaleTriggerSeconds is how long a trigger may sit unconsumed.
+	StaleTriggerSeconds int `json:"stale_trigger_seconds,omitempty"`
+	// TurnGraceSeconds is how far past its timeout a turn may still be
+	// running before the supervisor that should have killed it is presumed
+	// stuck.
+	TurnGraceSeconds int `json:"turn_grace_seconds,omitempty"`
+	// UnreviewedSeconds is how long a change may stay open, untouched, before
+	// it is a condition. Zero disables the check (it needs the network).
+	UnreviewedSeconds int `json:"unreviewed_seconds,omitempty"`
+	// DiskMinFreePercent is the headroom every volume the factory writes to
+	// must keep. The predecessor filled a 232 GB volume to 96% with no signal.
+	DiskMinFreePercent int `json:"disk_min_free_percent,omitempty"`
+	// Caches are the directories the factory bounds. Each is reclaimed,
+	// oldest entry first, when it exceeds its bound, and what was reclaimed
+	// is reported. Growth without a bound is a defect.
+	Caches []Cache `json:"caches,omitempty"`
+}
+
+// DefaultHealth is the health block with every default applied and nothing
+// declared: no caches, no unreviewed check.
+func DefaultHealth() Health { return Health{}.withDefaults() }
+
+func (h Health) withDefaults() Health {
+	if h.IntervalSeconds == 0 {
+		h.IntervalSeconds = DefaultHealthInterval
+	}
+	if h.AlertAfter == 0 {
+		h.AlertAfter = DefaultAlertAfter
+	}
+	if h.RepeatSeconds == 0 {
+		h.RepeatSeconds = DefaultRepeatSeconds
+	}
+	if h.StaleTriggerSeconds == 0 {
+		h.StaleTriggerSeconds = DefaultStaleTrigger
+	}
+	if h.TurnGraceSeconds == 0 {
+		h.TurnGraceSeconds = DefaultTurnGrace
+	}
+	if h.DiskMinFreePercent == 0 {
+		h.DiskMinFreePercent = DefaultDiskMinFree
+	}
+	return h
+}
+
+// Cache is one bounded directory.
+type Cache struct {
+	Path     string `json:"path"`
+	MaxBytes int64  `json:"max_bytes"`
 }
 
 // Path is where the config was loaded from.
@@ -329,6 +438,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Roles.Reviewer.TimeoutSeconds == 0 {
 		c.Roles.Reviewer.TimeoutSeconds = DefaultTurnTimeout
+	}
+	c.Health = c.Health.withDefaults()
+	for i := range c.Alerts {
+		if c.Alerts[i].Kind == "command" && c.Alerts[i].TimeoutSeconds == 0 {
+			c.Alerts[i].TimeoutSeconds = DefaultAlertCmdTimeout
+		}
 	}
 }
 
@@ -402,6 +517,45 @@ func (c *Config) Validate() error {
 	}
 	if c.Paths.SubmitRepo != "" && c.Paths.SubmitRepo == c.Paths.ProducerWorkdir {
 		add("paths.submit_repo is the producer workdir; the two-directory boundary requires them to differ")
+	}
+
+	// --- cache root: the only place reclamation may delete ---
+	if len(c.Health.Caches) > 0 && c.Paths.CacheRoot == "" {
+		add("health.caches declared but paths.cache_root is empty; reclamation deletes, and only inside a dedicated cache root")
+	}
+	if cr := c.Paths.CacheRoot; cr != "" {
+		switch {
+		case !filepath.IsAbs(cr):
+			add("paths.cache_root %q is not absolute", cr)
+		case filepath.Clean(cr) == string(filepath.Separator):
+			add("paths.cache_root is /; reclamation would delete the host")
+		default:
+			protected := []struct{ name, path string }{
+				{"paths.root", c.Paths.Root},
+				{"paths.producer_workdir", c.Paths.ProducerWorkdir},
+				{"paths.submit_repo", c.Paths.SubmitRepo},
+				{"credentials.producer file", parentOf(c.Credentials.Producer.File)},
+				{"credentials.reviewer file", parentOf(c.Credentials.Reviewer.File)},
+			}
+			for i, a := range c.Alerts {
+				if a.Kind == "file" && a.Path != "" {
+					protected = append(protected, struct{ name, path string }{fmt.Sprintf("alerts[%d] file", i), parentOf(a.Path)})
+				}
+			}
+			for _, pr := range protected {
+				if pr.path == "" {
+					continue
+				}
+				if PathsOverlap(cr, pr.path) {
+					add("paths.cache_root %q overlaps %s %q; reclamation may not reach it", cr, pr.name, pr.path)
+				}
+			}
+			for i, cc := range c.Health.Caches {
+				if cc.Path != "" && filepath.IsAbs(cc.Path) && !PathWithin(cc.Path, cr) {
+					add("health.caches[%d] path %q is not inside paths.cache_root %q", i, cc.Path, cr)
+				}
+			}
+		}
 	}
 
 	switch c.Git.Transport {
@@ -520,19 +674,49 @@ func (c *Config) Validate() error {
 			if len(a.Command) == 0 {
 				add("alerts[%d]: kind command with no command", i)
 			}
-		case "webhook":
-			if a.URL == "" {
-				add("alerts[%d]: kind webhook with no url", i)
+			if a.Env["PATH"] == "" {
+				add("alerts[%d]: kind command with no PATH in env; the command's environment is declared, not inherited", i)
+			}
+			if a.TimeoutSeconds < 0 {
+				add("alerts[%d]: timeout_seconds is negative", i)
 			}
 		case "file":
 			if a.Path == "" {
 				add("alerts[%d]: kind file with no path", i)
+			} else if !filepath.IsAbs(a.Path) {
+				add("alerts[%d]: path %q is not absolute", i, a.Path)
 			}
-		case "syslog":
+		case "webhook", "syslog":
+			add("alerts[%d]: kind %q is not implemented in this build; a transport that is accepted and never delivers alerts nobody", i, a.Kind)
 		case "":
 			add("alerts[%d]: kind is empty", i)
 		default:
-			add("alerts[%d]: kind %q is not one of command, webhook, file, syslog", i, a.Kind)
+			add("alerts[%d]: kind %q is not one of file, command", i, a.Kind)
+		}
+	}
+
+	h := c.Health
+	for _, k := range []struct {
+		n string
+		v int
+	}{{"interval_seconds", h.IntervalSeconds}, {"alert_after", h.AlertAfter}, {"repeat_seconds", h.RepeatSeconds},
+		{"stale_trigger_seconds", h.StaleTriggerSeconds}, {"turn_grace_seconds", h.TurnGraceSeconds}} {
+		if k.v <= 0 {
+			add("health.%s must be positive", k.n)
+		}
+	}
+	if h.UnreviewedSeconds < 0 {
+		add("health.unreviewed_seconds is negative")
+	}
+	if h.DiskMinFreePercent <= 0 || h.DiskMinFreePercent >= 100 {
+		add("health.disk_min_free_percent must be between 1 and 99")
+	}
+	for i, cc := range h.Caches {
+		if cc.Path == "" || !filepath.IsAbs(cc.Path) {
+			add("health.caches[%d]: path must be absolute", i)
+		}
+		if cc.MaxBytes <= 0 {
+			add("health.caches[%d]: max_bytes must be positive; a cache with no bound is a defect, not a tuning issue", i)
 		}
 	}
 
@@ -544,6 +728,9 @@ func (c *Config) Validate() error {
 
 // StatePath is where this factory's state document lives.
 func (c *Config) StatePath() string { return filepath.Join(c.Paths.Root, "state.json") }
+
+// HealthPath is the structured health document the tick writes (§4.5).
+func (c *Config) HealthPath() string { return filepath.Join(c.Paths.Root, "health.json") }
 
 // InboxDir and OutboxDir are the filesystem handoff channels (SPEC.md §6.2).
 func (c *Config) InboxDir() string  { return filepath.Join(c.Paths.Root, "inbox") }
@@ -798,6 +985,30 @@ func (c *Config) TurnEnv(role string, factoryd map[string]string, supervisorEnv 
 		out = append(out, k+"="+env[k])
 	}
 	return out
+}
+
+// PathWithin reports whether p is inside (or is) dir, lexically. Both are
+// cleaned; neither is resolved -- the physical check belongs to the moment
+// of use, where a symlink can still have changed since load.
+func PathWithin(p, dir string) bool {
+	p, dir = filepath.Clean(p), filepath.Clean(dir)
+	if p == dir {
+		return true
+	}
+	if dir == string(filepath.Separator) {
+		return true
+	}
+	return strings.HasPrefix(p, dir+string(filepath.Separator))
+}
+
+// PathsOverlap reports whether one path is inside the other, either way.
+func PathsOverlap(a, b string) bool { return PathWithin(a, b) || PathWithin(b, a) }
+
+func parentOf(p string) string {
+	if p == "" {
+		return ""
+	}
+	return filepath.Dir(p)
 }
 
 // LookPathIn resolves cmd against an explicit PATH, the way the process that

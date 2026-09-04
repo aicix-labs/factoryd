@@ -1,5 +1,5 @@
 {
-  "schema_version": 3,
+  "schema_version": 4,
   "name": "widgets",
   "provider": "github",
   "github": {
@@ -15,7 +15,8 @@
   "paths": {
     "root": "/var/lib/factoryd/widgets",
     "producer_workdir": "/var/lib/factoryd/widgets/clone",
-    "submit_repo": "/var/lib/factoryd/widgets/submit"
+    "submit_repo": "/var/lib/factoryd/widgets/submit",
+    "cache_root": "/var/cache/factoryd/widgets"
   },
   "credentials": {
     "producer": {
@@ -85,7 +86,26 @@
       "kind": "command",
       "command": [
         "/usr/local/bin/notify-operator"
-      ]
+      ],
+      "env": {
+        "PATH": "/usr/local/bin:/usr/bin:/bin"
+      },
+      "timeout_seconds": 30
     }
-  ]
+  ],
+  "health": {
+    "interval_seconds": 60,
+    "alert_after": 3,
+    "repeat_seconds": 1800,
+    "stale_trigger_seconds": 900,
+    "turn_grace_seconds": 120,
+    "unreviewed_seconds": 0,
+    "disk_min_free_percent": 10,
+    "caches": [
+      {
+        "path": "/var/cache/factoryd/widgets/go",
+        "max_bytes": 5368709120
+      }
+    ]
+  }
 }

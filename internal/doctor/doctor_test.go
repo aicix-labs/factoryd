@@ -127,12 +127,12 @@ func fixture(t *testing.T) *config.Config {
 	}
 
 	cfg := &config.Config{
-		SchemaVersion: config.SchemaVersion,
-		Name:          "widgets",
-		Provider:      "github",
-		GitHub:        &config.GitHub{Owner: "acme", Repo: "widgets"},
-		TargetBranch:  "main",
-		Git:           config.Git{Remote: "https://github.com/acme/widgets.git", Transport: "https"},
+		SchemaVersion: config.SchemaVersion, Health: config.DefaultHealth(),
+		Name:         "widgets",
+		Provider:     "github",
+		GitHub:       &config.GitHub{Owner: "acme", Repo: "widgets"},
+		TargetBranch: "main",
+		Git:          config.Git{Remote: "https://github.com/acme/widgets.git", Transport: "https"},
 		Paths: config.Paths{
 			Root:            root,
 			ProducerWorkdir: filepath.Join(root, "work"),
@@ -258,9 +258,66 @@ func TestIndividualFailuresAreCaught(t *testing.T) {
 			wantName: "handoff inbox",
 		},
 		{
+			name: "cache root is a symlink",
+			mutate: func(t *testing.T, c *config.Config) {
+				real := filepath.Join(t.TempDir(), "real")
+				os.MkdirAll(real, 0o755)
+				link := filepath.Join(c.Paths.Root, "cache-link")
+				if err := os.Symlink(real, link); err != nil {
+					t.Fatal(err)
+				}
+				c.Paths.CacheRoot = link
+			},
+			wantName: "cache root",
+		},
+		{
+			name: "cache root is world-writable",
+			mutate: func(t *testing.T, c *config.Config) {
+				d := filepath.Join(c.Paths.Root, "cache-open")
+				os.MkdirAll(d, 0o777)
+				os.Chmod(d, 0o777)
+				c.Paths.CacheRoot = d
+			},
+			wantName: "cache root",
+		},
+		{
+			name: "cache root missing",
+			mutate: func(t *testing.T, c *config.Config) {
+				c.Paths.CacheRoot = filepath.Join(c.Paths.Root, "no-such-cache")
+			},
+			wantName: "cache root",
+		},
+		{
 			name:     "no alert transport",
 			mutate:   func(t *testing.T, c *config.Config) { c.Alerts = nil },
 			wantName: "alert transports",
+		},
+		{
+			// The path exists and looks writable to a stat; the probe finds
+			// out it is not, because it delivers rather than inspects.
+			name: "alert file cannot be appended",
+			mutate: func(t *testing.T, c *config.Config) {
+				blocker := filepath.Join(t.TempDir(), "not-a-dir")
+				if err := os.WriteFile(blocker, nil, 0o644); err != nil {
+					t.Fatal(err)
+				}
+				c.Alerts = []config.Alert{{Kind: "file", Path: filepath.Join(blocker, "alerts.log")}}
+			},
+			wantName: "alert file",
+		},
+		{
+			name: "alert command refuses the alert",
+			mutate: func(t *testing.T, c *config.Config) {
+				c.Alerts = []config.Alert{{Kind: "command", Command: []string{"false"}, Env: map[string]string{"PATH": "/usr/bin:/bin"}, TimeoutSeconds: 5}}
+			},
+			wantName: "alert command",
+		},
+		{
+			name: "one of two transports fails and the report names it",
+			mutate: func(t *testing.T, c *config.Config) {
+				c.Alerts = append(c.Alerts, config.Alert{Kind: "command", Command: []string{"false"}, Env: map[string]string{"PATH": "/usr/bin:/bin"}, TimeoutSeconds: 5})
+			},
+			wantName: "alert command",
 		},
 		{
 			name:     "gate command does not exist",
@@ -784,5 +841,23 @@ func TestReviewerUnderItsOwnIdentityPasses(t *testing.T) {
 	}
 	if !seen {
 		t.Fatal("the reviewer's command was never probed under its identity")
+	}
+}
+
+// The delivery probe is a delivery: a healthy run leaves a probe line in the
+// alert file. Without this, "alert file ok" would also be printed by a probe
+// that only stat'ed the path.
+func TestAlertProbeActuallyDelivers(t *testing.T) {
+	cfg := fixture(t)
+	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
+	if !r.OK() {
+		t.Fatalf("healthy fixture failed:\n%s", r)
+	}
+	body, err := os.ReadFile(cfg.Alerts[0].Path)
+	if err != nil {
+		t.Fatalf("no alert file after doctor: %v", err)
+	}
+	if !strings.Contains(string(body), `"kind":"doctor"`) || !strings.Contains(string(body), `"severity":"probe"`) {
+		t.Fatalf("alert file does not hold the probe:\n%s", body)
 	}
 }
