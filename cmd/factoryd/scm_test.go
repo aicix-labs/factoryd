@@ -168,3 +168,53 @@ func TestCloseRefusesAnOperatorThatIsTheReviewerByProviderID(t *testing.T) {
 		t.Fatalf("rc=%d closes=%v; an unresolved role was skipped", rc, closes)
 	}
 }
+
+// The driver that closes is the driver that proved the identity. A
+// rotation of operator.token between the proof and the close must not
+// close as the new token: the file is rewritten from inside the fake's
+// Whoami (the last read before the close), and the close is asserted to
+// have run as the token that was validated (#47 review).
+func TestCloseRunsAsTheTokenThatWasValidatedNotARereadOfTheFile(t *testing.T) {
+	root := t.TempDir()
+	write := func(name, tok string) config.CredentialRef {
+		p := filepath.Join(root, name)
+		if err := os.WriteFile(p, []byte(tok+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return config.CredentialRef{File: p}
+	}
+	cfg := &config.Config{Credentials: config.Credentials{
+		Producer: write("producer.token", "p"), Reviewer: write("reviewer.token", "r"), Operator: write("operator.token", "o1")}}
+	var closes []string
+	closed := false
+	build := func(cfg *config.Config, token string) (scm.Driver, error) {
+		return rotatingDriver{tokenDriver: tokenDriver{token: token, closes: &closes, closed: &closed}, cfg: cfg, t: t}, nil
+	}
+	role := &closeDriver{state: scm.StateOpen}
+	if rc := scmVerb(context.Background(), role, operatorPrincipal(cfg, build), "close", []string{"48"}, &printer{}); rc != exitOK {
+		t.Fatalf("rc=%d closes=%v", rc, closes)
+	}
+	if len(closes) != 1 || !strings.HasPrefix(closes[0], "o1:") {
+		t.Fatalf("closes=%v; the close ran as a token other than the one validated", closes)
+	}
+	if b, _ := os.ReadFile(cfg.Credentials.Operator.File); strings.TrimSpace(string(b)) != "o2" {
+		t.Fatal("the test's rotation did not happen; it proves nothing")
+	}
+}
+
+// rotatingDriver rewrites operator.token the moment the operator's
+// identity is read, which is after validation began and before any close.
+type rotatingDriver struct {
+	tokenDriver
+	cfg *config.Config
+	t   *testing.T
+}
+
+func (d rotatingDriver) Whoami(ctx context.Context) (scm.Identity, error) {
+	if d.token == "o1" {
+		if err := os.WriteFile(d.cfg.Credentials.Operator.File, []byte("o2\n"), 0o600); err != nil {
+			d.t.Fatal(err)
+		}
+	}
+	return d.tokenDriver.Whoami(ctx)
+}

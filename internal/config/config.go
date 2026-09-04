@@ -628,6 +628,7 @@ func (c *Config) Validate() error {
 				{"paths.submit_repo", c.Paths.SubmitRepo},
 				{"credentials.producer file", parentOf(c.Credentials.Producer.File)},
 				{"credentials.reviewer file", parentOf(c.Credentials.Reviewer.File)},
+				{"credentials.operator file", parentOf(c.Credentials.Operator.File)},
 			}
 			for i, a := range c.Alerts {
 				if a.Kind == "file" && a.Path != "" {

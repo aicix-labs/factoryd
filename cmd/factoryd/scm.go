@@ -78,14 +78,16 @@ func operatorPrincipal(cfg *config.Config, newDriver principal.DriverBuilder) fu
 		if cfg.Credentials.Operator.File == "" {
 			return nil, errors.New("credentials.operator is not configured; close is an operator's act and needs the operator's own credential (a file the reviewer and producer identities cannot read)")
 		}
-		if _, err := principal.Resolve(ctx, cfg, newDriver); err != nil {
+		// One read: the driver that proved the identity is the driver that
+		// closes. A second read of the file could be a different token.
+		three, err := principal.Resolve(ctx, cfg, newDriver)
+		if err != nil {
 			return nil, err
 		}
-		tok, err := cfg.Credentials.Operator.Resolve()
-		if err != nil {
-			return nil, fmt.Errorf("operator credential: %w", err)
+		if three.OperatorDriver == nil {
+			return nil, errors.New("operator identity resolved to no driver")
 		}
-		return newDriver(cfg, tok)
+		return three.OperatorDriver, nil
 	}
 }
 
