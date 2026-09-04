@@ -888,18 +888,22 @@ path, so an agent blocked *before* having something to push had no way to reach 
 counterpart and stopped, requiring a human relay. A question must carry a proposed
 fix: a yes/no costs one round trip, an open question costs three.
 
-**A verdict names the branch to declare.** `outbox/<id>.json` carries
-`change_id`, `kind`, `sha`, `summary`, `at`, `merge_commit` (verified merges
-only), and — because a producer without credential or network has no other way
-to map a change id back to a branch — `branch` (the pushed `<declared>-<tree>`)
-and `declared_branch` (the family). To update the change it was told about, the
-producer declares `declared_branch` again; submit pushes a new immutable member
-of that family and supersedes the old draft (§4.4). A verdict-triggered turn is
-also told `FACTORYD_VERDICT`, `FACTORYD_CHANGE_ID` and `FACTORYD_CHANGE_BRANCH`
-(the family) in its environment; on any other turn those keys are present and
-empty. Found on the first production cycle (#29): without this the producer
-read a stale branch from its seed clone and opened a second change beside the
-one under review.
+**A verdict names the family to re-declare.** A change is never updated in
+place: a fixed tree is a new immutable branch and a new draft, and it
+**supersedes** the old one only if it was declared under the same family name
+(§4.4) — the reviewed head stays reviewed, which is better than an update. The
+declared name is therefore the key that links a fix to the change it answers,
+and a producer without credential or network has no way to learn it: the
+verdict carries the id, `.producer-branch` is consumed by submit. So
+`outbox/<id>.json` carries, besides `change_id`, `kind`, `sha`, `summary`, `at`
+and `merge_commit` (verified merges only), `branch` (the pushed
+`<declared>-<tree>`) and `declared_branch` (the family). A verdict-triggered
+turn is also told `FACTORYD_VERDICT`, `FACTORYD_CHANGE_ID` and
+`FACTORYD_CHANGE_BRANCH` (the family) in its environment; on any other turn
+those keys are present and empty. Found on the first production cycle (#29):
+without the family name the producer re-declared a stale one from its seed
+clone and got an unrelated draft beside the change under review, not a
+superseding one.
 
 **Verdict summaries must stand alone.** The counterpart may be a sandboxed agent that
 cannot fetch the PR comment the summary references. Put the substance in the summary.

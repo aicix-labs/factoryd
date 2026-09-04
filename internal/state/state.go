@@ -151,11 +151,12 @@ type Verdict struct {
 	// MergeCommit is set only for a verified merge.
 	MergeCommit string `json:"merge_commit,omitempty"`
 	// Branch is the change's pushed source branch, <declared>-<tree>, and
-	// DeclaredBranch the family the producer declared (#29). A producer
-	// told "changes requested on change 48" holds no credential and no
-	// network; the only way it can update THAT change is to declare the
-	// same family again, and nothing else in its reach maps a change id to
-	// one. So the verdict carries it.
+	// DeclaredBranch the family the producer declared (#29). A change is
+	// never updated in place: a fix is a new immutable branch that
+	// SUPERSEDES the old draft only if declared under the same family. A
+	// producer told "changes requested on change 48" holds no credential
+	// and no network, and nothing else in its reach maps the id to that
+	// family. So the verdict carries it.
 	Branch         string `json:"branch,omitempty"`
 	DeclaredBranch string `json:"declared_branch,omitempty"`
 }

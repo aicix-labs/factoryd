@@ -127,12 +127,14 @@ the branch family by prefix.
 
 ### Operating notes from the runs
 
-- **The verdict now names the branch to declare** (#29). The first production
-  cycle found the producer opening a second change beside the one under review,
-  because nothing in its reach mapped the change id back to a declarable branch.
-  `outbox/<id>.json` carries `branch` and `declared_branch`, and a verdict turn
-  is told `FACTORYD_CHANGE_BRANCH`; a wrapper that persisted `.producer-branch`
-  before submit consumed it is no longer needed.
+- **The verdict now names the family to re-declare** (#29). A fix is never an
+  in-place update: it is a new immutable branch that *supersedes* the old draft
+  only when declared under the same family name. The first production cycle
+  found the producer re-declaring a stale name from its seed clone and getting
+  an unrelated draft beside the change under review. `outbox/<id>.json` carries
+  `branch` and `declared_branch`, and a verdict turn is told
+  `FACTORYD_CHANGE_BRANCH`; a wrapper that persisted `.producer-branch` before
+  submit consumed it is no longer needed.
 
 - **"A second pass with agent CLIs changes nothing except who writes the code"
   was not quite true** (#27): an agent CLI exits 0 whatever the model concluded,
