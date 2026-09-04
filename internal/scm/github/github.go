@@ -7,6 +7,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/url"
+	"strconv"
 	"strings"
 	"time"
 
@@ -141,6 +142,7 @@ func (p ghPull) toChange() scm.Change {
 		ID:           scm.ChangeID(fmt.Sprint(p.Number)),
 		Title:        p.Title,
 		Author:       p.User.Login,
+		AuthorID:     userID(p.User.ID),
 		SourceBranch: p.Head.Ref,
 		TargetBranch: p.Base.Ref,
 		HeadSHA:      p.Head.SHA,
@@ -209,7 +211,7 @@ func (d *Driver) Diff(ctx context.Context, id scm.ChangeID) ([]scm.FileDiff, err
 			return nil, fmt.Errorf("github diff %s: %w", id, err)
 		}
 		for _, f := range page {
-			out = append(out, scm.FileDiff{
+			fd := scm.FileDiff{
 				Path:    f.Filename,
 				OldPath: f.PreviousFilename,
 				Added:   f.Additions,
@@ -218,7 +220,14 @@ func (d *Driver) Diff(ctx context.Context, id scm.ChangeID) ([]scm.FileDiff, err
 				Deleted: f.Status == "removed",
 				Renamed: f.Status == "renamed",
 				Patch:   f.Patch,
-			})
+			}
+			// GitHub omits the patch of a file that is too large or binary.
+			// A file with changes and no patch is a file whose content was
+			// not delivered; it is said so, not read as "nothing added".
+			if f.Patch == "" && f.Status != "removed" && f.Status != "renamed" && (f.Additions+f.Deletions > 0 || f.Status == "added" || f.Status == "modified") {
+				fd.Incomplete, fd.IncompleteReason = true, "no patch delivered (large or binary)"
+			}
+			out = append(out, fd)
 		}
 		path = httpjson.NextLink(resp.Header)
 	}
@@ -535,12 +544,19 @@ func (d *Driver) Audits(ctx context.Context, id scm.ChangeID, sha string) ([]scm
 			if !ok {
 				continue
 			}
-			if a.PostedBy == "" {
-				a.PostedBy = c.User.Login
-			}
+			// The provider's authenticated author, overriding anything the
+			// body may claim.
+			a.PostedBy, a.PostedByID = c.User.Login, userID(c.User.ID)
 			all = append(all, a)
 		}
 		path = httpjson.NextLink(resp.Header)
 	}
 	return scm.SelectAudits(all, sha), nil
+}
+
+func userID(id int64) string {
+	if id == 0 {
+		return ""
+	}
+	return strconv.FormatInt(id, 10)
 }

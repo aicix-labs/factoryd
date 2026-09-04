@@ -20,7 +20,6 @@ type auditWire struct {
 	SHA      string   `json:"sha"`
 	Attempts []string `json:"attempts"`
 	Notes    string   `json:"notes,omitempty"`
-	PostedBy string   `json:"posted_by,omitempty"`
 	// A pointer, because omitempty does not omit a zero time.Time. An audit
 	// posted without a timestamp was writing "0001-01-01T00:00:00Z" into the
 	// comment, which reads like data and is not.
@@ -48,7 +47,7 @@ func EncodeAudit(a Audit) (string, error) {
 	}
 	w := auditWire{
 		Lens: a.Lens, Verdict: a.Verdict.String(), SHA: a.SHA,
-		Attempts: a.Attempts, Notes: a.Notes, PostedBy: a.PostedBy,
+		Attempts: a.Attempts, Notes: a.Notes,
 	}
 	if !a.PostedAt.IsZero() {
 		at := a.PostedAt.UTC().Truncate(time.Second)
@@ -98,7 +97,7 @@ func ParseAudit(body string) (a Audit, ok bool, err error) {
 	}
 	a = Audit{
 		Lens: w.Lens, Verdict: v, SHA: w.SHA, Attempts: w.Attempts,
-		Notes: w.Notes, PostedBy: w.PostedBy,
+		Notes: w.Notes,
 	}
 	if w.PostedAt != nil {
 		a.PostedAt = *w.PostedAt

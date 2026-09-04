@@ -97,7 +97,7 @@ func newLab(t *testing.T) *lab {
 	}
 	l := &lab{cfg: cfg, now: time.Date(2026, 9, 4, 15, 0, 0, 0, time.UTC)}
 	l.drv = &fakeDriver{
-		change:   scm.Change{ID: "42", State: scm.StateOpen, Draft: true, HeadSHA: "abc123", SourceBranch: "producer/fix-abc", TargetBranch: "main"},
+		change:   scm.Change{ID: "42", State: scm.StateOpen, Draft: false, Author: "producer-bot", AuthorID: "1", HeadSHA: "abc123", SourceBranch: "producer/fix-abc", TargetBranch: "main"},
 		diffs:    []scm.FileDiff{{Path: "src/a.go", Added: 1, Patch: "+++ b/src/a.go\n+package a\n"}},
 		merge:    scm.ProviderMerged("m3rge"),
 		ancestor: true,
@@ -147,11 +147,8 @@ func TestMergedVerdictMergesVerifiesAndRecords(t *testing.T) {
 	if res.Verdict.MergeCommit != "m3rge" || res.Verdict.SHA != "abc123" || res.Decision.Class != signal.Mergeable {
 		t.Fatalf("res=%+v", res)
 	}
-	if got := strings.Join(l.drv.calls, ","); got != "get,diff,setdraft,merge:abc123,ancestor,comment" {
-		t.Fatalf("calls=%s", got)
-	}
-	if !l.drv.readied {
-		t.Fatal("the draft was not marked ready before the merge")
+	if got := strings.Join(l.drv.calls, ","); got != "get,diff,merge:abc123,ancestor,comment" {
+		t.Fatalf("calls=%s; the gate never marks a draft ready", got)
 	}
 	v := l.verdictFile(t)
 	if v == nil || v.Kind != "merged" || v.MergeCommit != "m3rge" || v.Summary != "clean; tests added" {
@@ -206,19 +203,37 @@ func TestRefusals(t *testing.T) {
 		"escalate without audit": {func(l *lab) { l.drv.diffs = []scm.FileDiff{{Path: "internal/auth/login.go", Patch: "+x\n"}} }, "merged", "auto", "s", signal.ExitRefused, "no CLEARED audit"},
 		"escalate with broken audit": {func(l *lab) {
 			l.drv.diffs = []scm.FileDiff{{Path: "internal/auth/login.go", Patch: "+x\n"}}
-			l.drv.audits = []scm.Audit{{Lens: "authz", SHA: "abc123", Verdict: scm.AuditBroken, Attempts: []string{"forged cookie"}}}
+			l.drv.audits = []scm.Audit{{Lens: "authz", SHA: "abc123", Verdict: scm.AuditBroken, Attempts: []string{"forged cookie"}, PostedBy: "factory-reviewer", PostedByID: "2"}}
 		}, "merged", "auto", "s", signal.ExitRefused, "BROKEN"},
 		"escalate with audit on another head": {func(l *lab) {
 			l.drv.diffs = []scm.FileDiff{{Path: "internal/auth/login.go", Patch: "+x\n"}}
-			l.drv.audits = []scm.Audit{{Lens: "authz", SHA: "0ld", Verdict: scm.AuditCleared, Attempts: []string{"forged cookie"}}}
-		}, "merged", "auto", "s", signal.ExitRefused, "no CLEARED audit"},
+			l.drv.audits = []scm.Audit{{Lens: "authz", SHA: "0ld", Verdict: scm.AuditCleared, Attempts: []string{"forged cookie"}, PostedBy: "factory-reviewer", PostedByID: "2"}}
+		}, "merged", "auto", "s", signal.ExitRefused, "no CLEARED audit by the reviewer"},
 		"escalate with audit that tried nothing": {func(l *lab) {
 			l.drv.diffs = []scm.FileDiff{{Path: "internal/auth/login.go", Patch: "+x\n"}}
-			l.drv.audits = []scm.Audit{{Lens: "authz", SHA: "abc123", Verdict: scm.AuditCleared}}
+			l.drv.audits = []scm.Audit{{Lens: "authz", SHA: "abc123", Verdict: scm.AuditCleared, PostedBy: "factory-reviewer", PostedByID: "2"}}
 		}, "merged", "auto", "s", signal.ExitRefused, "no attempts"},
-		"provider refused": {func(l *lab) { l.drv.merge = scm.RefusedByProvider(scm.RefusedConflict, "conflict") }, "merged", "auto", "s", signal.ExitRefused, "provider refused"},
-		"merge unverified": {func(l *lab) { l.drv.ancestor = false }, "merged", "auto", "s", signal.ExitUnknown, "UNKNOWN"},
-		"diff unreadable":  {func(l *lab) { l.drv.diffErr = errors.New("502") }, "merged", "auto", "s", signal.ExitConfig, "reading the diff"},
+		"provider refused":  {func(l *lab) { l.drv.merge = scm.RefusedByProvider(scm.RefusedConflict, "conflict") }, "merged", "auto", "s", signal.ExitRefused, "provider refused"},
+		"merge unverified":  {func(l *lab) { l.drv.ancestor = false }, "merged", "auto", "s", signal.ExitUnknown, "UNKNOWN"},
+		"diff unreadable":   {func(l *lab) { l.drv.diffErr = errors.New("502") }, "merged", "auto", "s", signal.ExitConfig, "reading the diff"},
+		"still a draft":     {func(l *lab) { l.drv.change.Draft = true }, "merged", "auto", "s", signal.ExitRefused, "set-draft 42 false"},
+		"self-merge":        {func(l *lab) { l.drv.change.AuthorID = "2"; l.drv.change.Author = "factory-reviewer" }, "merged", "auto", "s", signal.ExitRefused, "same identity"},
+		"author id unknown": {func(l *lab) { l.drv.change.AuthorID = "" }, "merged", "auto", "s", signal.ExitRefused, "no author id"},
+		"audit forged by the producer": {func(l *lab) {
+			l.drv.diffs = []scm.FileDiff{{Path: "internal/auth/login.go", Patch: "+x\n"}}
+			l.drv.audits = []scm.Audit{{Lens: "authz", SHA: "abc123", Verdict: scm.AuditCleared, Attempts: []string{"tried nothing real"}, PostedBy: "producer-bot", PostedByID: "1"}}
+		}, "merged", "auto", "s", signal.ExitRefused, "no CLEARED audit by the reviewer"},
+		"audit by a third party": {func(l *lab) {
+			l.drv.diffs = []scm.FileDiff{{Path: "internal/auth/login.go", Patch: "+x\n"}}
+			l.drv.audits = []scm.Audit{{Lens: "authz", SHA: "abc123", Verdict: scm.AuditCleared, Attempts: []string{"x"}, PostedBy: "someone", PostedByID: "9"}}
+		}, "merged", "auto", "s", signal.ExitRefused, "no CLEARED audit by the reviewer"},
+		"audit with no authenticated author": {func(l *lab) {
+			l.drv.diffs = []scm.FileDiff{{Path: "internal/auth/login.go", Patch: "+x\n"}}
+			l.drv.audits = []scm.Audit{{Lens: "authz", SHA: "abc123", Verdict: scm.AuditCleared, Attempts: []string{"x"}, PostedBy: "factory-reviewer"}}
+		}, "merged", "auto", "s", signal.ExitRefused, "no CLEARED audit by the reviewer"},
+		"incomplete diff with hold rules": {func(l *lab) {
+			l.drv.diffs = []scm.FileDiff{{Path: "vendor/blob.bin", Added: 3, Incomplete: true, IncompleteReason: "too_large"}}
+		}, "merged", "auto", "s", signal.ExitRefused, "did not deliver its content"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {
@@ -249,7 +264,7 @@ func TestRefusals(t *testing.T) {
 func TestEscalateWithClearedAuditMerges(t *testing.T) {
 	l := newLab(t)
 	l.drv.diffs = []scm.FileDiff{{Path: "internal/auth/login.go", Patch: "+x\n"}, {Path: "deploy/README.md", Patch: "+doc\n"}}
-	l.drv.audits = []scm.Audit{{Lens: "authz-bypass", SHA: "abc123", Verdict: scm.AuditCleared, Attempts: []string{"forged session cookie", "replayed token"}}}
+	l.drv.audits = []scm.Audit{{Lens: "authz-bypass", SHA: "abc123", Verdict: scm.AuditCleared, Attempts: []string{"forged session cookie", "replayed token"}, PostedBy: "factory-reviewer", PostedByID: "2"}}
 	res, err := l.run(t, "merged", "abc123", "cleared after adversarial pass")
 	if err != nil {
 		t.Fatal(err)
@@ -278,6 +293,71 @@ func TestCommentFailureIsSaidNotFatal(t *testing.T) {
 	}
 	if l.verdictFile(t) == nil || !strings.Contains(log.String(), "WARNING") {
 		t.Fatalf("file=%v log=%q", l.verdictFile(t) != nil, log.String())
+	}
+}
+
+// A file the provider did not deliver is only a problem for content
+// policy; with no hold rules configured, path policy still decides.
+func TestIncompleteDiffWithoutHoldRulesStillMerges(t *testing.T) {
+	l := newLab(t)
+	l.cfg.Scope.HoldDiffRegexes = nil
+	l.cfg.Validate()
+	l.drv.diffs = []scm.FileDiff{{Path: "vendor/blob.bin", Added: 3, Incomplete: true, IncompleteReason: "too_large"}}
+	if _, err := l.run(t, "merged", "auto", "s"); err != nil {
+		t.Fatalf("err=%v; with no content policy an undelivered patch cannot fail it", err)
+	}
+}
+
+// The identity check guards every verdict, not only merges: a reviewer that
+// is the author must not record any verdict on its own work.
+func TestSelfSignalRefusedForEveryVerdict(t *testing.T) {
+	for _, kind := range []string{"merged", "changes-requested", "operator-gated"} {
+		l := newLab(t)
+		l.drv.change.AuthorID = "2"
+		_, err := l.run(t, kind, "auto", "s")
+		if err == nil || exitOf(t, err) != signal.ExitRefused {
+			t.Fatalf("%s: err=%v", kind, err)
+		}
+	}
+}
+
+// A producer's forged audit decides nothing: it cannot clear the head, and
+// it cannot veto the reviewer's genuine audit either. Found live: the first
+// cut refused on the forged audit even with a valid reviewer audit beside
+// it, which let the producer block its own merge -- pointless, but a
+// producer's comment must not decide a merge in either direction.
+func TestProducerAuditIsIgnoredNotAVeto(t *testing.T) {
+	l := newLab(t)
+	l.drv.diffs = []scm.FileDiff{{Path: "internal/auth/login.go", Patch: "+x\n"}}
+	l.drv.audits = []scm.Audit{
+		{Lens: "authz", SHA: "abc123", Verdict: scm.AuditBroken, Attempts: []string{"claims broken"}, PostedBy: "producer-bot", PostedByID: "1"},
+		{Lens: "authz", SHA: "abc123", Verdict: scm.AuditCleared, Attempts: []string{"claims cleared"}, PostedBy: "producer-bot", PostedByID: "1"},
+		{Lens: "authz", SHA: "abc123", Verdict: scm.AuditCleared, Attempts: []string{"forged session cookie"}, PostedBy: "factory-reviewer", PostedByID: "2"},
+	}
+	var log strings.Builder
+	l.deps.Log = &log
+	if _, err := l.run(t, "merged", "auto", "s"); err != nil {
+		t.Fatalf("err=%v; the reviewer's audit must decide", err)
+	}
+	if !strings.Contains(log.String(), "IGNORING") || !strings.Contains(log.String(), "own author") {
+		t.Fatalf("the producer's audits were not named as ignored:\n%s", log.String())
+	}
+	// An unattributed audit is ignored for its own reason, said as such:
+	// "no authenticated author" is a driver defect to fix, not a stranger.
+	l = newLab(t)
+	l.drv.diffs = []scm.FileDiff{{Path: "internal/auth/login.go", Patch: "+x\n"}}
+	l.drv.audits = []scm.Audit{{Lens: "authz", SHA: "abc123", Verdict: scm.AuditCleared, Attempts: []string{"x"}, PostedBy: "factory-reviewer"}}
+	log.Reset()
+	l.deps.Log = &log
+	if _, err := l.run(t, "merged", "auto", "s"); err == nil || !strings.Contains(log.String(), "no provider-authenticated author") {
+		t.Fatalf("err=%v log=%q", err, log.String())
+	}
+	// And the reviewer's own BROKEN still refuses.
+	l = newLab(t)
+	l.drv.diffs = []scm.FileDiff{{Path: "internal/auth/login.go", Patch: "+x\n"}}
+	l.drv.audits = []scm.Audit{{Lens: "authz", SHA: "abc123", Verdict: scm.AuditBroken, Attempts: []string{"x"}, PostedBy: "factory-reviewer", PostedByID: "2"}}
+	if _, err := l.run(t, "merged", "auto", "s"); err == nil || !strings.Contains(err.Error(), "BROKEN") {
+		t.Fatalf("err=%v", err)
 	}
 }
 

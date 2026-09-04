@@ -276,6 +276,8 @@ func scGet(ctx context.Context, d scm.Driver, f Factory) error {
 		return fmt.Errorf("Get.SourceBranch = %q, want %q", c.SourceBranch, SourceBranch)
 	case c.Author != ProducerName:
 		return fmt.Errorf("Get.Author = %q, want %q", c.Author, ProducerName)
+	case c.AuthorID == "":
+		return fmt.Errorf("Get.AuthorID is empty; two-party trust is decided on the provider's stable id at the merge gate, never on the login")
 	case c.State != scm.StateOpen:
 		return fmt.Errorf("Get.State = %v, want open", c.State)
 	case c.Draft:
@@ -505,6 +507,9 @@ func scAudits(ctx context.Context, d scm.Driver, f Factory) error {
 	}
 	if a.PostedBy == "" {
 		return fmt.Errorf("Audits[0].PostedBy is empty; an unattributed audit is not evidence")
+	}
+	if a.PostedByID == "" {
+		return fmt.Errorf("Audits[0].PostedByID is empty; the merge gate decides authorship on the provider's stable id, and a driver that does not carry it cannot feed the gate")
 	}
 	return nil
 }

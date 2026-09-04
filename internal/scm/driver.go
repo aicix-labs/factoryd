@@ -44,9 +44,14 @@ func (s ChangeState) String() string {
 
 // Change is one pull request or merge request.
 type Change struct {
-	ID           ChangeID
-	Title        string
-	Author       string
+	ID     ChangeID
+	Title  string
+	Author string
+	// AuthorID is the provider's stable id of the author. Distinctness from
+	// the reviewer is decided on this, never on the login, at the moment of
+	// the irreversible operation (§2 two-party trust). Empty means the
+	// provider did not say, which is not the same as distinct.
+	AuthorID     string
 	SourceBranch string
 	TargetBranch string
 	HeadSHA      string
@@ -67,6 +72,14 @@ type FileDiff struct {
 	Deleted bool
 	Renamed bool
 	Patch   string
+	// Incomplete is set when the provider did not deliver this file's
+	// content: GitLab collapses large diffs and omits ones that are too
+	// large; GitHub omits the patch of a large or binary file. Content
+	// policy cannot be evaluated on what was not delivered, and a gate that
+	// evaluated it on an empty patch would pass exactly the file most worth
+	// looking at.
+	Incomplete       bool
+	IncompleteReason string
 }
 
 // PipelineState is the CI verdict for a commit.
@@ -155,8 +168,14 @@ type Audit struct {
 	SHA      string       `json:"sha"`
 	Attempts []string     `json:"attempts"`
 	Notes    string       `json:"notes,omitempty"`
-	PostedBy string       `json:"posted_by,omitempty"`
-	PostedAt time.Time    `json:"posted_at,omitempty"`
+	// PostedBy and PostedByID are who the PROVIDER says posted the comment
+	// that carries this audit. They are set by the driver from the
+	// authenticated comment author and never from the comment body: a body
+	// is written by whoever posts it, and an audit that could name its own
+	// author could be forged by the producer for its own head.
+	PostedBy   string    `json:"posted_by,omitempty"`
+	PostedByID string    `json:"posted_by_id,omitempty"`
+	PostedAt   time.Time `json:"posted_at,omitempty"`
 }
 
 // Validate enforces SPEC.md §6.4: an audit that records no attempts is not a

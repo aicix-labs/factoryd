@@ -102,6 +102,18 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 	if change.State != scm.StateOpen {
 		return Result{}, refuse("change %s is %s, not open", req.ID, change.State)
 	}
+	// Two-party trust, decided here, at the irreversible operation, on the
+	// provider's stable ids -- not on logins, and not on a doctor result
+	// that may be stale or a credential that may have been swapped since.
+	// An author the provider did not name is not known to be distinct.
+	switch {
+	case deps.Reviewer.ID == "":
+		return Result{}, failed("the reviewer identity has no provider id; distinctness cannot be established")
+	case change.AuthorID == "":
+		return Result{}, refuse("change %s has no author id from the provider; it cannot be shown to be someone else's work", req.ID)
+	case change.AuthorID == deps.Reviewer.ID:
+		return Result{}, refuse("change %s was authored by %s (id %s), the same identity signalling as reviewer; a reviewer never merges its own work", req.ID, change.Author, change.AuthorID)
+	}
 	sha := req.SHA
 	switch {
 	case sha == "" || sha == "auto":
@@ -124,6 +136,14 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 		if len(diffs) == 0 {
 			return res, refuse("change %s has an empty diff; there is nothing to merge", req.ID)
 		}
+		// Content policy is evaluated on delivered content only. A file the
+		// provider did not deliver -- collapsed, too large, binary -- cannot
+		// be evaluated, and is refused rather than read as "nothing added".
+		for _, f := range diffs {
+			if f.Incomplete && len(cfg.Scope.HoldDiffRegexes) > 0 {
+				return res, refuse("scope policy cannot be evaluated on %s: the provider did not deliver its content (%s); review it by hand and signal operator-gated, or merge outside the gate", f.Path, f.IncompleteReason)
+			}
+		}
 		res.Decision = Classify(&cfg.Scope, diffs)
 		for _, r := range res.Decision.Reasons {
 			fmt.Fprintf(log, "scope: %s\n", r)
@@ -140,17 +160,21 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 				return res, failed("reading audits of %s at %s: %w", req.ID, sha, err)
 			}
 			res.Audits = audits
-			if err := auditsClear(audits, sha); err != nil {
+			if err := auditsClear(audits, sha, deps.Reviewer, change, log); err != nil {
 				return res, refuse("scope policy requires an adversarial audit of %s at %s: %v\n  %s", req.ID, sha, err, strings.Join(res.Decision.Reasons, "\n  "))
 			}
 			fmt.Fprintf(log, "audit: %d cleared on %s\n", len(audits), sha)
 		}
 
-		// 3. Ready, then merge with the expected head, then verify.
+		// 3. Merge with the expected head, then verify. The gate does NOT
+		// mark a draft ready: no provider offers a ready mutation conditional
+		// on the head, so a producer pushing between the check and the
+		// mutation would have its unreviewed head marked ready by the gate
+		// (the merge, being head-conditional, would then refuse -- but the
+		// ready state would stand). Marking ready is the reviewer's own,
+		// explicit act, done after review and before signalling.
 		if change.Draft {
-			if err := deps.Driver.SetDraft(ctx, req.ID, false); err != nil {
-				return res, failed("marking %s ready: %w", req.ID, err)
-			}
+			return res, refuse("change %s is still a draft; the gate does not mark a draft ready. After review: factoryd scm --config <f> set-draft %s false, then signal", req.ID, req.ID)
 		}
 		mr, err := scm.MergeVerified(ctx, deps.Driver, req.ID, sha, cfg.TargetBranch)
 		if err != nil {
@@ -191,13 +215,30 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 }
 
 // auditsClear decides whether the audits on a head satisfy an escalate
-// class: at least one CLEARED audit pinned to this exact sha, and no BROKEN
-// one. The driver already refused audits without attempts at the type
-// boundary; this checks them again, because the gate is where it matters.
-func auditsClear(audits []scm.Audit, sha string) error {
+// class: at least one CLEARED audit pinned to this exact sha, posted by the
+// authenticated reviewer, and no BROKEN one by the reviewer. Authorship is
+// the provider's word (the driver sets it from the comment's authenticated
+// author). Audits by anyone else -- the change's author above all, whose
+// audit of its own head is the forgery the requirement exists to prevent --
+// are not counted and are named: they can neither clear a head nor veto
+// it, because a producer's comment must not decide a merge either way. The
+// driver already refused audits without attempts at the type boundary;
+// this checks them again, because the gate is where it matters.
+func auditsClear(audits []scm.Audit, sha string, reviewer scm.Identity, change scm.Change, log io.Writer) error {
 	cleared := 0
 	for _, a := range audits {
 		if a.SHA != sha {
+			continue
+		}
+		switch {
+		case a.PostedByID == "":
+			fmt.Fprintf(log, "audit: ignoring %q: no provider-authenticated author\n", a.Lens)
+			continue
+		case a.PostedByID == change.AuthorID:
+			fmt.Fprintf(log, "audit: IGNORING %q posted by the change's own author %s; a producer does not audit its own head\n", a.Lens, a.PostedBy)
+			continue
+		case a.PostedByID != reviewer.ID:
+			fmt.Fprintf(log, "audit: ignoring %q posted by %s (id %s), not the reviewer signalling now\n", a.Lens, a.PostedBy, a.PostedByID)
 			continue
 		}
 		if err := a.Validate(); err != nil {
@@ -211,7 +252,7 @@ func auditsClear(audits []scm.Audit, sha string) error {
 		}
 	}
 	if cleared == 0 {
-		return errors.New("no CLEARED audit is recorded on this head")
+		return errors.New("no CLEARED audit by the reviewer is recorded on this head")
 	}
 	return nil
 }

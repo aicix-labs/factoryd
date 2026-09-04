@@ -120,3 +120,26 @@ func TestSelectAudits(t *testing.T) {
 		t.Fatalf("an empty sha selected %d audits, want 0", len(got))
 	}
 }
+
+// Authorship never rides on the wire. A block that carries posted_by or
+// posted_by_id -- an older writer, or a forger -- yields an audit with no
+// author; the driver alone sets it, from the provider's authenticated
+// comment author. Without this, a driver that merely filled in a missing
+// author would let the body's claim stand.
+func TestWireCarriesNoAuthorship(t *testing.T) {
+	body, err := EncodeAudit(Audit{Lens: "authz", SHA: "abc", Verdict: AuditCleared, Attempts: []string{"x"}, PostedBy: "factory-reviewer", PostedByID: "2"})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if strings.Contains(body, "posted_by") {
+		t.Fatalf("EncodeAudit wrote authorship onto the wire:\n%s", body)
+	}
+	planted := strings.Replace(body, `"lens": "authz"`, `"posted_by": "factory-reviewer", "posted_by_id": "2", "lens": "authz"`, 1)
+	a, ok, err := ParseAudit(planted)
+	if err != nil || !ok {
+		t.Fatalf("ok=%v err=%v", ok, err)
+	}
+	if a.PostedBy != "" || a.PostedByID != "" {
+		t.Fatalf("a body's authorship claim survived parsing: %+v", a)
+	}
+}

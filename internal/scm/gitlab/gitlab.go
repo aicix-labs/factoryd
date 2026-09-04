@@ -118,6 +118,7 @@ func (m glMR) toChange() scm.Change {
 		ID:           scm.ChangeID(strconv.Itoa(m.IID)),
 		Title:        m.Title,
 		Author:       m.Author.Username,
+		AuthorID:     userID(m.Author.ID),
 		SourceBranch: m.SourceBranch,
 		TargetBranch: m.TargetBranch,
 		HeadSHA:      m.SHA,
@@ -247,6 +248,10 @@ func (d *Driver) readDiffs(ctx context.Context, id scm.ChangeID) ([]scm.FileDiff
 		RenamedFile bool   `json:"renamed_file"`
 		DeletedFile bool   `json:"deleted_file"`
 		Diff        string `json:"diff"`
+		// GitLab documents two incomplete states: a collapsed diff (content
+		// withheld, fetch it separately) and one too large to render.
+		Collapsed bool `json:"collapsed"`
+		TooLarge  bool `json:"too_large"`
 	}
 	var out []scm.FileDiff
 	page := "1"
@@ -267,6 +272,14 @@ func (d *Driver) readDiffs(ctx context.Context, id scm.ChangeID) ([]scm.FileDiff
 				Deleted: f.DeletedFile,
 				Renamed: f.RenamedFile,
 				Patch:   f.Diff,
+			}
+			switch {
+			case f.TooLarge:
+				fd.Incomplete, fd.IncompleteReason = true, "too_large: GitLab did not deliver the content"
+			case f.Collapsed:
+				fd.Incomplete, fd.IncompleteReason = true, "collapsed: GitLab withheld the content"
+			case f.Diff == "" && !f.DeletedFile && !f.RenamedFile:
+				fd.Incomplete, fd.IncompleteReason = true, "empty patch for a changed file"
 			}
 			if f.RenamedFile {
 				fd.OldPath = f.OldPath
@@ -613,12 +626,19 @@ func (d *Driver) Audits(ctx context.Context, id scm.ChangeID, sha string) ([]scm
 			if !ok {
 				continue
 			}
-			if a.PostedBy == "" {
-				a.PostedBy = n.Author.Username
-			}
+			// The provider's authenticated author, overriding anything the
+			// body may claim.
+			a.PostedBy, a.PostedByID = n.Author.Username, userID(n.Author.ID)
 			all = append(all, a)
 		}
 		page = nextPage(resp.Header)
 	}
 	return scm.SelectAudits(all, sha), nil
+}
+
+func userID(id int64) string {
+	if id == 0 {
+		return ""
+	}
+	return strconv.FormatInt(id, 10)
 }

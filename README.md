@@ -47,7 +47,10 @@ Every verb in the SPEC's surface is built. `signal merged` is the merge gate:
 the `scope` policy in the config (deny / allow / hold-diff / escalate regexes,
 preserved from v1 as data) decides what may merge, what needs a recorded
 adversarial audit on the exact head, and what a human must approve — and a
-gate result never substitutes a verdict the reviewer did not choose.
+gate result never substitutes a verdict the reviewer did not choose. Two-party
+trust is decided there too, on the provider's stable ids: the reviewer is never
+the author, an audit counts only when the provider says the reviewer posted it,
+and the gate never marks a draft ready.
 
 ## What works today
 
@@ -138,6 +141,7 @@ $ echo $?
 5
 $ factoryd audit --config f.json post 61 3f9a1c2b7d --lens authz-bypass --verdict CLEARED --file attempts.json
 audit authz-bypass CLEARED posted on 61 at 3f9a1c2b7d by factory-reviewer (3 attempts)
+$ factoryd scm --config f.json set-draft 61 false      # the reviewer's own act; the gate never does it
 $ factoryd signal --config f.json 61 merged auto --summary "cleared: authz bypass attempts recorded"
 merged 61 at 3f9a1c2b7d merged as 8c2e41d0aa (verified); wrote /var/lib/factoryd/widgets/outbox/61.json
 ```
