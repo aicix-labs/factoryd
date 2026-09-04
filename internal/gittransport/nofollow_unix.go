@@ -4,6 +4,7 @@ package gittransport
 
 import (
 	"os"
+	"path/filepath"
 	"syscall"
 )
 
@@ -21,4 +22,24 @@ func OpenNoFollow(dir *os.File, name string, flags int) (*os.File, error) {
 		return nil, &os.PathError{Op: "openat", Path: name, Err: err}
 	}
 	return os.NewFile(uintptr(fd), name), nil
+}
+
+// PhysicalPrefix resolves p through its deepest existing ancestor: the
+// symlinks of what exists are followed, and the part that does not exist
+// yet is appended lexically. It is what a path will BE once created.
+func PhysicalPrefix(p string) string {
+	p = filepath.Clean(p)
+	rest := ""
+	for cur := p; ; {
+		if real, err := filepath.EvalSymlinks(cur); err == nil {
+			return filepath.Join(real, rest)
+		}
+		parent, base := filepath.Split(cur)
+		parent = filepath.Clean(parent)
+		if parent == cur {
+			return filepath.Join(cur, rest)
+		}
+		rest = filepath.Join(base, rest)
+		cur = parent
+	}
 }

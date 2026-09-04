@@ -335,7 +335,12 @@ operator command that saw a moment, and the producer owns its home and can
 reopen it during its turn; so `submit` asks the gate identity the same question
 again, after the producer has quiesced and immediately before provisioning and
 running the gate, and refuses — exit 3, a boundary failure, not a red branch —
-if the answer changed.
+if the answer changed. And because provisioning a gate path chowns it to the
+gate by that same privileged process, **no gate path may overlap the producer's
+home**: refused at load lexically, refused by `submit` physically — each path
+resolved through its deepest existing ancestor, so a symlink planted under a
+declared path is seen for where it lands — before any ownership changes, and the
+traversal probe is repeated after provisioning as the last lock.
 
 **The producer's sandbox is the supervisor's, not the agent's.**
 `roles.producer.sandbox.no_network` starts the turn in a new, empty network
@@ -1207,6 +1212,7 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §4.4 one intent reader | only a message, only a branch, an empty message, a dangling branch link → an error the after-turn counts on the streak; neither file → no intent | both files → the declaration |
 | §4.4 producer holds no credential | the producer identity can read either credential file → `doctor` fails; a probe that cannot read even the producer's own workdir → `doctor` fails as an unproved boundary | the producer can read its workdir and neither token |
 | §4.4 producer home re-proved at the crossing | `doctor` green with the home at `0700`; the producer reopens it to `0711` during its turn → `submit` refuses before the gate (exit 3), nothing provisioned, pushed or opened; a `0711` home passes a read probe and fails the traversal probe | the home closed again → the gate runs and the change is pushed |
+| §4.4 gate paths and the producer home | a gate path equal to, under, or above the home → refused at load; one that reaches the home only physically (a symlink, or a not-yet-existing path under one) → refused by `submit` **before the provisioner is called**; a provisioning that opened the home by a route neither lock saw → the re-probe refuses the gate | an ordinary gate path is provisioned and the gate runs |
 | §6.4 the gate refuses | a deny path (either name of a rename), held content on an added line, an escalate path with no audit / a `BROKEN` audit / an audit on another head / an audit that tried nothing, a moved head, a closed change, an empty diff, a provider refusal → `merged` is refused **before** any merge call (the provider's own refusal excepted), no verdict file is written | a mergeable change is readied, merged with the expected head, verified, and recorded in file, state and comment |
 | §6.4 refuse, not downgrade | an operator-only result refuses; the recorded verdict is never one the gate substituted | the reviewer's own `operator-gated` signal records without merging |
 | §6.4 hold is on additions | a removed key and a `+++` header do not hold; an added key does | — |

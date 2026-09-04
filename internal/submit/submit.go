@@ -296,6 +296,24 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		fmt.Fprintf(log, "boundary: the gate cannot traverse %s\n", home)
 	}
 
+	// 5b. No gate path may overlap the producer's home, judged PHYSICALLY:
+	// a declared path is chowned to the gate by this privileged process,
+	// and one that reaches into the home -- a symlink planted under a
+	// declared path, say -- would grant the gate exactly the traversal
+	// just refused, after the probe and before the gate. Judged before any
+	// ownership changes; Validate's lexical check is the first lock.
+	if home := cfg.Roles.Producer.Env["HOME"]; home != "" {
+		physHome := gittransport.PhysicalPrefix(home)
+		for _, p := range cfg.Gate.RequiredWritablePaths {
+			resolved, err := cfg.ResolveGatePath(p)
+			if err != nil {
+				return Result{}, wrap(ExitConfig, err, "gate path %s", p)
+			}
+			if phys := gittransport.PhysicalPrefix(resolved); config.PathsOverlap(phys, physHome) {
+				return Result{}, fail(ExitConfig, "gate path %q resolves to %s, which overlaps the producer's home %s; provisioning it would hand the gate the producer's model credential -- not provisioning, not running the gate", p, phys, physHome)
+			}
+		}
+	}
 	for _, p := range cfg.Gate.RequiredWritablePaths {
 		resolved, err := cfg.ResolveGatePath(p)
 		if err != nil {
@@ -303,6 +321,18 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		}
 		if err := deps.Provision.Provision(ctx, resolved); err != nil {
 			return Result{}, wrap(ExitConfig, err, "gate path %s could not be provisioned for the gate", p)
+		}
+	}
+	// 5c. Defense in depth: provisioning changed ownership under the gate;
+	// the boundary is asked again after it, so a path that reached the home
+	// by a route neither lock saw still refuses the gate.
+	if home := cfg.Roles.Producer.Env["HOME"]; home != "" {
+		can, err := deps.Provision.GateCanTraverse(ctx, home)
+		if err != nil {
+			return Result{}, wrap(ExitConfig, err, "re-probing the producer's home %s after provisioning", home)
+		}
+		if can {
+			return Result{}, fail(ExitConfig, "the gate identity can traverse the producer's home %s AFTER provisioning the gate paths; a declared path reached the home -- not running the gate", home)
 		}
 	}
 	exe, err := config.LookPathIn(cfg.Gate.Env["PATH"], cfg.Gate.Command[0])

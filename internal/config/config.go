@@ -678,8 +678,17 @@ func (c *Config) Validate() error {
 			add("gate.required_writable_paths contains an empty entry")
 			continue
 		}
-		if _, err := c.ResolveGatePath(p); err != nil {
+		resolved, err := c.ResolveGatePath(p)
+		if err != nil {
 			add("gate.required_writable_paths: %v", err)
+			continue
+		}
+		// A gate path is provisioned -- created and chowned to the gate --
+		// by a privileged submit. One that overlaps the producer's home
+		// would hand the gate exactly the traversal the boundary denies it,
+		// after doctor and submit both said no.
+		if home := c.Roles.Producer.Env["HOME"]; home != "" && filepath.IsAbs(home) && PathsOverlap(resolved, home) {
+			add("gate.required_writable_paths: %q resolves to %s, which overlaps the producer's home %s; provisioning it would grant the gate the producer's model credential", p, resolved, home)
 		}
 	}
 
