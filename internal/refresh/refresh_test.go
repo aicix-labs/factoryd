@@ -17,6 +17,7 @@ import (
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/refresh"
+	"github.com/aicix-labs/factoryd/internal/scm"
 	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/submit"
 	"github.com/aicix-labs/factoryd/internal/supervise"
@@ -289,6 +290,7 @@ func (r *scriptedRunner) Run(_ context.Context, t supervise.Turn, _ func(proc.Re
 func (r *scriptedRunner) count() int { r.mu.Lock(); defer r.mu.Unlock(); return r.n }
 
 type e2e struct {
+	lookup     func(context.Context, scm.ChangeID) (scm.Change, error)
 	cfg        *config.Config
 	upstream   string
 	submitRepo string
@@ -358,6 +360,7 @@ func (e *e2e) deps(t *testing.T) func(context.Context) (refresh.Deps, error) {
 				e.refreshes++
 				return refresh.ApplyLocal(ctx, "git", e.work, bundle, branch)
 			},
+			Lookup: e.lookup,
 		}, nil
 	}
 }
@@ -722,5 +725,102 @@ func TestOperatorRefreshRefusesWhenATurnStartedFirst(t *testing.T) {
 	}
 	if e.refreshes != 1 {
 		t.Fatalf("refreshes=%d, want 1 (the turn start's)", e.refreshes)
+	}
+}
+
+// ---------- #43: a change merged outside factoryd ----------
+
+type lookupFake struct {
+	state scm.ChangeState
+	err   error
+	calls int
+}
+
+func (f *lookupFake) get(context.Context, scm.ChangeID) (scm.Change, error) {
+	f.calls++
+	if f.err != nil {
+		return scm.Change{}, f.err
+	}
+	return scm.Change{ID: "55", State: f.state}, nil
+}
+
+// Reconcile asks the provider once about an open cycle's own change and
+// nothing else: merged or closed finishes the cycle, a failed read leaves
+// it open and says so, and cycles in any other phase are not looked up.
+func TestReconcileFinishesAnOpenCycleWhoseChangeIsNoLongerOpen(t *testing.T) {
+	open := func() *state.State {
+		st := state.New("f")
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.ChangeID = "55"
+		st.LastVerdict = &state.Verdict{ChangeID: "55", Kind: state.VerdictOperatorGated}
+		return st
+	}
+	for _, c := range []struct {
+		st    scm.ChangeState
+		want  string
+		found bool
+	}{{scm.StateMerged, state.CycleFinished, true}, {scm.StateClosed, state.CycleFinished, true}, {scm.StateOpen, state.CycleOpen, false}} {
+		st := open()
+		f := &lookupFake{state: c.st}
+		changed, _ := refresh.Reconcile(context.Background(), nil, st, f.get, time.Now())
+		if changed != c.found || st.Cycle.Phase != c.want || f.calls != 1 {
+			t.Fatalf("provider %s: changed=%v phase=%s calls=%d", c.st, changed, st.Cycle.Phase, f.calls)
+		}
+	}
+	st := open()
+	f := &lookupFake{err: errors.New("503")}
+	if changed, note := refresh.Reconcile(context.Background(), nil, st, f.get, time.Now()); changed || st.Cycle.Phase != state.CycleOpen || !strings.Contains(note, "left open") {
+		t.Fatalf("a failed read finished the cycle: %v %q %s", changed, note, st.Cycle.Phase)
+	}
+	if changed, _ := refresh.Reconcile(context.Background(), nil, open(), nil, time.Now()); changed {
+		t.Fatal("no lookup, yet the cycle changed")
+	}
+	for _, phase := range []string{state.CycleWorking, state.CycleSubmitting, state.CycleFinished, state.CycleClean, state.CycleUnknown} {
+		st := state.New("f")
+		st.SetCycle(phase, time.Now()).ChangeID = "55"
+		f := &lookupFake{state: scm.StateMerged}
+		if changed, _ := refresh.Reconcile(context.Background(), nil, st, f.get, time.Now()); changed || f.calls != 0 {
+			t.Fatalf("phase %s: looked up (%d) or changed (%v)", phase, f.calls, changed)
+		}
+	}
+}
+
+// End to end: the reviewer signalled operator-gated, a human merged !55,
+// last_verdict still says operator-gated. The next brief's before-turn
+// step reconciles under the lock, finishes the cycle, and refreshes to
+// the moved target. Nothing polled: one read, at the decision.
+func TestOperatorMergedChangeIsReconciledAtTheNextBrief(t *testing.T) {
+	e := newE2E(t)
+	e.setCycle(t, func(st *state.State) {
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.ChangeID, c.Family, c.Digest = "55", "feat/x", "feat/x-abc"
+		st.LastVerdict = &state.Verdict{ChangeID: "55", Kind: state.VerdictOperatorGated}
+	})
+	e.edit(t, "landed.go", "the change a human merged")
+	os.WriteFile(filepath.Join(e.upstream, "landed.go"), []byte("the change a human merged"), 0o644)
+	git(t, e.upstream, "add", ".")
+	git(t, e.upstream, "commit", "-qm", "merge !55")
+	want := git(t, e.upstream, "rev-parse", "HEAD")
+	lk := &lookupFake{state: scm.StateMerged}
+	e.lookup = lk.get
+	e.wake(t)
+	r := &scriptedRunner{act: func(int, supervise.Turn) supervise.TurnResult { e.progress(t); return supervise.TurnResult{} }}
+	if err := e.run(t, r, 1); err != nil {
+		t.Fatal(err)
+	}
+	if lk.calls != 1 {
+		t.Fatalf("provider read %d times, want exactly 1", lk.calls)
+	}
+	if e.refreshes != 1 {
+		t.Fatalf("refreshes=%d, want 1: the reconciled cycle did not start a new one", e.refreshes)
+	}
+	if c := e.cycle(t); c == nil || c.Phase != state.CycleWorking || c.Base != want {
+		t.Fatalf("cycle %+v, want working at %s", c, want)
+	}
+	// And last_verdict, untouched by the refresh, still says operator-gated:
+	// the cycle, not the verdict, governs the refresh.
+	st, _ := state.Load(e.cfg.StatePath(), e.cfg.Name)
+	if st.LastVerdict.Kind != state.VerdictOperatorGated {
+		t.Fatalf("last_verdict = %s", st.LastVerdict.Kind)
 	}
 }

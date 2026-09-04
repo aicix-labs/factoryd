@@ -99,6 +99,7 @@ func refreshDeps(ctx context.Context, cfg *config.Config) (refresh.Deps, error) 
 	return refresh.Deps{
 		Fetch:  transport.Fetch,
 		Bundle: repo.Bundle,
+		Lookup: driver.Get, // one read of the cycle's change, for Reconcile (#43)
 		Apply: func(ctx context.Context, bundle, branch string) (string, error) {
 			return applyAsProducer(ctx, cfg, self, bundle, branch)
 		},

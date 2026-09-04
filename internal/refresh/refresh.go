@@ -26,6 +26,7 @@ import (
 	"time"
 
 	"github.com/aicix-labs/factoryd/internal/config"
+	"github.com/aicix-labs/factoryd/internal/scm"
 	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/supervise"
 )
@@ -40,6 +41,9 @@ type Deps struct {
 	// Apply, as the producer, fetches branch from the bundle into the
 	// workdir and resets to it, returning the workdir's HEAD afterwards.
 	Apply func(ctx context.Context, bundle, branch string) (sha string, err error)
+	// Lookup reads one change at the provider, for Reconcile. Nil means
+	// no reconciliation: the cycle record is taken as it stands.
+	Lookup func(ctx context.Context, id scm.ChangeID) (scm.Change, error)
 }
 
 // Result is what a refresh did.
@@ -47,6 +51,8 @@ type Result struct {
 	// SHA is the workdir's HEAD after the refresh, verified equal to the
 	// bundle's tip.
 	SHA string
+	// Note reports a reconciliation that happened on the way (#43).
+	Note string
 }
 
 // Ref is where the transport's fetch leaves the target branch.
@@ -134,6 +140,35 @@ func Decide(st *state.State) (run bool, reason string) {
 	}
 }
 
+// Reconcile brings an open cycle up to date with the provider by one read
+// (#43): a change the reviewer signalled operator-gated and a human then
+// merged left the cycle open forever, refusing every refresh and never
+// telling the producer its work landed. Nothing watches the provider;
+// this asks once, at the moment a refresh is being decided, and only
+// about the cycle's own change. Merged finishes the cycle; closed without
+// a merge ends it too (the draft is gone; its branch is still at the
+// provider), noted as such. A read that fails leaves the record as it is
+// -- unknown is not finished -- and says so.
+func Reconcile(ctx context.Context, _ *config.Config, st *state.State, lookup func(context.Context, scm.ChangeID) (scm.Change, error), now time.Time) (changed bool, note string) {
+	c := st.Cycle
+	if lookup == nil || c == nil || c.Phase != state.CycleOpen || c.ChangeID == "" {
+		return false, ""
+	}
+	ch, err := lookup(ctx, scm.ChangeID(c.ChangeID))
+	if err != nil {
+		return false, fmt.Sprintf("cycle left open: could not read change %s at the provider (%v)", c.ChangeID, err)
+	}
+	switch ch.State {
+	case scm.StateMerged:
+		st.SetCycle(state.CycleFinished, now).Note = "change " + c.ChangeID + " found merged at the provider (reconciled at refresh time)"
+		return true, "cycle finished: change " + c.ChangeID + " is merged at the provider"
+	case scm.StateClosed:
+		st.SetCycle(state.CycleFinished, now).Note = "change " + c.ChangeID + " found closed without a merge at the provider (reconciled at refresh time)"
+		return true, "cycle finished: change " + c.ChangeID + " was closed without a merge at the provider"
+	}
+	return false, ""
+}
+
 // ErrRefused is returned by Guarded when the cycle, re-read under the
 // lock, does not allow a refresh.
 var ErrRefused = errors.New("refresh refused")
@@ -151,10 +186,14 @@ var ErrRefused = errors.New("refresh refused")
 func Guarded(ctx context.Context, cfg *config.Config, deps Deps, force bool) (Result, string, error) {
 	var r Result
 	var prev string
+	var reconciled string
 	_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
 		prev = state.CycleUnknown
 		if st.Cycle != nil {
 			prev = st.Cycle.Phase
+		}
+		if changed, note := Reconcile(ctx, cfg, st, deps.Lookup, time.Now()); changed || note != "" {
+			reconciled = note
 		}
 		if !force {
 			if run, why := Decide(st); !run {
@@ -168,6 +207,9 @@ func Guarded(ctx context.Context, cfg *config.Config, deps Deps, force bool) (Re
 		st.SetCycle(state.CycleNew, time.Now()).Base = r.SHA
 		return nil
 	})
+	if reconciled != "" && err == nil {
+		r.Note = reconciled
+	}
 	return r, prev, err
 }
 
@@ -181,19 +223,37 @@ func BeforeTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 	return func(ctx context.Context, t supervise.Turn) (string, error) {
 		var msg string
 		_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
-			run, why := Decide(st)
-			msg = "workdir not refreshed: " + why
-			if run {
-				deps, err := mkDeps(ctx)
+			// An open cycle is checked against the provider once before
+			// the decision (#43): the deps are built for that read, and
+			// reused for the refresh if one follows.
+			var deps Deps
+			var built bool
+			if c := st.Cycle; c != nil && c.Phase == state.CycleOpen {
+				d, err := mkDeps(ctx)
 				if err != nil {
 					return err
+				}
+				deps, built = d, true
+				if _, note := Reconcile(ctx, cfg, st, deps.Lookup, time.Now()); note != "" {
+					msg = note + "; "
+				}
+			}
+			run, why := Decide(st)
+			msg += "workdir not refreshed: " + why
+			if run {
+				if !built {
+					d, err := mkDeps(ctx)
+					if err != nil {
+						return err
+					}
+					deps = d
 				}
 				r, err := Run(ctx, cfg, deps)
 				if err != nil {
 					return err
 				}
 				st.SetCycle(state.CycleNew, time.Now()).Base = r.SHA
-				msg = fmt.Sprintf("workdir refreshed to %s at %s", cfg.TargetBranch, short(r.SHA))
+				msg = strings.TrimSuffix(msg, "workdir not refreshed: "+why) + fmt.Sprintf("workdir refreshed to %s at %s", cfg.TargetBranch, short(r.SHA))
 			}
 			// The turn is about to run: from here the tree is the producer's.
 			if c := st.Cycle; c != nil && c.Phase == state.CycleNew {

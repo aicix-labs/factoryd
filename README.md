@@ -55,6 +55,10 @@ and the gate never marks a draft ready.
 
 ## What works today
 
+A change a human merged outside factoryd is reconciled by one provider read
+when the next refresh is decided, and `factoryd verdict <id> merged` records
+it as a real verdict that wakes the producer (SPEC §3). Nothing polls.
+
 `factoryd scm close <id> [reason]` retires a superseded draft as the operator
 principal: `credentials.operator`, a third token the reviewer identity cannot
 read and a third *provider identity*, both proved by `doctor` and re-proved

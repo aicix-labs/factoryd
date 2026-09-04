@@ -42,6 +42,8 @@ usage:
   factoryd signal    --config <f> <id> <verdict> <sha|auto> --summary <s>
                                                      record the reviewer's verdict; "merged" IS the merge gate
                                                      exits 0 done, 3 config, 5 refused (scope/audit/head/provider), 6 merge unknown
+  factoryd verdict   --config <f> <id> merged [summary]   record a merge a human made outside factoryd:
+                                                     verified at the provider, wakes the producer, finishes the cycle
   factoryd audit     --config <f> post <id> <sha> --lens <l> --verdict CLEARED|BROKEN --file <f>
                                                      record an adversarial pass on the head; no attempts is not a pass
   factoryd scm       --config <f> <verb>...         drive the provider directly
@@ -106,6 +108,8 @@ func main() {
 		}
 		c.Close()
 		os.Exit(exitOK)
+	case "verdict":
+		os.Exit(runVerdict(args))
 	case "signal":
 		os.Exit(runSignal(args))
 	case "audit":

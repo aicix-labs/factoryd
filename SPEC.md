@@ -126,7 +126,17 @@ immutable branch of a cycle still `submitting` finishes it from the signal
 side. Refresh runs only at `new`, `finished` and `clean`; `working` keeps a
 first turn's edits through the retry that follows its failure; a document
 written before the record existed loads as `unknown`, and unknown authorizes
-nothing. A refresh that fails is a failed
+nothing. **A change merged outside factoryd** — the reviewer signalled
+`operator-gated`, a human merged — is learned two ways, neither a watcher
+(#43). At the moment a refresh is decided, under the lock, an `open` cycle's
+own change is read at the provider *once*: merged, or closed without a merge,
+finishes the cycle (noted as reconciled); a read that fails leaves it open and
+says so. And `factoryd verdict --config <f> <id> merged [summary]` is the
+operator's verb to say so deliberately: verified at the provider first (merged,
+head on the target), written to the outbox as a real verdict marked
+`recorded_by: operator` — which wakes the producer, so the human's action
+re-enters the protocol where it left — and the cycle finished. It records a
+merge that happened; it does not perform one. A refresh that fails is a failed
 turn on the streak (exit 1002), and the agent does not run over a tree the step
 could not prepare. `factoryd refresh --config <f>` is the same step by hand,
 refused outside `new`/`finished`/`clean` unless `--force`d, which is the

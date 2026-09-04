@@ -298,3 +298,63 @@ func commentFor(v state.Verdict, who scm.Identity) string {
 	}
 	return b
 }
+
+// RecordMerged is the operator's verb for a change merged outside factoryd
+// (#43): the reviewer signalled operator-gated, a human merged, and
+// nothing told the factory. Nothing polls; the operator says so once, and
+// the merge re-enters the protocol as a real verdict: verified at the
+// provider first -- the change is merged and its head is on the target --
+// then written to the outbox, which wakes the producer, recorded in state,
+// and the cycle finished if the change is the cycle's. A change that is
+// not merged is refused: this records what happened, it does not make it
+// happen.
+func RecordMerged(ctx context.Context, cfg *config.Config, d scm.Driver, id scm.ChangeID, summary string, now func() time.Time) (state.Verdict, string, error) {
+	if now == nil {
+		now = time.Now
+	}
+	if strings.TrimSpace(summary) == "" {
+		summary = "merged by the operator outside factoryd"
+	}
+	change, err := d.Get(ctx, id)
+	if err != nil {
+		return state.Verdict{}, "", fmt.Errorf("reading change %s: %w", id, err)
+	}
+	if change.State != scm.StateMerged {
+		return state.Verdict{}, "", fmt.Errorf("change %s is %s, not merged; factoryd verdict records a merge that happened, it does not perform one", id, change.State)
+	}
+	if change.HeadSHA == "" {
+		return state.Verdict{}, "", fmt.Errorf("change %s reports no head sha; the merge cannot be verified", id)
+	}
+	target := change.TargetBranch
+	if target == "" {
+		target = cfg.TargetBranch
+	}
+	on, err := d.IsAncestor(ctx, change.HeadSHA, target)
+	if err != nil {
+		return state.Verdict{}, "", fmt.Errorf("verifying %s on %s: %w", change.HeadSHA, target, err)
+	}
+	if !on {
+		return state.Verdict{}, "", fmt.Errorf("change %s says merged but its head %s is not on %s; not recording a merge that is not there", id, change.HeadSHA, target)
+	}
+	v := state.Verdict{
+		ChangeID: string(id), Kind: state.VerdictMerged, SHA: change.HeadSHA, Summary: summary, At: now(),
+		MergeCommit: change.HeadSHA, Branch: change.SourceBranch, DeclaredBranch: state.FamilyOf(change.SourceBranch),
+		RecordedBy: "operator",
+	}
+	path, err := writeVerdict(cfg, v)
+	if err != nil {
+		return state.Verdict{}, "", fmt.Errorf("writing the verdict: %w", err)
+	}
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(s *state.State) error {
+		s.LastVerdict = &v
+		if c := s.Cycle; c != nil && ((c.Phase == state.CycleOpen && c.ChangeID == v.ChangeID) ||
+			(c.Phase == state.CycleSubmitting && v.Branch != "" && c.Digest == v.Branch)) {
+			s.SetCycle(state.CycleFinished, now())
+			s.Cycle.ChangeID = v.ChangeID
+		}
+		return nil
+	}); err != nil {
+		return state.Verdict{}, "", fmt.Errorf("recording the verdict in state: %w", err)
+	}
+	return v, path, nil
+}

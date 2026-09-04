@@ -271,6 +271,10 @@ type Verdict struct {
 	// family. So the verdict carries it.
 	Branch         string `json:"branch,omitempty"`
 	DeclaredBranch string `json:"declared_branch,omitempty"`
+	// RecordedBy names who recorded the verdict: "reviewer" (signal, the
+	// gate) or "operator" (factoryd verdict, a human closing the loop on a
+	// change they merged outside factoryd, #43). Empty means reviewer.
+	RecordedBy string `json:"recorded_by,omitempty"`
 }
 
 // ReadVerdictFile reads an outbox/<id>.json handoff document and requires
