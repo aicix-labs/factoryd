@@ -41,9 +41,9 @@ pretending.
 | 5a | Git transport (https), the owned environment, the two-directory boundary, `doctor`'"'"'s probe | **done** |
 | 5b | `submit`: materialize, gate, open the Draft PR/MR, signal | **done** |
 | 6 | Health tick, alert transports (`file`, `command`), resource guards, bounded caches | **done** |
-| 7 | Status page | not started |
+| 7 | Status page: `factoryd status`, HTML + JSON, read-only | **done** |
 
-`factoryd signal`, `audit` and `status` exit non-zero with "not implemented in
+`factoryd signal` and `audit` exit non-zero with "not implemented in
 this build". A subcommand that silently did nothing would be
 indistinguishable from one that ran and found nothing to do.
 
@@ -100,6 +100,28 @@ with write access to an ancestor can retarget between a check and a delete. A co
 the tick: a fail-safe alert goes out through the transports regardless. `doctor` delivers
 a probe alert through every transport rather than inspecting them, because
 "the path looks writable" is not "the alert landed".
+
+the status page — is it working, what is it doing right now, what is it waiting
+on, what needs me — as one-shot text, JSON, or a served page with a JSON
+endpoint. Read-only by contract and by test: nothing under the factory root
+changes when it is read, and the provider is asked once per health interval,
+not per reload:
+
+```console
+$ factoryd status --config f.json
+widgets  NOT WORKING  (github -> main)  at 2026-09-04T14:02:11Z
+needs you:
+  ! reviewer supervisor pid 4120 (start token 3ab1) is dead and did not halt
+  ! change 61 is operator-gated: touches deploy/ (escalate-class path)
+producer  supervisor pid 4118 alive (inotify); idle, last turn producer-20260904T135501-3 exit 0 after 7m12s; waiting on verdict(7m10s)
+reviewer  supervisor DEAD; running reviewer-20260904T140104-9 (wake) for 1m07s
+health    healthy, 41s ago
+  volume /var/lib/factoryd/widgets      71.2% free
+changes   1 open as of 2026-09-04T14:01:40Z
+  61     draft producer/fix-3f9a1c2b7d -> main  gate: match command position
+verdict   operator-gated on 61 at 2026-09-04T13:58:02Z: touches deploy/ (escalate-class path)
+$ factoryd status --config f.json --config g.json --serve 127.0.0.1:8080
+```
 
 a supervised role loop, where the agent turn is any command you configure:
 
