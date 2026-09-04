@@ -54,7 +54,8 @@
       "sandbox": {
         "no_network": true
       },
-      "timeout_seconds": 120
+      "timeout_seconds": 120,
+      "_note": "sandbox.no_network suits this scripted producer; a codex/claude producer must reach its API and must not set it"
     },
     "reviewer": {
       "command": [

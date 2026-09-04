@@ -305,7 +305,14 @@ namespace, created by factoryd as root at clone before the identity switch; a
 factoryd that cannot create it refuses to start the turn rather than starting it
 connected. `doctor` proves it from inside: a listener doctor opens must be
 unreachable from the sandboxed probe and reachable from the unsandboxed one.
-SUBMIT is the producer supervisor's **after-turn step**: after a turn that
+**It is for producers whose network is not their own** — a scripted turn, or
+an agent whose tooling sandboxes its shell while the agent process itself talks
+to a hosted model. `no_network` takes the network from the *whole* turn, the
+agent process included; a producer that is itself a hosted-model CLI (codex,
+claude) must reach its API and **must not** set it — its own tool sandbox is what
+keeps the *shell* offline, and §4.4's two-directory boundary is what keeps git
+out of its hands either way. SUBMIT is the producer supervisor's **after-turn
+step**: after a turn that
 exited clean and declared intent, the supervisor runs submit outside the sandbox
 as itself; a submit that fails on configuration or identity counts on the fail
 streak like a turn that exited non-zero.

@@ -150,7 +150,9 @@ merged 61 at 3f9a1c2b7d merged as 8c2e41d0aa (verified); wrote /var/lib/factoryd
 a supervised role loop, where the agent turn is any command you configure. The
 producer's turn can be sandboxed by the supervisor itself
 (`roles.producer.sandbox.no_network`: a new network namespace, created as root
-before the identity switch, proved by `doctor` from inside), and `submit` is the
+before the identity switch, proved by `doctor` from inside — for scripted turns
+or tool-sandboxed agents, **not** for a producer that is itself a hosted-model
+CLI, which must reach its API), and `submit` is the
 producer supervisor's after-turn step — the turn declares intent in files and
 exits; the supervisor does the git and network work outside the sandbox:
 
