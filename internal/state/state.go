@@ -116,6 +116,11 @@ type RoleState struct {
 	// a restart re-persists it and refuses rather than reading the missing
 	// file as an acknowledgement (#32 review).
 	SentinelWritten bool `json:"sentinel_written,omitempty"`
+	// LeftoverTurns counts turns that recorded progress but left processes
+	// behind after the leader exited. The strays are killed and verified
+	// gone; the turn stands (#33). The count is the hygiene signal an
+	// operator reads to know an agent's tooling is leaking.
+	LeftoverTurns int `json:"leftover_turns,omitempty"`
 	// LastHalt is the most recent halt after it was cleared: the audit
 	// trail of a circuit breaker that tripped and was reset. The reset is
 	// the operator's restart after removing the sentinel (#30); a halt that

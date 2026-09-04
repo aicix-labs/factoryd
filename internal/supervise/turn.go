@@ -253,12 +253,25 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 		s.log.Error("turn could not run", "turn", turn.ID, "err", runErr)
 	}
 
+	// A turn that left processes running: they were killed and verified
+	// gone before the runner returned, so the tree is quiescent either way.
+	// What the strays mean depends on whether the turn did its work. Real
+	// agent CLIs leave helpers behind (shell snapshots, language servers,
+	// MCP hosts) after posting their audit and signalling; counting such a
+	// turn as failed re-armed a retry that reviewed the same change again,
+	// and under supersession every redundant verdict grew the change family
+	// by one draft (#33). With progress recorded the turn stands and the
+	// leak is a hygiene warning, counted in state; with no progress it is
+	// the failure the containment check was written for.
+	hygiene := false
 	if runErr == nil && res.Leftover {
-		// A turn that left processes running is not finished. Nothing follows
-		// it, and it counts as a failure: a producer that keeps a child alive
-		// past its exit is either broken or trying something.
-		s.log.Error("turn left processes running after its leader exited; killed, and counting the turn as failed", "turn", turn.ID)
-		res.ExitCode = ExitLeftover
+		if s.progressMTime().After(before) {
+			hygiene = true
+			s.log.Error("turn left processes running after its leader exited; killed. The turn recorded progress, so it stands and is not retried", "turn", turn.ID)
+		} else {
+			s.log.Error("turn left processes running after its leader exited and recorded no progress; killed, and counting the turn as failed", "turn", turn.ID)
+			res.ExitCode = ExitLeftover
+		}
 	}
 	// After a clean turn, the supervisor's own follow-up (submit, for the
 	// producer). Its failure is the turn's failure.
@@ -347,6 +360,9 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 			rs.Halted = true
 			rs.HaltReason = haltReason
 			rs.HaltedAt = ended
+		}
+		if hygiene {
+			rs.LeftoverTurns++
 		}
 		return nil
 	}); err != nil {

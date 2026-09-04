@@ -71,6 +71,9 @@ type RoleView struct {
 	Pending []PendingView `json:"pending,omitempty"`
 	Spin    int           `json:"spin_count"`
 	Fails   int           `json:"fail_streak"`
+	// LeftoverTurns is hygiene: turns that did their work but left
+	// processes behind, which were killed (#33).
+	LeftoverTurns int `json:"leftover_turns"`
 	// Stopped is the halt sentinel on disk, which outlives the process.
 	Stopped bool `json:"stop_sentinel"`
 }
@@ -186,7 +189,7 @@ func (c *Collector) Collect(ctx context.Context) Snapshot {
 	for _, r := range state.Roles {
 		rs := st.Role(r)
 		role := string(r)
-		v := RoleView{WatchMode: rs.WatchMode, Halted: rs.Halted, HaltReason: rs.HaltReason, LastHalt: rs.LastHalt, Spin: rs.SpinCount, Fails: rs.FailStreak}
+		v := RoleView{WatchMode: rs.WatchMode, Halted: rs.Halted, HaltReason: rs.HaltReason, LastHalt: rs.LastHalt, Spin: rs.SpinCount, Fails: rs.FailStreak, LeftoverTurns: rs.LeftoverTurns}
 		if rs.Supervisor != nil {
 			v.Supervisor = &SupervisorView{PID: rs.Supervisor.PID, StartedAt: rs.Supervisor.StartedAt}
 			alive, err := c.deps.Alive(*rs.Supervisor)

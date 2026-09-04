@@ -99,6 +99,9 @@ func Text(s Snapshot) string {
 		if v.LastHalt != nil && !v.Halted {
 			fmt.Fprintf(&sb, "; recovered from a halt (%s) at %s", v.LastHalt.Reason, v.LastHalt.ClearedAt.Format(time.RFC3339))
 		}
+		if v.LeftoverTurns > 0 {
+			fmt.Fprintf(&sb, "; %d turn(s) left processes behind (killed; the agent's tooling is leaking)", v.LeftoverTurns)
+		}
 		if len(v.Pending) > 0 {
 			sb.WriteString("; waiting on")
 			for _, p := range v.Pending {

@@ -40,10 +40,11 @@ type TurnResult struct {
 	TimedOut bool
 	// Leftover records that the turn's leader exited but other processes in
 	// its group were still running -- a background child the agent left
-	// behind. They were killed. A turn that is still running is not a clean
-	// turn: nothing may follow it (no submit) while something the producer
-	// started can still rewrite the tree, and it counts as a failure. A
-	// child that detached from the group escapes this check; the root-
+	// behind. They were killed and, under cgroup containment, verified gone
+	// before the runner returned, so nothing the producer started is still
+	// rewriting the tree when the supervisor judges the turn. A leftover
+	// turn that recorded no progress counts as a failure; one that did
+	// stands, with the leak counted as hygiene (#33). A child that detached from the group escapes this check; the root-
 	// mediated crossing does not rely on it (§4.4: every read is no-follow,
 	// judged on the opened descriptor).
 	Leftover bool
@@ -54,8 +55,10 @@ type TurnResult struct {
 	Containment string
 }
 
-// ExitLeftover is recorded for a turn whose leader exited zero but left
-// processes running in its group.
+// ExitLeftover is recorded for a turn whose leader exited zero, left
+// processes running in its group, and recorded no progress. A leftover
+// turn that did record progress stands: the strays are killed either way,
+// and the leak is counted as hygiene, not failure (#33).
 const ExitLeftover = 1001
 
 // ExitAfterTurnFailed is the exit code recorded for a turn whose agent
