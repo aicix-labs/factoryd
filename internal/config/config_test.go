@@ -428,3 +428,58 @@ func TestReviewerCredentialCannotReplaceAGeneratedValue(t *testing.T) {
 		t.Fatalf("an ordinary credential name was not injected:\n%s", strings.Join(env, "\n"))
 	}
 }
+
+// The operator principal is a boundary only as a third secret: a file the
+// role identities cannot read, distinct from both role tokens, never an
+// environment variable (#47 review).
+func TestOperatorCredentialMustBeAThirdFile(t *testing.T) {
+	base := func(t *testing.T) *config.Config {
+		t.Helper()
+		c, err := config.Load("../../examples/factory.github.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	c := base(t)
+	c.Credentials.Operator = c.Credentials.Reviewer
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "credentials.operator and credentials.reviewer point at the same secret") {
+		t.Fatalf("operator == reviewer accepted: %v", err)
+	}
+	c = base(t)
+	c.Credentials.Operator = c.Credentials.Producer
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "credentials.operator and credentials.producer point at the same secret") {
+		t.Fatalf("operator == producer accepted: %v", err)
+	}
+	c = base(t)
+	c.Credentials.Operator = config.CredentialRef{Env: "OPERATOR_TOKEN"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "credentials.operator.env is not accepted") {
+		t.Fatalf("operator from env accepted: %v", err)
+	}
+	c = base(t)
+	c.Credentials.Operator = config.CredentialRef{File: "/etc/factoryd/widgets/operator.token"}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("a distinct operator file refused: %v", err)
+	}
+}
+
+// The operator credential's directory is protected from cache reclamation
+// like the two role credentials' are: reclamation deletes, and a token
+// under the cache root is a token that disappears (#47 review).
+func TestCacheRootMayNotContainTheOperatorCredential(t *testing.T) {
+	c, err := config.Load("../../examples/factory.github.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Paths.CacheRoot = "/var/cache/factoryd"
+	c.Health.Caches = []config.Cache{{Path: "/var/cache/factoryd/go", MaxBytes: 1}}
+	c.Credentials.Operator = config.CredentialRef{File: "/var/cache/factoryd/secrets/operator.token"}
+	err = c.Validate()
+	if err == nil || !strings.Contains(err.Error(), "credentials.operator file") {
+		t.Fatalf("an operator token under the cache root was accepted: %v", err)
+	}
+	c.Credentials.Operator = config.CredentialRef{File: "/etc/factoryd/widgets/operator.token"}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("a token outside the cache root refused: %v", err)
+	}
+}

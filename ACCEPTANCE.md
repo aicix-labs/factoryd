@@ -127,6 +127,14 @@ the branch family by prefix.
 
 ### Operating notes from the runs
 
+- **Three tokens, three OS identities** (#36, #47). `credentials.operator` is
+  the human's own provider token, 0600 root; `reviewer.token` is 0640
+  root:factoryd-reviewer and the reviewer role runs as `factoryd-reviewer`;
+  `producer.token` is readable by factoryd alone. `doctor` proves each role
+  cannot read what it must not, and that the three resolve to three provider
+  ids. `factoryd scm close` is the operator's, run as root; a reviewer turn
+  that runs it gets a refusal naming the missing credential.
+
 - **A refused submission is not retried into a loop** (#40, #42). A reviewer
   marked the family's open change ready; the producer re-declared the family;
   submit refused, correctly — and the supervisor re-armed a retry of the whole

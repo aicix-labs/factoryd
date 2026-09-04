@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -11,6 +12,7 @@ import (
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/factory"
+	"github.com/aicix-labs/factoryd/internal/principal"
 	"github.com/aicix-labs/factoryd/internal/scm"
 )
 
@@ -61,11 +63,40 @@ func runSCM(args []string) int {
 		fmt.Fprintf(os.Stderr, "factoryd scm: %v\n", err)
 		return exitConfig
 	}
+	operator := operatorPrincipal(cfg, factory.NewDriver)
+	return scmVerb(context.Background(), d, operator, rest[0], rest[1:], &printer{json: *asJSON})
+}
 
-	ctx := context.Background()
-	out := &printer{json: *asJSON}
+// operatorPrincipal resolves the operator's driver for the one verb that
+// needs it. It never falls back to a role's token, and it proves the
+// operator a third PROVIDER identity immediately before use: all three
+// credentials resolved in this process's context and compared by stable
+// id, a role that cannot be resolved being an error, never a role skipped
+// (#47 review). Two files holding one token are one authority.
+func operatorPrincipal(cfg *config.Config, newDriver principal.DriverBuilder) func(context.Context) (scm.Driver, error) {
+	return func(ctx context.Context) (scm.Driver, error) {
+		if cfg.Credentials.Operator.File == "" {
+			return nil, errors.New("credentials.operator is not configured; close is an operator's act and needs the operator's own credential (a file the reviewer and producer identities cannot read)")
+		}
+		// One read: the driver that proved the identity is the driver that
+		// closes. A second read of the file could be a different token.
+		three, err := principal.Resolve(ctx, cfg, newDriver)
+		if err != nil {
+			return nil, err
+		}
+		if three.OperatorDriver == nil {
+			return nil, errors.New("operator identity resolved to no driver")
+		}
+		return three.OperatorDriver, nil
+	}
+}
 
-	verb, rest := rest[0], rest[1:]
+// scmVerb dispatches one verb against the role's driver. close alone uses
+// the operator principal, obtained through operator(); a verb that could
+// reach Driver.Close through the role's driver would be the reviewer
+// closing. Separate from credential and driver construction so guards can
+// be tested against fakes.
+func scmVerb(ctx context.Context, d scm.Driver, operator func(context.Context) (scm.Driver, error), verb string, rest []string, out *printer) int {
 	need := func(n int, form string) bool {
 		if len(rest) < n {
 			fmt.Fprintf(os.Stderr, "factoryd scm %s: usage: %s\n", verb, form)
@@ -194,6 +225,58 @@ func runSCM(args []string) int {
 			return out.fail(err)
 		}
 		return exitOK
+
+	case "close":
+		// Closing is not conditional at either provider: between the read
+		// and the close another party can mark the change ready, or merge
+		// it, and the close still lands or reports success. Submit avoids
+		// that race by never closing; the automated reviewer protocol does
+		// too. So close runs as the OPERATOR principal only -- a credential
+		// the reviewer identity cannot read (#47 review) -- through a driver
+		// the role's token never builds. The window is narrowed, not
+		// removed: the change must be an open draft at the last read, and
+		// afterwards it must be closed; merged is reported as what it is.
+		if !need(1, "close <id> [reason]") {
+			return exitError
+		}
+		if operator == nil {
+			return out.fail(errors.New("close: no operator principal available"))
+		}
+		od, err := operator(ctx)
+		if err != nil {
+			return out.fail(fmt.Errorf("close: %w", err))
+		}
+		id := scm.ChangeID(rest[0])
+		c, err := od.Get(ctx, id)
+		if err != nil {
+			return out.fail(err)
+		}
+		if c.State != scm.StateOpen {
+			return out.fail(fmt.Errorf("change %s is %s, not open; nothing to close", id, c.State))
+		}
+		if !c.Draft {
+			return out.fail(fmt.Errorf("change %s is ready, not a draft; it has left the producer's hands and is not a superseded draft to retire", id))
+		}
+		reason := "superseded by a newer submission"
+		if len(rest) > 1 {
+			reason = strings.Join(rest[1:], " ")
+		}
+		if err := od.Close(ctx, id, reason); err != nil {
+			return out.fail(err)
+		}
+		// Verified, not believed: re-read, and only closed is success.
+		after, err := od.Get(ctx, id)
+		if err != nil {
+			return out.fail(fmt.Errorf("close reported success but the change could not be re-read: %w", err))
+		}
+		switch after.State {
+		case scm.StateClosed:
+			return exitOK
+		case scm.StateMerged:
+			return out.fail(fmt.Errorf("change %s is MERGED after the close: another party merged it in the window the close cannot exclude; nothing was retired", id))
+		default:
+			return out.fail(fmt.Errorf("close reported success but change %s is %s", id, after.State))
+		}
 
 	case "merge":
 		if !need(2, "merge <id> <expected-head>") {

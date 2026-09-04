@@ -56,7 +56,7 @@ type Result struct {
 	// Supersedes lists the earlier drafts in the family that the new draft
 	// replaces. They are left open: closing one would be a write to a change
 	// that may have left the producer's hands since it was last read, and no
-	// provider offers a close conditional on that. The reviewer closes them.
+	// provider offers a close conditional on that. An operator retires them.
 	Supersedes []scm.ChangeID
 	// DirtyPaths is set on ExitNothing: files the producer changed without
 	// declaring a submission (issue #12). The next turn's failure is then
@@ -488,10 +488,11 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	// closed. Submit never writes to an existing change: any read of one is
 	// stale by the time the write lands, and neither provider offers a
 	// close conditional on the state that was read. A draft a reviewer
-	// took in that window would be closed under them. The reviewer, who
-	// holds the merge, closes what it supersedes.
+	// took in that window would be closed under them. Neither does the
+	// automated reviewer, for the same reason; the OPERATOR retires what is
+	// superseded, as the operator principal, having read both (#36).
 	for _, id := range supersedes {
-		fmt.Fprintf(log, "draft: supersedes %s (left open for the reviewer)\n", id)
+		fmt.Fprintf(log, "draft: supersedes %s (left open; an operator retires it with factoryd scm close)\n", id)
 	}
 
 	// 9. Record the open draft, THEN signal the reviewer, then retire the
@@ -784,7 +785,7 @@ func firstLine(s string) string {
 func draftBody(msg, sha string, at time.Time, supersedes []scm.ChangeID) string {
 	b := fmt.Sprintf("%s\n\n---\nopened by factoryd submit at %s\ncommit %s\n", msg, at.Format(time.RFC3339), sha)
 	for _, id := range supersedes {
-		b += fmt.Sprintf("supersedes %s (left open; the reviewer closes it)\n", id)
+		b += fmt.Sprintf("supersedes %s (left open; an operator retires it with `factoryd scm close`, never the automated reviewer)\n", id)
 	}
 	return b
 }

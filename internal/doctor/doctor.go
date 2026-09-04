@@ -22,6 +22,7 @@ import (
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/factory"
 	"github.com/aicix-labs/factoryd/internal/gittransport"
+	"github.com/aicix-labs/factoryd/internal/principal"
 	"github.com/aicix-labs/factoryd/internal/scm"
 )
 
@@ -199,7 +200,7 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 		// copy into ordinary source and have submit push for it. The control
 		// is a file in its own workdir, which it must be able to read --
 		// otherwise "cannot read" is a broken probe.
-		for _, cr := range []struct{ name, file string }{{"producer credential", cfg.Credentials.Producer.File}, {"reviewer credential", cfg.Credentials.Reviewer.File}} {
+		for _, cr := range []struct{ name, file string }{{"producer credential", cfg.Credentials.Producer.File}, {"reviewer credential", cfg.Credentials.Reviewer.File}, {"operator credential", cfg.Credentials.Operator.File}} {
 			if cr.file == "" {
 				continue
 			}
@@ -237,6 +238,41 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 	}
 
 	// --- the gate's identity, by probe ---
+	// The operator principal is a boundary only if the reviewer identity
+	// cannot read it: a reviewer that can read the operator's token can
+	// close a draft, the act the automated protocol is kept out of (#47
+	// review). Probed AS the reviewer, with the control that the reviewer
+	// can read its own credential -- otherwise "cannot read" is a broken
+	// probe. Only when an operator credential and a reviewer identity are
+	// configured; a reviewer running as factoryd itself is not a boundary
+	// either, and is reported as such.
+	if of := cfg.Credentials.Operator.File; of != "" {
+		switch {
+		case cfg.Roles.Reviewer.RunAs == nil || cfg.Roles.Reviewer.RunAs.User == "":
+			add("reviewer cannot read operator credential", fmt.Errorf("roles.reviewer.run_as is unset: the reviewer runs as factoryd itself and can read %s; the operator principal is no boundary", of), of)
+		default:
+			rev, rerr := deps.NewProber(cfg.Roles.Reviewer.RunAs)
+			if rerr != nil {
+				add("reviewer cannot read operator credential", fmt.Errorf("undecided: %v", rerr), of)
+				break
+			}
+			if can, err := rev.CanRead(ctx, of); err != nil {
+				add("reviewer cannot read operator credential", fmt.Errorf("undecided: %v", err), of)
+			} else if can {
+				add("reviewer cannot read operator credential", fmt.Errorf("%s CAN read %s; the automated reviewer could close drafts as the operator", rev.Describe(), of), of)
+			} else {
+				add("reviewer cannot read operator credential", nil, rev.Describe()+" cannot read "+of)
+			}
+			if rf := cfg.Credentials.Reviewer.File; rf != "" {
+				if can, err := rev.CanRead(ctx, rf); err != nil || !can {
+					add("reviewer read probe control", fmt.Errorf("%s cannot read its own credential %s (%v); the refusal above proves nothing", rev.Describe(), rf, err), rf)
+				} else {
+					add("reviewer read probe control", nil, rev.Describe()+" can read "+rf+", so the refusal above is a refusal")
+				}
+			}
+		}
+	}
+
 	// The gate runs producer-authored code. It must be able to write its
 	// declared paths and must not be able to write .git or read a credential.
 	// Each is probed as the gate user; each has its own control.
@@ -254,7 +290,7 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 			add("gate cannot touch .git", nil, gitDir)
 		}
 		for _, cred := range []struct{ name, file string }{
-			{"reviewer", cfg.Credentials.Reviewer.File}, {"producer", cfg.Credentials.Producer.File},
+			{"reviewer", cfg.Credentials.Reviewer.File}, {"producer", cfg.Credentials.Producer.File}, {"operator", cfg.Credentials.Operator.File},
 		} {
 			if cred.file == "" {
 				continue
@@ -549,6 +585,22 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 		add("distinct identities", fmt.Errorf("producer and reviewer both authenticate as %s; the producer could merge its own work", p), "")
 	default:
 		add("distinct identities", nil, fmt.Sprintf("producer %s, reviewer %s", p, v))
+	}
+	// The operator is a third PROVIDER principal, or it is no boundary: two
+	// files holding one token are two paths to one authority, and the
+	// unreadability probe above cannot tell (#47 review). Resolved here, in
+	// doctor's own context, by stable id; and again immediately before
+	// every close.
+	if o := cfg.Credentials.Operator; o.File != "" || o.Env != "" {
+		three, err := principal.Resolve(ctx, cfg, principal.DriverBuilder(newDriver))
+		switch {
+		case err != nil:
+			add("operator identity", err, o.Describe())
+		case three.Operator == nil:
+			add("operator identity", fmt.Errorf("undecided: the operator credential resolved to no identity"), o.Describe())
+		default:
+			add("operator identity", nil, fmt.Sprintf("operator %s, distinct from producer %s and reviewer %s by provider id", *three.Operator, three.Producer, three.Reviewer))
+		}
 	}
 
 	return r

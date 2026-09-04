@@ -24,6 +24,9 @@
     },
     "reviewer": {
       "file": "/etc/factoryd/widgets/reviewer.token"
+    },
+    "operator": {
+      "file": "/etc/factoryd/widgets/operator.token"
     }
   },
   "gate": {
@@ -64,6 +67,7 @@
       "command": [
         "/usr/local/bin/factory-reviewer-turn"
       ],
+      "run_as": { "user": "factoryd-reviewer" },
       "env": {
         "PATH": "/usr/local/bin:/usr/bin:/bin",
         "HOME": "/var/lib/factoryd/widgets"
