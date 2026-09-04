@@ -15,6 +15,7 @@ import (
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/proc"
+	"github.com/aicix-labs/factoryd/internal/state"
 )
 
 // ExecRunner runs an agent turn as a subprocess.
@@ -236,6 +237,23 @@ func (r *ExecRunner) env(t Turn) []string {
 		// factoryd's own verbs (the reviewer: scm, audit, signal) does not
 		// have to be told by hand (canary issue #22).
 		"FACTORYD_CONFIG": r.Config.Path(),
+		// On a verdict-triggered turn: what the verdict is about, and the
+		// family to declare to update that change (#29). Empty otherwise;
+		// the keys are always present, so the generated set is exact.
+		"FACTORYD_VERDICT":       "",
+		"FACTORYD_CHANGE_ID":     "",
+		"FACTORYD_CHANGE_BRANCH": "",
+	}
+	for _, tr := range t.Triggers {
+		if tr.Label != "verdict" {
+			continue
+		}
+		if v, err := state.ReadVerdictFile(tr.Path); err == nil {
+			factoryd["FACTORYD_VERDICT"] = v.Kind
+			factoryd["FACTORYD_CHANGE_ID"] = v.ChangeID
+			factoryd["FACTORYD_CHANGE_BRANCH"] = v.DeclaredBranch
+		}
+		break
 	}
 	// Constructed, never inherited: os.Environ() is consulted for exactly the
 	// reviewer's credential name and nothing else (Config.TurnEnv).

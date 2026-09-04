@@ -3,7 +3,9 @@ package supervise_test
 import (
 	"bytes"
 	"context"
+	"encoding/json"
 	"errors"
+	"github.com/aicix-labs/factoryd/internal/state"
 	"io"
 	"os"
 	"path/filepath"
@@ -382,5 +384,37 @@ func TestGeneratedTurnKeysMatchTheRunner(t *testing.T) {
 	}
 	for k := range set {
 		t.Errorf("the runner set %s, which config.GeneratedTurnKeys does not list; a credential could be named after it", k)
+	}
+}
+
+// A verdict-triggered turn is told what the verdict is about and which
+// family to declare to update that change (#29), from the verdict file
+// that woke it; any other turn sees the keys empty.
+func TestVerdictTurnIsToldTheChangeAndItsFamily(t *testing.T) {
+	fx, r, out := execFixture(t, []string{"sh", "-c", "env | grep '^FACTORYD_\\(VERDICT\\|CHANGE\\)'"}, 30)
+	vpath := filepath.Join(fx.outbox, "48.json")
+	v := state.Verdict{ChangeID: "48", Kind: "changes-requested", SHA: "abc", Summary: "s", Branch: "producer/fix-0123456789", DeclaredBranch: "producer/fix"}
+	b, _ := json.Marshal(v)
+	if err := os.WriteFile(vpath, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tn := turn(fx, 0)
+	tn.Triggers = []watch.Trigger{{Label: "verdict", Path: vpath}}
+	if _, err := r.Run(context.Background(), tn, nil); err != nil {
+		t.Fatal(err)
+	}
+	env := out.String()
+	for _, want := range []string{"FACTORYD_VERDICT=changes-requested", "FACTORYD_CHANGE_ID=48", "FACTORYD_CHANGE_BRANCH=producer/fix"} {
+		if !strings.Contains(env, want) {
+			t.Errorf("the verdict turn was not told %s\ngot:\n%s", want, env)
+		}
+	}
+	// A wake turn: the keys exist and are empty.
+	fx2, r2, out2 := execFixture(t, []string{"sh", "-c", "env | grep '^FACTORYD_CHANGE_BRANCH='"}, 30)
+	if _, err := r2.Run(context.Background(), turn(fx2, 0), nil); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out2.String()) != "FACTORYD_CHANGE_BRANCH=" {
+		t.Fatalf("a non-verdict turn saw %q", out2.String())
 	}
 }

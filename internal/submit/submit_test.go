@@ -1200,3 +1200,17 @@ func TestRelativeProducerHomeIsRefusedFromADifferentCWD(t *testing.T) {
 		t.Fatalf("probed=%v gate=%v pushed=%v", l.prov.probed, l.gate.ran, l.tr.pushed)
 	}
 }
+
+func TestDeclaredFamilyInvertsImmutableBranch(t *testing.T) {
+	for declared, tree := range map[string]string{"producer/fix": "0123456789abcdef", "a-b-c": "fedcba9876543210", "x": "abcdef0123456789"} {
+		if got := submit.DeclaredFamily(submit.ImmutableBranch(declared, tree)); got != declared {
+			t.Fatalf("DeclaredFamily(ImmutableBranch(%q, %q)) = %q", declared, tree, got)
+		}
+	}
+	// Not a pushed name: returned unchanged, never mangled.
+	for _, plain := range []string{"producer/fix", "release-2026", "fix-0123456789ab", "fix-ZZZZZZZZZZ"} {
+		if got := submit.DeclaredFamily(plain); got != plain {
+			t.Fatalf("DeclaredFamily(%q) = %q, want unchanged", plain, got)
+		}
+	}
+}

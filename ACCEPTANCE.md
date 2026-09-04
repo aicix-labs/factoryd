@@ -127,6 +127,13 @@ the branch family by prefix.
 
 ### Operating notes from the runs
 
+- **The verdict now names the branch to declare** (#29). The first production
+  cycle found the producer opening a second change beside the one under review,
+  because nothing in its reach mapped the change id back to a declarable branch.
+  `outbox/<id>.json` carries `branch` and `declared_branch`, and a verdict turn
+  is told `FACTORYD_CHANGE_BRANCH`; a wrapper that persisted `.producer-branch`
+  before submit consumed it is no longer needed.
+
 - **"A second pass with agent CLIs changes nothing except who writes the code"
   was not quite true** (#27): an agent CLI exits 0 whatever the model concluded,
   and a model cannot set an exit code by narrating it. Wire agent CLIs through
