@@ -795,6 +795,17 @@ func (c *Config) Validate() error {
 			}
 		}
 	}
+	// A credential's environment NAME is an env key too: the reviewer's is
+	// injected into its turn by that name. A name that is one of the keys
+	// the supervisor generates would put a token where a path belongs. The
+	// convention FACTORYD_REVIEWER_TOKEN is a FACTORYD_ name that collides
+	// with nothing, so this is judged against the generated keys exactly,
+	// from the one list the runner builds from.
+	for _, cr := range []struct{ name, env string }{{"credentials.producer.env", c.Credentials.Producer.Env}, {"credentials.reviewer.env", c.Credentials.Reviewer.Env}} {
+		if IsGeneratedTurnKey(cr.env) {
+			add("%s names %s, which the supervisor generates for every turn; a token would be injected where that value belongs", cr.name, cr.env)
+		}
+	}
 
 	problems = append(problems, c.Scope.compile()...)
 	if c.Scope.DenyRegexes == nil && c.Scope.EscalateRegexes == nil {
@@ -1055,6 +1066,25 @@ func (c *Config) gatePathMayNotReachGit(declared, resolved string) error {
 // where the materialised change lives.
 func (c *Config) GateWorkdir() string { return c.Paths.SubmitRepo }
 
+// GeneratedTurnKeys are the environment variables the supervisor sets for
+// every turn. The runner builds its map from this list and a test holds the
+// two together; Validate refuses a credential named after any of them.
+var GeneratedTurnKeys = []string{
+	"FACTORYD_FACTORY", "FACTORYD_ROLE", "FACTORYD_TURN", "FACTORYD_ROOT",
+	"FACTORYD_INBOX", "FACTORYD_OUTBOX", "FACTORYD_WORKDIR", "FACTORYD_TARGET_BRANCH",
+	"FACTORYD_PROGRESS", "FACTORYD_TRIGGERS", "FACTORYD_TRIGGER_PATHS", "FACTORYD_CONFIG",
+}
+
+// IsGeneratedTurnKey reports whether name is one the supervisor generates.
+func IsGeneratedTurnKey(name string) bool {
+	for _, k := range GeneratedTurnKeys {
+		if k == name {
+			return true
+		}
+	}
+	return false
+}
+
 // TurnEnv is the complete environment for a role's turn: FACTORYD_* first,
 // then roles.<role>.env, then -- for the reviewer only -- the reviewer's
 // credential variable, if credentials.reviewer.env names one, copied by name
@@ -1069,14 +1099,12 @@ func (c *Config) TurnEnv(role string, factoryd map[string]string, supervisorEnv 
 	for k, v := range spec.Env {
 		env[k] = v
 	}
-	// Generated values are applied LAST, so they win: FACTORYD_* is the
-	// supervisor's namespace. Validate refuses a role env that declares one
-	// (reserved); this is the second lock, for a config that reached here
-	// without Validate, and it makes the order of the two loops the rule
-	// rather than an accident.
-	for k, v := range factoryd {
-		env[k] = v
-	}
+	// The reviewer's credential, by the name the config chose, taken from
+	// the supervisor's own environment. Injected BEFORE the generated
+	// values: a credential named FACTORYD_CONFIG would otherwise replace the
+	// config path with the token, and a reviewer turn would carry a secret
+	// where a path belongs and leak it through the first error that printed
+	// it. Validate refuses such a name; this is the second lock.
 	if role == "reviewer" && c.Credentials.Reviewer.Env != "" {
 		name := c.Credentials.Reviewer.Env
 		for _, kv := range supervisorEnv {
@@ -1085,6 +1113,15 @@ func (c *Config) TurnEnv(role string, factoryd map[string]string, supervisorEnv 
 				break
 			}
 		}
+	}
+	// Generated values are applied LAST, so they win over everything: role
+	// env and credential alike. FACTORYD_* is the supervisor's namespace.
+	// Validate refuses a role env or credential name that claims one; this
+	// ordering is the second lock, for a config that reached here without
+	// Validate, and it makes the order of the loops the rule rather than an
+	// accident.
+	for k, v := range factoryd {
+		env[k] = v
 	}
 	keys := make([]string, 0, len(env))
 	for k := range env {

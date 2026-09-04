@@ -119,18 +119,20 @@ func TestValidationFailures(t *testing.T) {
     "hold_diff_regexes": ["-----BEGIN [A-Z ]*PRIVATE KEY-----"],
     "escalate_regexes": ["(^|/)(auth|token|secret)"]
   }`, ``, "scope is absent"},
-		"scope regex does not compile":    {`"(^|/)Dockerfile$"`, `"(^|/Dockerfile$"`, "does not compile"},
-		"scope empty pattern":             {`"^deploy/.*\\.md$"`, `""`, "is empty"},
-		"producer env declares FACTORYD_": {`"env": {"PATH": "/usr/local/bin:/usr/bin:/bin"}, "run_as": {"user": "factoryd-producer"}`, `"env": {"PATH": "/usr/local/bin:/usr/bin:/bin", "FACTORYD_CONFIG": "/stale.json"}, "run_as": {"user": "factoryd-producer"}`, "reserved"},
-		"reviewer env declares FACTORYD_": {`"reviewer": {"command": ["claude", "-p", "reviewer-playbook"], "env": {"PATH": "/usr/local/bin:/usr/bin:/bin"}}`, `"reviewer": {"command": ["claude", "-p", "reviewer-playbook"], "env": {"PATH": "/usr/local/bin:/usr/bin:/bin", "FACTORYD_ROOT": "/elsewhere"}}`, "reserved"},
-		"gate env declares FACTORYD_":     {`"GOCACHE": "/var/cache/factoryd/go"}`, `"GOCACHE": "/var/cache/factoryd/go", "FACTORYD_TURN": "x"}`, "reserved"},
-		"alert missing path":              {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "file"}`, "no path"},
-		"webhook is not deliverable here": {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "webhook"}`, "not implemented"},
-		"syslog is not deliverable here":  {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "syslog"}`, "not implemented"},
-		"alert command without PATH":      {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "command", "command": ["notify"]}`, "PATH"},
-		"alert file relative path":        {`"path": "/var/log/factoryd/alerts.log"`, `"path": "alerts.log"`, "absolute"},
-		"cache without a bound":           {`"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go", "max_bytes": 1}]},`, `"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go"}]},`, "max_bytes"},
-		"cache relative path":             {`"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go", "max_bytes": 1}]},`, `"health": {"caches": [{"path": "go", "max_bytes": 1}]},`, "absolute"},
+		"scope regex does not compile":        {`"(^|/)Dockerfile$"`, `"(^|/Dockerfile$"`, "does not compile"},
+		"scope empty pattern":                 {`"^deploy/.*\\.md$"`, `""`, "is empty"},
+		"producer env declares FACTORYD_":     {`"env": {"PATH": "/usr/local/bin:/usr/bin:/bin"}, "run_as": {"user": "factoryd-producer"}`, `"env": {"PATH": "/usr/local/bin:/usr/bin:/bin", "FACTORYD_CONFIG": "/stale.json"}, "run_as": {"user": "factoryd-producer"}`, "reserved"},
+		"reviewer env declares FACTORYD_":     {`"reviewer": {"command": ["claude", "-p", "reviewer-playbook"], "env": {"PATH": "/usr/local/bin:/usr/bin:/bin"}}`, `"reviewer": {"command": ["claude", "-p", "reviewer-playbook"], "env": {"PATH": "/usr/local/bin:/usr/bin:/bin", "FACTORYD_ROOT": "/elsewhere"}}`, "reserved"},
+		"reviewer credential named FACTORYD_": {`"reviewer": {"env": "FACTORYD_REVIEWER_TOKEN"}`, `"reviewer": {"env": "FACTORYD_CONFIG"}`, "generates"},
+		"producer credential named FACTORYD_": {`"producer": {"file": "/etc/factoryd/producer.token"}`, `"producer": {"env": "FACTORYD_ROOT"}`, "generates"},
+		"gate env declares FACTORYD_":         {`"GOCACHE": "/var/cache/factoryd/go"}`, `"GOCACHE": "/var/cache/factoryd/go", "FACTORYD_TURN": "x"}`, "reserved"},
+		"alert missing path":                  {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "file"}`, "no path"},
+		"webhook is not deliverable here":     {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "webhook"}`, "not implemented"},
+		"syslog is not deliverable here":      {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "syslog"}`, "not implemented"},
+		"alert command without PATH":          {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "command", "command": ["notify"]}`, "PATH"},
+		"alert file relative path":            {`"path": "/var/log/factoryd/alerts.log"`, `"path": "alerts.log"`, "absolute"},
+		"cache without a bound":               {`"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go", "max_bytes": 1}]},`, `"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go"}]},`, "max_bytes"},
+		"cache relative path":                 {`"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go", "max_bytes": 1}]},`, `"health": {"caches": [{"path": "go", "max_bytes": 1}]},`, "absolute"},
 		"caches without a cache root": {`"submit_repo": "/var/lib/factoryd/widgets/submit",
     "cache_root": "/var/cache/factoryd/widgets"`, `"submit_repo": "/var/lib/factoryd/widgets/submit"`, "cache_root"},
 		"cache root is /":                     {`"cache_root": "/var/cache/factoryd/widgets"`, `"cache_root": "/"`, "delete the host"},
@@ -394,5 +396,31 @@ func TestGeneratedTurnEnvWinsOverRoleEnv(t *testing.T) {
 	}
 	if got["FACTORYD_CONFIG"] != "/etc/factoryd/real.json" || got["FACTORYD_ROOT"] != "/var/lib/factoryd/real" || got["PATH"] != "/usr/bin" {
 		t.Fatalf("env=%v; the generated values must win and the rest must survive", env)
+	}
+}
+
+// The reviewer's credential is injected by the name the config chose, from
+// the supervisor's environment. A name that is a generated key must not put
+// the token where the config path belongs, whatever the order of injection:
+// the generated value wins, and the token appears nowhere in the turn's env.
+func TestReviewerCredentialCannotReplaceAGeneratedValue(t *testing.T) {
+	const token = "TOKEN-SENTINEL-7f3a9c"
+	cfg := &config.Config{
+		Roles:       config.Roles{Reviewer: config.RoleSpec{Env: map[string]string{"PATH": "/usr/bin"}}},
+		Credentials: config.Credentials{Reviewer: config.CredentialRef{Env: "FACTORYD_CONFIG"}},
+	}
+	env := cfg.TurnEnv("reviewer", map[string]string{"FACTORYD_CONFIG": "/etc/factoryd/real.json"}, []string{"FACTORYD_CONFIG=" + token, "OTHER=x"})
+	joined := strings.Join(env, "\n")
+	if !strings.Contains(joined, "FACTORYD_CONFIG=/etc/factoryd/real.json") {
+		t.Fatalf("the config path was replaced:\n%s", joined)
+	}
+	if strings.Contains(joined, token) {
+		t.Fatalf("the token reached the turn's environment under a generated name:\n%s", joined)
+	}
+	// Control: an ordinary credential name is injected.
+	cfg.Credentials.Reviewer.Env = "REVIEWER_TOKEN"
+	env = cfg.TurnEnv("reviewer", map[string]string{"FACTORYD_CONFIG": "/etc/factoryd/real.json"}, []string{"REVIEWER_TOKEN=" + token})
+	if !strings.Contains(strings.Join(env, "\n"), "REVIEWER_TOKEN="+token) {
+		t.Fatalf("an ordinary credential name was not injected:\n%s", strings.Join(env, "\n"))
 	}
 }

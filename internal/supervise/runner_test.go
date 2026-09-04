@@ -359,3 +359,28 @@ func TestLeftoverChildIsKilledAndReported(t *testing.T) {
 		t.Fatalf("res=%+v err=%v; a quiescent turn is not leftover", res, err)
 	}
 }
+
+// The runner's generated keys and config.GeneratedTurnKeys are one list: a
+// key added to the runner and not to the list is a key a credential could
+// be named after; one on the list and not set by the runner is a promise
+// not kept.
+func TestGeneratedTurnKeysMatchTheRunner(t *testing.T) {
+	fx, r, out := execFixture(t, []string{"sh", "-c", "env | grep '^FACTORYD_' | cut -d= -f1"}, 30)
+	fx.cfg.SetPath(filepath.Join(fx.root, "factory.json"))
+	if _, err := r.Run(context.Background(), turn(fx, 0), nil); err != nil {
+		t.Fatal(err)
+	}
+	set := map[string]bool{}
+	for _, k := range strings.Fields(out.String()) {
+		set[k] = true
+	}
+	for _, k := range config.GeneratedTurnKeys {
+		if !set[k] {
+			t.Errorf("config.GeneratedTurnKeys lists %s but the runner did not set it", k)
+		}
+		delete(set, k)
+	}
+	for k := range set {
+		t.Errorf("the runner set %s, which config.GeneratedTurnKeys does not list; a credential could be named after it", k)
+	}
+}
