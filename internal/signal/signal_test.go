@@ -491,3 +491,66 @@ func TestMergeOfASubmittingCyclesBranchFinishesIt(t *testing.T) {
 		t.Fatalf("a merge of another branch finished a submitting cycle: %+v", st.Cycle)
 	}
 }
+
+// The operator's verdict for a merge made outside factoryd (#43): verified
+// at the provider (merged, head on the target), written to the outbox --
+// which wakes the producer -- recorded as the operator's, and the cycle
+// finished if it is the cycle's change. Not merged, or merged but not on
+// the target, is refused: this records a merge, it does not perform one.
+func TestOperatorRecordsAMergeMadeOutsideFactoryd(t *testing.T) {
+	l := newLab(t)
+	l.drv.change.State = scm.StateMerged
+	if _, err := state.Update(l.cfg.StatePath(), l.cfg.Name, func(st *state.State) error {
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.ChangeID, c.Family = "42", "producer/fix"
+		st.LastVerdict = &state.Verdict{ChangeID: "42", Kind: state.VerdictOperatorGated}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	v, path, err := signal.RecordMerged(context.Background(), l.cfg, l.drv, "42", "", func() time.Time { return l.now })
+	if err != nil {
+		t.Fatal(err)
+	}
+	if v.Kind != state.VerdictMerged || v.RecordedBy != "operator" || v.MergeCommit != "abc123" || v.DeclaredBranch != state.FamilyOf("producer/fix-abc") {
+		t.Fatalf("verdict %+v", v)
+	}
+	if _, err := os.Stat(path); err != nil || filepath.Dir(path) != l.cfg.OutboxDir() {
+		t.Fatalf("verdict not written to the outbox: %s %v", path, err)
+	}
+	got, err := state.ReadVerdictFile(path)
+	if err != nil || got.RecordedBy != "operator" {
+		t.Fatalf("outbox verdict %+v %v", got, err)
+	}
+	st, _ := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if st.LastVerdict.Kind != state.VerdictMerged || st.Cycle.Phase != state.CycleFinished {
+		t.Fatalf("state: verdict %s, cycle %s", st.LastVerdict.Kind, st.Cycle.Phase)
+	}
+
+	// Not merged: refused, nothing written.
+	l2 := newLab(t)
+	if _, _, err := signal.RecordMerged(context.Background(), l2.cfg, l2.drv, "42", "", nil); err == nil || !strings.Contains(err.Error(), "not merged") {
+		t.Fatalf("an open change was recorded as merged: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(l2.cfg.OutboxDir(), "42.json")); !os.IsNotExist(err) {
+		t.Fatal("a verdict was written for a refused record")
+	}
+	// Retargeted (#49 review): the change now targets release and is merged
+	// there. Not this factory's merge; refused, nothing written.
+	l4 := newLab(t)
+	l4.drv.change.State = scm.StateMerged
+	l4.drv.change.TargetBranch = "release"
+	if _, _, err := signal.RecordMerged(context.Background(), l4.cfg, l4.drv, "42", "", nil); err == nil || !strings.Contains(err.Error(), `targets "release", not this factory's target "main"`) {
+		t.Fatalf("a retargeted merge was recorded: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(l4.cfg.OutboxDir(), "42.json")); !os.IsNotExist(err) {
+		t.Fatal("a verdict was written for a retargeted merge")
+	}
+	// Merged per the provider but the head is not on the target: refused.
+	l3 := newLab(t)
+	l3.drv.change.State = scm.StateMerged
+	l3.drv.ancestor = false
+	if _, _, err := signal.RecordMerged(context.Background(), l3.cfg, l3.drv, "42", "", nil); err == nil || !strings.Contains(err.Error(), "not on main") {
+		t.Fatalf("a merge whose head is not on the target was recorded: %v", err)
+	}
+}

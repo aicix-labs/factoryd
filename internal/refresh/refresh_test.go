@@ -17,6 +17,7 @@ import (
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/refresh"
+	"github.com/aicix-labs/factoryd/internal/scm"
 	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/submit"
 	"github.com/aicix-labs/factoryd/internal/supervise"
@@ -289,6 +290,8 @@ func (r *scriptedRunner) Run(_ context.Context, t supervise.Turn, _ func(proc.Re
 func (r *scriptedRunner) count() int { r.mu.Lock(); defer r.mu.Unlock(); return r.n }
 
 type e2e struct {
+	lookup     func(context.Context, scm.ChangeID) (scm.Change, error)
+	ancestor   func(context.Context, string, string) (bool, error)
 	cfg        *config.Config
 	upstream   string
 	submitRepo string
@@ -358,6 +361,8 @@ func (e *e2e) deps(t *testing.T) func(context.Context) (refresh.Deps, error) {
 				e.refreshes++
 				return refresh.ApplyLocal(ctx, "git", e.work, bundle, branch)
 			},
+			Lookup:   e.lookup,
+			Ancestor: e.ancestor,
 		}, nil
 	}
 }
@@ -722,5 +727,160 @@ func TestOperatorRefreshRefusesWhenATurnStartedFirst(t *testing.T) {
 	}
 	if e.refreshes != 1 {
 		t.Fatalf("refreshes=%d, want 1 (the turn start's)", e.refreshes)
+	}
+}
+
+// ---------- #43: a change merged outside factoryd ----------
+
+type lookupFake struct {
+	state    scm.ChangeState
+	target   string // the change's target at the provider; "" means main
+	err      error
+	onTarget bool // IsAncestor(head, main)
+	ancErr   error
+	calls    int
+	ancCalls int
+}
+
+func (f *lookupFake) get(context.Context, scm.ChangeID) (scm.Change, error) {
+	f.calls++
+	if f.err != nil {
+		return scm.Change{}, f.err
+	}
+	target := f.target
+	if target == "" {
+		target = "main"
+	}
+	return scm.Change{ID: "55", State: f.state, TargetBranch: target, HeadSHA: "h55"}, nil
+}
+
+func (f *lookupFake) ancestor(_ context.Context, sha, ref string) (bool, error) {
+	f.ancCalls++
+	if f.ancErr != nil {
+		return false, f.ancErr
+	}
+	return f.onTarget && ref == "main" && sha == "h55", nil
+}
+
+// Reconcile asks the provider about an open cycle's own change and nothing
+// else. Merged finishes the cycle only when the change's target is the
+// configured target AND its head is on it at the provider (#49 review):
+// a draft retargeted and merged into release, or "merged" with a head
+// not on main, leaves the cycle open with a note. Closed without a merge
+// finishes it; a failed read leaves it open; other phases are not looked
+// up.
+func TestReconcileFinishesAnOpenCycleOnlyForAMergeIntoTheConfiguredTarget(t *testing.T) {
+	cfg := &config.Config{TargetBranch: "main"}
+	open := func() *state.State {
+		st := state.New("f")
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.ChangeID = "55"
+		st.LastVerdict = &state.Verdict{ChangeID: "55", Kind: state.VerdictOperatorGated}
+		return st
+	}
+	cases := []struct {
+		name  string
+		f     *lookupFake
+		want  string
+		found bool
+		note  string
+	}{
+		{"merged into main, head on main", &lookupFake{state: scm.StateMerged, onTarget: true}, state.CycleFinished, true, "merged into main"},
+		{"retargeted: merged into release", &lookupFake{state: scm.StateMerged, target: "release", onTarget: true}, state.CycleOpen, false, `merged into "release", not the configured target "main"`},
+		{"merged says main but head not on main", &lookupFake{state: scm.StateMerged, onTarget: false}, state.CycleOpen, false, "is not on main"},
+		{"merged but ancestry unverifiable", &lookupFake{state: scm.StateMerged, ancErr: errors.New("503")}, state.CycleOpen, false, "could not verify"},
+		{"closed without merge", &lookupFake{state: scm.StateClosed}, state.CycleFinished, true, "closed without a merge"},
+		{"still open", &lookupFake{state: scm.StateOpen}, state.CycleOpen, false, ""},
+		{"read failed", &lookupFake{err: errors.New("503")}, state.CycleOpen, false, "left open"},
+	}
+	for _, c := range cases {
+		st := open()
+		changed, note := refresh.Reconcile(context.Background(), cfg, st, c.f.get, c.f.ancestor, time.Now())
+		if changed != c.found || st.Cycle.Phase != c.want || c.f.calls != 1 || !strings.Contains(note, c.note) {
+			t.Fatalf("%s: changed=%v phase=%s calls=%d note=%q", c.name, changed, st.Cycle.Phase, c.f.calls, note)
+		}
+	}
+	// No ancestor check available: merged is not believed.
+	st := open()
+	f := &lookupFake{state: scm.StateMerged, onTarget: true}
+	if changed, note := refresh.Reconcile(context.Background(), cfg, st, f.get, nil, time.Now()); changed || !strings.Contains(note, "cannot be verified") {
+		t.Fatalf("merged believed without an ancestry check: %v %q", changed, note)
+	}
+	if changed, _ := refresh.Reconcile(context.Background(), cfg, open(), nil, nil, time.Now()); changed {
+		t.Fatal("no lookup, yet the cycle changed")
+	}
+	for _, phase := range []string{state.CycleWorking, state.CycleSubmitting, state.CycleFinished, state.CycleClean, state.CycleUnknown} {
+		st := state.New("f")
+		st.SetCycle(phase, time.Now()).ChangeID = "55"
+		f := &lookupFake{state: scm.StateMerged, onTarget: true}
+		if changed, _ := refresh.Reconcile(context.Background(), cfg, st, f.get, f.ancestor, time.Now()); changed || f.calls != 0 {
+			t.Fatalf("phase %s: looked up (%d) or changed (%v)", phase, f.calls, changed)
+		}
+	}
+}
+
+// End to end: the reviewer signalled operator-gated, a human merged !55,
+// last_verdict still says operator-gated. The next brief's before-turn
+// step reconciles under the lock, finishes the cycle, and refreshes to
+// the moved target. Nothing polled: one read, at the decision.
+func TestOperatorMergedChangeIsReconciledAtTheNextBrief(t *testing.T) {
+	e := newE2E(t)
+	e.setCycle(t, func(st *state.State) {
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.ChangeID, c.Family, c.Digest = "55", "feat/x", "feat/x-abc"
+		st.LastVerdict = &state.Verdict{ChangeID: "55", Kind: state.VerdictOperatorGated}
+	})
+	e.edit(t, "landed.go", "the change a human merged")
+	os.WriteFile(filepath.Join(e.upstream, "landed.go"), []byte("the change a human merged"), 0o644)
+	git(t, e.upstream, "add", ".")
+	git(t, e.upstream, "commit", "-qm", "merge !55")
+	want := git(t, e.upstream, "rev-parse", "HEAD")
+	lk := &lookupFake{state: scm.StateMerged, onTarget: true}
+	e.lookup, e.ancestor = lk.get, lk.ancestor
+	e.wake(t)
+	r := &scriptedRunner{act: func(int, supervise.Turn) supervise.TurnResult { e.progress(t); return supervise.TurnResult{} }}
+	if err := e.run(t, r, 1); err != nil {
+		t.Fatal(err)
+	}
+	if lk.calls != 1 {
+		t.Fatalf("provider read %d times, want exactly 1", lk.calls)
+	}
+	if e.refreshes != 1 {
+		t.Fatalf("refreshes=%d, want 1: the reconciled cycle did not start a new one", e.refreshes)
+	}
+	if c := e.cycle(t); c == nil || c.Phase != state.CycleWorking || c.Base != want {
+		t.Fatalf("cycle %+v, want working at %s", c, want)
+	}
+	// And last_verdict, untouched by the refresh, still says operator-gated:
+	// the cycle, not the verdict, governs the refresh.
+	st, _ := state.Load(e.cfg.StatePath(), e.cfg.Name)
+	if st.LastVerdict.Kind != state.VerdictOperatorGated {
+		t.Fatalf("last_verdict = %s", st.LastVerdict.Kind)
+	}
+}
+
+// End to end, the retargeted case (#49 review): !55 was opened for main,
+// retargeted, and merged into release. The next brief's before-turn step
+// must NOT finish the cycle or refresh -- the producer's tree, which
+// never landed on main, is kept.
+func TestRetargetedMergeDoesNotFinishTheCycleOrResetTheTree(t *testing.T) {
+	e := newE2E(t)
+	e.setCycle(t, func(st *state.State) {
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.ChangeID, c.Family, c.Digest = "55", "feat/x", "feat/x-abc"
+	})
+	e.edit(t, "in-flight.go", "merged into release, not main")
+	lk := &lookupFake{state: scm.StateMerged, target: "release", onTarget: true}
+	e.lookup, e.ancestor = lk.get, lk.ancestor
+	e.wake(t)
+	r := &scriptedRunner{act: func(int, supervise.Turn) supervise.TurnResult { e.progress(t); return supervise.TurnResult{} }}
+	if err := e.run(t, r, 1); err != nil {
+		t.Fatal(err)
+	}
+	if e.refreshes != 0 || !e.has("in-flight.go") {
+		t.Fatalf("a retargeted merge reset the tree: refreshes=%d kept=%v", e.refreshes, e.has("in-flight.go"))
+	}
+	if c := e.cycle(t); c == nil || c.Phase != state.CycleOpen {
+		t.Fatalf("cycle %+v, want still open", c)
 	}
 }
