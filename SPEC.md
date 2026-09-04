@@ -888,6 +888,33 @@ path, so an agent blocked *before* having something to push had no way to reach 
 counterpart and stopped, requiring a human relay. A question must carry a proposed
 fix: a yes/no costs one round trip, an open question costs three.
 
+**A verdict names the family to re-declare.** A change is never updated in
+place: a fixed tree is a new immutable branch and a new draft, and it
+**supersedes** the old one only if it was declared under the same family name
+(§4.4) — the reviewed head stays reviewed, which is better than an update. The
+declared name is therefore the key that links a fix to the change it answers,
+and a producer without credential or network has no way to learn it: the
+verdict carries the id, `.producer-branch` is consumed by submit. So
+`outbox/<id>.json` carries, besides `change_id`, `kind`, `sha`, `summary`, `at`
+and `merge_commit` (verified merges only), `branch` (the pushed
+`<declared>-<tree>`) and `declared_branch` (the family). A verdict-triggered
+turn is told every verdict it carries, exactly: `FACTORYD_VERDICTS` is a JSON
+array with one entry per verdict trigger (`path`, `change_id`, `kind`, `sha`,
+`branch`, `declared_branch`) — a turn may be woken by several at once, and a
+scalar that named the first one's family for all would send a fix to the wrong
+change. The scalar keys `FACTORYD_VERDICT`, `FACTORYD_CHANGE_ID` and
+`FACTORYD_CHANGE_BRANCH` name the verdict only when the turn carries exactly
+one, and are empty otherwise; on a turn with no verdict all four are present,
+the array `[]`. A verdict file the runner cannot read or parse — or whose lineage
+is incomplete or incoherent: an unknown kind, no change id, a filename that
+does not match it, no branch, or a declared family that is not the family of
+its branch — is a runner error: the turn does not start, rather than starting
+with empty values. A pre-#31 verdict document (no branch lineage) is refused
+for exactly that reason. Found on the first production cycle (#29):
+without the family name the producer re-declared a stale one from its seed
+clone and got an unrelated draft beside the change under review, not a
+superseding one.
+
 **Verdict summaries must stand alone.** The counterpart may be a sandboxed agent that
 cannot fetch the PR comment the summary references. Put the substance in the summary.
 

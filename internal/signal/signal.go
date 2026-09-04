@@ -14,6 +14,7 @@ import (
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/scm"
 	"github.com/aicix-labs/factoryd/internal/state"
+	"github.com/aicix-labs/factoryd/internal/submit"
 )
 
 // Exit codes. They are the contract of `factoryd signal`.
@@ -124,7 +125,8 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 	if sha == "" {
 		return Result{}, failed("change %s reports no head sha", req.ID)
 	}
-	v := state.Verdict{ChangeID: string(req.ID), Kind: req.Kind, SHA: sha, Summary: req.Summary, At: now()}
+	v := state.Verdict{ChangeID: string(req.ID), Kind: req.Kind, SHA: sha, Summary: req.Summary, At: now(),
+		Branch: change.SourceBranch, DeclaredBranch: submit.DeclaredFamily(change.SourceBranch)}
 	res := Result{Verdict: v}
 
 	if req.Kind == state.VerdictMerged {

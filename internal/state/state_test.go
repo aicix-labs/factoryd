@@ -337,3 +337,38 @@ func TestLockPathIsSeparateFromTheDocument(t *testing.T) {
 		t.Fatalf("the document is unreadable after a locked update: %v", err)
 	}
 }
+
+// A verdict may start a turn only with its lineage complete and coherent
+// (#31): the old, pre-branch document shape is the exact input that
+// reintroduces the stale-family failure, and it is refused.
+func TestVerdictLineageFailsClosed(t *testing.T) {
+	good := Verdict{ChangeID: "48", Kind: VerdictChangesRequested, SHA: "abc", Summary: "s", Branch: "producer/ci-host-0123456789", DeclaredBranch: "producer/ci-host"}
+	if err := good.ValidateLineage("/x/outbox/48.json"); err != nil {
+		t.Fatalf("a complete verdict was refused: %v", err)
+	}
+	cases := map[string]struct {
+		mutate func(v *Verdict)
+		path   string
+		want   string
+	}{
+		"old format, no branch":          {func(v *Verdict) { v.Branch, v.DeclaredBranch = "", "" }, "/x/outbox/48.json", "no branch lineage"},
+		"branch without family":          {func(v *Verdict) { v.DeclaredBranch = "" }, "/x/outbox/48.json", "no branch lineage"},
+		"family not of the branch":       {func(v *Verdict) { v.DeclaredBranch = "producer/auth" }, "/x/outbox/48.json", "not the family"},
+		"unknown kind":                   {func(v *Verdict) { v.Kind = "approved" }, "/x/outbox/48.json", "not one of"},
+		"no change id":                   {func(v *Verdict) { v.ChangeID = "" }, "/x/outbox/48.json", "names no change"},
+		"filename disagrees with the id": {func(v *Verdict) {}, "/x/outbox/49.json", "file named"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			v := good
+			c.mutate(&v)
+			err := v.ValidateLineage(c.path)
+			if err == nil || !strings.Contains(err.Error(), c.want) {
+				t.Fatalf("err=%v, want %q", err, c.want)
+			}
+		})
+	}
+	if FamilyOf("producer/ci-host-0123456789") != "producer/ci-host" || FamilyOf("plain") != "plain" || FamilyOf("x-ZZZZZZZZZZ") != "x-ZZZZZZZZZZ" {
+		t.Fatal("FamilyOf")
+	}
+}

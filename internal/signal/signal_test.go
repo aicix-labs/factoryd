@@ -381,3 +381,25 @@ func TestClassifyHoldOnlyOnAddedLines(t *testing.T) {
 		t.Fatalf("decision=%+v", d)
 	}
 }
+
+// The verdict carries the branch the producer must declare to update the
+// change (#29): the pushed <declared>-<tree> and the declared family
+// recovered from it. Without it a credential-less, networkless producer
+// cannot map a change id back to a declarable branch and opens a second
+// change beside the one under review.
+func TestVerdictCarriesTheBranchAndItsFamily(t *testing.T) {
+	l := newLab(t)
+	l.drv.change.SourceBranch = "producer/fix-0123456789"
+	_, err := l.run(t, "changes-requested", "auto", "add a test for the empty case")
+	if err != nil {
+		t.Fatal(err)
+	}
+	v := l.verdictFile(t)
+	if v == nil || v.Branch != "producer/fix-0123456789" || v.DeclaredBranch != "producer/fix" {
+		t.Fatalf("verdict file=%+v; want branch and declared family", v)
+	}
+	st, err := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if err != nil || st.LastVerdict == nil || st.LastVerdict.DeclaredBranch != "producer/fix" {
+		t.Fatalf("state=%+v err=%v", st.LastVerdict, err)
+	}
+}

@@ -26,6 +26,7 @@ import (
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/gittransport"
 	"github.com/aicix-labs/factoryd/internal/scm"
+	"github.com/aicix-labs/factoryd/internal/state"
 )
 
 // Exit codes are the CLI contract.
@@ -617,6 +618,11 @@ func ImmutableBranch(declared, tree string) string {
 	}
 	return declared + "-" + tree[:n]
 }
+
+// DeclaredFamily is the inverse of ImmutableBranch: the declared name
+// recovered from a pushed branch. One implementation, in state, so the
+// verdict's own lineage check and submit cannot disagree.
+func DeclaredFamily(branch string) string { return state.FamilyOf(branch) }
 
 // openInFamily lists the open changes whose source branch belongs to the
 // declared family: the family name itself, or the family name followed by the

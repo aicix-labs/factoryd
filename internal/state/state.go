@@ -11,10 +11,12 @@ package state
 
 import (
 	"encoding/json"
+	"errors"
 	"fmt"
 	"os"
 	"path/filepath"
 	"sort"
+	"strings"
 	"time"
 
 	"github.com/aicix-labs/factoryd/internal/proc"
@@ -150,6 +152,75 @@ type Verdict struct {
 	At      time.Time `json:"at"`
 	// MergeCommit is set only for a verified merge.
 	MergeCommit string `json:"merge_commit,omitempty"`
+	// Branch is the change's pushed source branch, <declared>-<tree>, and
+	// DeclaredBranch the family the producer declared (#29). A change is
+	// never updated in place: a fix is a new immutable branch that
+	// SUPERSEDES the old draft only if declared under the same family. A
+	// producer told "changes requested on change 48" holds no credential
+	// and no network, and nothing else in its reach maps the id to that
+	// family. So the verdict carries it.
+	Branch         string `json:"branch,omitempty"`
+	DeclaredBranch string `json:"declared_branch,omitempty"`
+}
+
+// ReadVerdictFile reads an outbox/<id>.json handoff document and requires
+// its lineage to be complete and coherent before a turn may act on it: a
+// syntactically valid verdict from before the branch was recorded (#31) has
+// a change id and a kind and no family, and a turn given it would fall back
+// to exactly the stale branch the family exists to prevent. Fail closed.
+func ReadVerdictFile(path string) (Verdict, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return Verdict{}, err
+	}
+	var v Verdict
+	if err := json.Unmarshal(b, &v); err != nil {
+		return Verdict{}, fmt.Errorf("%s: %w", path, err)
+	}
+	if err := v.ValidateLineage(path); err != nil {
+		return Verdict{}, fmt.Errorf("%s: %w", path, err)
+	}
+	return v, nil
+}
+
+// ValidateLineage requires everything a producer needs to act on a verdict
+// and nothing that contradicts itself: one of the three kinds; a change id
+// that is the file's own name; a pushed branch; a declared family that is
+// the family of that branch.
+func (v Verdict) ValidateLineage(path string) error {
+	if !ValidVerdictKind(v.Kind) {
+		return fmt.Errorf("verdict kind %q is not one of merged, changes-requested, operator-gated", v.Kind)
+	}
+	if v.ChangeID == "" {
+		return errors.New("verdict names no change")
+	}
+	if path != "" {
+		if want := v.ChangeID + ".json"; filepath.Base(path) != want {
+			return fmt.Errorf("verdict for change %s is in a file named %s, not %s", v.ChangeID, filepath.Base(path), want)
+		}
+	}
+	if v.Branch == "" || v.DeclaredBranch == "" {
+		return errors.New("verdict carries no branch lineage (written before the family was recorded?); a turn cannot know which family to re-declare")
+	}
+	if got := FamilyOf(v.Branch); got != v.DeclaredBranch {
+		return fmt.Errorf("verdict's declared family %q is not the family of its branch %q (%q)", v.DeclaredBranch, v.Branch, got)
+	}
+	return nil
+}
+
+// FamilyOf recovers the declared family from a pushed branch
+// <declared>-<10 hex>; a name without that suffix is its own family.
+func FamilyOf(branch string) string {
+	i := strings.LastIndex(branch, "-")
+	if i <= 0 || len(branch)-i-1 != 10 {
+		return branch
+	}
+	for _, c := range branch[i+1:] {
+		if !((c >= '0' && c <= '9') || (c >= 'a' && c <= 'f')) {
+			return branch
+		}
+	}
+	return branch[:i]
 }
 
 // Verdict kinds. There are three and only three (SPEC.md §2).
