@@ -7,7 +7,6 @@ import (
 	"fmt"
 	"github.com/aicix-labs/factoryd/internal/supervise"
 	"os"
-	"path/filepath"
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/factory"
@@ -111,8 +110,14 @@ func submitDeps(ctx context.Context, cfg *config.Config) (submit.Deps, error) {
 // is the supervisor's to count.
 func producerAfterTurn(cfg *config.Config) func(ctx context.Context, t supervise.Turn, res supervise.TurnResult) (string, error) {
 	return func(ctx context.Context, t supervise.Turn, res supervise.TurnResult) (string, error) {
-		if _, err := os.Stat(filepath.Join(cfg.TurnWorkdir("producer"), submit.BranchFile)); err != nil {
-			return "no intent declared; nothing to submit", nil
+		// The same reader submit uses, so a declaration submit would refuse --
+		// one file without the other, a link, a fifo -- is a failed after-turn
+		// here too, not "no intent" and a consumed trigger over stranded work.
+		if _, err := submit.ReadIntent(cfg.TurnWorkdir("producer")); err != nil {
+			if errors.Is(err, submit.ErrNoIntent) {
+				return "no intent declared; nothing to submit", nil
+			}
+			return "", fmt.Errorf("submit: the producer's intent is not a valid declaration: %w", err)
 		}
 		deps, err := submitDeps(ctx, cfg)
 		if err != nil {

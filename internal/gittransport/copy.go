@@ -133,6 +133,14 @@ func copyDir(d *os.File, dirPath, rel, dst string) error {
 			f.Close()
 			return fmt.Errorf("copytree: %s: %w", erel, err)
 		}
+		if fi.Mode().IsRegular() {
+			// A regular descriptor is not proof of provenance: a hard link
+			// to a credential is regular too. One link, or it does not cross.
+			if _, err := RequireOwnRegular(f, erel); err != nil {
+				f.Close()
+				return fmt.Errorf("copytree: %w", err)
+			}
+		}
 		switch {
 		case fi.IsDir():
 			if err := os.MkdirAll(target, 0o755); err != nil {

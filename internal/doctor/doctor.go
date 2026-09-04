@@ -95,6 +95,9 @@ type Deps struct {
 	GitIdentity func(ctx context.Context, cfg *config.Config, d scm.Driver, secret string) (string, error)
 	// GitGuard runs the transport's pre-operation guard on submit_repo.
 	GitGuard func(cfg *config.Config, d scm.Driver, secret string) error
+	// Contain proves a turn can be contained on this host: a per-turn cgroup
+	// created, killed and removed. Nil uses the real probe.
+	Contain func() error
 	// Reach probes whether a turn of spec can reach addr, sandboxed or not.
 	// Nil uses the real runner with this binary's own _netprobe verb.
 	Reach func(ctx context.Context, spec config.RoleSpec, addr string, sandboxed bool) (bool, error)
@@ -122,6 +125,9 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 	}
 	if deps.Reach == nil {
 		deps.Reach = realReach
+	}
+	if deps.Contain == nil {
+		deps.Contain = realContain
 	}
 	var r Report
 	add := func(name string, err error, detail string) {
@@ -207,8 +213,12 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 				add("producer cannot read "+cr.name, nil, prober.Describe()+" cannot read "+cr.file)
 			}
 		}
+		// The control is printed whether it passes or fails: a control that
+		// is silent when it passes cannot be audited (canary review note).
 		if canOwn, err := prober.CanRead(ctx, producerDir); err != nil || !canOwn {
 			add("producer read probe control", fmt.Errorf("%s cannot read its own workdir %s (%v); the credential probes above prove nothing", prober.Describe(), producerDir, err), producerDir)
+		} else {
+			add("producer read probe control", nil, prober.Describe()+" can read "+producerDir+", so the two refusals above are refusals")
 		}
 		canSubmit, err1 := prober.CanWrite(ctx, cfg.Paths.SubmitRepo)
 		canWork, err2 := prober.CanWrite(ctx, producerDir)
@@ -413,6 +423,15 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 
 	add("spin guard", nil, fmt.Sprintf("warn at %d turns with no progress, halt at %d; backoff %ds",
 		cfg.Supervisor.SpinWarn, cfg.Supervisor.SpinAbort, cfg.Supervisor.BackoffSeconds))
+
+	// --- containment ---
+	// A turn's processes are held in a per-turn cgroup, killed as a whole
+	// and verified gone before anything follows the turn. A process group
+	// cannot do that -- setsid(2) leaves it -- so a host on which the
+	// cgroup cannot be made is a host on which a clean turn is not a
+	// quiescent producer, and doctor says so rather than letting the
+	// weaker containment pass for the stronger.
+	add("containment", deps.Contain(), "per-turn cgroup: created, killed as a whole, verified empty, removed")
 
 	// --- alerts ---
 	// Delivered, not inspected: a probe alert goes through every transport
@@ -760,4 +779,11 @@ func realReach(ctx context.Context, spec config.RoleSpec, addr string, sandboxed
 		return false, err
 	}
 	return supervise.ProbeReach(ctx, spec, exe, addr, sandboxed)
+}
+
+func realContain() error {
+	if os.Geteuid() != 0 {
+		return fmt.Errorf("doctor is not root; a per-turn cgroup cannot be created, and a turn would be held by a process group only, which a setsid'd child leaves")
+	}
+	return supervise.ProbeContainment()
 }

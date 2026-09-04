@@ -184,11 +184,12 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	// and reading the default here would report "nothing to submit" while
 	// the declared work sat elsewhere.
 	work := cfg.TurnWorkdir("producer")
-	msg, hasWork, err := readControl(work, CommitMsgFile)
-	if err != nil {
-		return Result{}, wrap(ExitConfig, err, "reading %s", CommitMsgFile)
+	intent, err := ReadIntent(work)
+	if err != nil && !errors.Is(err, ErrNoIntent) {
+		return Result{}, wrap(ExitConfig, err, "reading the producer's intent")
 	}
-	if !hasWork {
+	msg, branch := intent.Message, intent.Branch
+	if errors.Is(err, ErrNoIntent) {
 		// Nothing declared. Say what is being left behind, so a dirty tree
 		// does not become the next turn's surprise (issue #12).
 		dirty, _ := dirtyPaths(work)
@@ -201,13 +202,6 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 			}
 		}
 		return r, nil
-	}
-	branch, hasBranch, err := readControl(work, BranchFile)
-	if err != nil {
-		return Result{}, wrap(ExitConfig, err, "reading %s", BranchFile)
-	}
-	if !hasBranch {
-		return Result{}, fail(ExitConfig, "%s names no branch; a commit message without a branch is intent without a destination, and submit refuses to guess one", BranchFile)
 	}
 	if branch == cfg.TargetBranch {
 		return Result{}, fail(ExitConfig, "%s names the target branch %q; the producer never writes to the target", BranchFile, branch)
@@ -390,6 +384,44 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 }
 
 // readControl reads a control file. Absent or blank means "not declared".
+// ErrNoIntent is returned by ReadIntent when neither control file exists:
+// the turn declared nothing, which is an ordinary outcome.
+var ErrNoIntent = errors.New("no intent declared: neither control file exists")
+
+// Intent is what the producer declared.
+type Intent struct {
+	Branch  string
+	Message string
+}
+
+// ReadIntent is THE reader of the producer's intent, shared by submit and by
+// the supervisor's after-turn step so the two cannot disagree. Both control
+// files are read no-follow on the workdir's descriptor and must be regular,
+// single-link files. Neither present is ErrNoIntent. Anything else that is
+// not a complete, valid declaration is an error: one file without the
+// other, an empty file, a symlink (dangling or not), a fifo, a hard link. A
+// supervisor that read "no intent" for any of those would consume the
+// trigger and strand the work; direct submit refuses them, and so must it.
+func ReadIntent(work string) (Intent, error) {
+	msg, hasMsg, merr := readControl(work, CommitMsgFile)
+	branch, hasBranch, berr := readControl(work, BranchFile)
+	if merr != nil {
+		return Intent{}, fmt.Errorf("%s: %w", CommitMsgFile, merr)
+	}
+	if berr != nil {
+		return Intent{}, fmt.Errorf("%s: %w", BranchFile, berr)
+	}
+	switch {
+	case !hasMsg && !hasBranch:
+		return Intent{}, ErrNoIntent
+	case hasMsg && !hasBranch:
+		return Intent{}, fmt.Errorf("%s is declared but %s names no branch; a commit message without a branch is intent without a destination, and submit refuses to guess one", CommitMsgFile, BranchFile)
+	case hasBranch && !hasMsg:
+		return Intent{}, fmt.Errorf("%s names %q but %s is absent or empty; a branch without a message is not a declaration", BranchFile, branch, CommitMsgFile)
+	}
+	return Intent{Branch: branch, Message: msg}, nil
+}
+
 // readControl reads a control file the producer wrote, as root, without
 // following anything the producer controls: the file is opened through a
 // handle on the workdir with O_NOFOLLOW on the final component, and must be
@@ -415,12 +447,9 @@ func readControl(work, name string) (string, bool, error) {
 		return "", false, err
 	}
 	defer f.Close()
-	fi, err := f.Stat()
+	fi, err := gittransport.RequireOwnRegular(f, name)
 	if err != nil {
-		return "", false, err
-	}
-	if !fi.Mode().IsRegular() {
-		return "", false, fmt.Errorf("%s is not a regular file (%v); refusing to read it", name, fi.Mode().Type())
+		return "", false, fmt.Errorf("%w; refusing to read it", err)
 	}
 	if fi.Size() > 64*1024 {
 		return "", false, fmt.Errorf("%s is %d bytes; a control file is a branch name or a commit message", name, fi.Size())

@@ -309,12 +309,23 @@ refused); every file copied is opened the same way, copied from that descriptor,
 and a directory is listed through its own descriptor. A file swapped for a link
 between listing and open fails the open and refuses the submit. `os.Root` is not
 used for this: it resolves an in-tree symlink itself before the final open, so
-`O_NOFOLLOW` never sees the link. A turn whose leader exited while processes in
-its group still ran is **not clean**: they are killed, nothing follows the turn,
-and it counts as a failure — and because a detached child escapes the group,
-the crossing does not rely on that check. **The producer receives no credential**
-is proved by `doctor` as the producer: neither credential file may be readable
-by it, with the control that its own workdir is.
+`O_NOFOLLOW` never sees the link. **A regular descriptor is not provenance
+either:** a hard link to a credential is a regular file with the credential's
+inode, so a file with more than one link — reachable from somewhere else — does
+not cross, as a control file or as source. **The producer's intent has one
+reader**, shared by `submit` and by the supervisor's after-turn step: neither
+control file is *no intent*; one without the other, an empty one, a link, a fifo
+or a hard link is a failed after-turn on the streak, never "no intent" and a
+consumed trigger over stranded work. **A turn is contained in its own cgroup**,
+joined at clone; after the leader exits, `cgroup.kill` ends everything left in
+it — whatever session a child made for itself — and the cgroup is verified
+empty before anything follows. A process group cannot give this (`setsid(2)`
+leaves it), so privileged factoryd that cannot create the cgroup refuses to start
+the turn, and the unprivileged fallback is named `process-group` in the result
+and fails `doctor`. Anything left in the cgroup makes the turn **not clean**:
+nothing follows it, and it counts as a failure. **The producer receives no
+credential** is proved by `doctor` as the producer: neither credential file may
+be readable by it, with the control that its own workdir is.
 
 **The producer's sandbox is the supervisor's, not the agent's.**
 `roles.producer.sandbox.no_network` starts the turn in a new, empty network
@@ -1170,6 +1181,9 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §8 no process-supplied label | a secret planted in the supervisor's recorded argv, in a live process's arguments, in its **comm** (rewritten by the process) and in its **executable path** (a copy named after the secret) appears in none of HTML, JSON or text | the processes **are** shown, by pid, labelled `turn` and `child` from factoryd's own records |
 | §4.4 no-follow crossing | a control file symlinked to a credential, outside or **inside** the tree → refused unread: no commit, no draft, no push, no secret in any log or error; a fifo control file → refused; a detached child that swaps a source file for a credential link after a clean exit → submit refuses, nothing committed or pushed, nothing copied | an ordinary tree copies and submits |
 | §4.4 leftover turn | a leader exits 0 with a child still running — holding its stdio, or silent — → the child is killed, the turn is reported leftover, nothing follows it, it counts as a failure | a quiescent turn is not leftover |
+| §4.4 containment | a leader exits 0 after starting a **`setsid`'d** descendant → it is killed by the cgroup, verified gone, and the turn is leftover (root; run under sudo) — the mutations "cgroup.kill never written", "empty verification skipped", "turn not placed in the cgroup", "survivors not reported", "root falls back to process groups" each fail it; unprivileged, the result says `process-group` and `doctor` fails containment | a quiescent turn under the cgroup is not leftover |
+| §4.4 hard links | a credential hard-linked into the tree as a control file, or as source → refused: no commit, no draft, no push, nothing copied, no secret in any output | a single-link file crosses |
+| §4.4 one intent reader | only a message, only a branch, an empty message, a dangling branch link → an error the after-turn counts on the streak; neither file → no intent | both files → the declaration |
 | §4.4 producer holds no credential | the producer identity can read either credential file → `doctor` fails; a probe that cannot read even the producer's own workdir → `doctor` fails as an unproved boundary | the producer can read its workdir and neither token |
 | §6.4 the gate refuses | a deny path (either name of a rename), held content on an added line, an escalate path with no audit / a `BROKEN` audit / an audit on another head / an audit that tried nothing, a moved head, a closed change, an empty diff, a provider refusal → `merged` is refused **before** any merge call (the provider's own refusal excepted), no verdict file is written | a mergeable change is readied, merged with the expected head, verified, and recorded in file, state and comment |
 | §6.4 refuse, not downgrade | an operator-only result refuses; the recorded verdict is never one the gate substituted | the reviewer's own `operator-gated` signal records without merging |

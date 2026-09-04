@@ -945,3 +945,102 @@ func TestFifoControlFileIsRefused(t *testing.T) {
 		t.Fatalf("err=%v git=%v", err, l.git.calls)
 	}
 }
+
+// O_NOFOLLOW stops symlinks, not hard links: a hard link to a credential is
+// a regular file with the credential's inode. Two links to one inode means
+// the file is reachable from elsewhere, and it does not cross -- as a
+// control file or as source.
+func TestHardLinkedCredentialIsRefusedOnBothCrossings(t *testing.T) {
+	const secret = "FAKE-CREDENTIAL-hardlink-3c9e"
+	// Same filesystem as the workdir, so the link can exist at all.
+	for _, where := range []string{"control", "source"} {
+		t.Run(where, func(t *testing.T) {
+			l := newLab(t)
+			l.edit(t, "src/a.go")
+			cred := filepath.Join(l.root, "reviewer.token")
+			if err := os.WriteFile(cred, []byte(secret+"\n"), 0o600); err != nil {
+				t.Fatal(err)
+			}
+			var target string
+			if where == "control" {
+				target = filepath.Join(l.work, submit.CommitMsgFile)
+				os.WriteFile(filepath.Join(l.work, submit.BranchFile), []byte("producer/fix\n"), 0o644)
+			} else {
+				l.declare(t, "producer/fix", "fix")
+				target = filepath.Join(l.work, "src", "leak.go")
+			}
+			if err := os.Link(cred, target); err != nil {
+				t.Skipf("hard link not permitted here: %v", err)
+			}
+			_, err := submit.Run(context.Background(), l.cfg, l.deps)
+			if err == nil || !strings.Contains(err.Error(), "links") {
+				t.Fatalf("err=%v; a multi-link file crossed", err)
+			}
+			for _, c := range l.git.calls {
+				if strings.HasPrefix(c, "commit") {
+					t.Fatalf("committed: %v", l.git.calls)
+				}
+			}
+			if len(l.tr.pushed) != 0 || l.drv.opened != nil {
+				t.Fatalf("pushed=%v opened=%v", l.tr.pushed, l.drv.opened != nil)
+			}
+			for _, out := range []string{err.Error(), l.log.String()} {
+				if strings.Contains(out, secret) {
+					t.Fatalf("the secret reached an output:\n%s", out)
+				}
+			}
+			if b, err := os.ReadFile(filepath.Join(l.cfg.Paths.SubmitRepo, "src", "leak.go")); err == nil && strings.Contains(string(b), secret) {
+				t.Fatal("the secret was copied into the submit repository")
+			}
+		})
+	}
+}
+
+// ReadIntent is the one reader both submit and the supervisor use. Neither
+// file is "no intent"; anything short of a complete, valid declaration is
+// an error -- a supervisor that read it as "no intent" would consume the
+// trigger and strand the work.
+func TestReadIntentDistinguishesNoneFromInvalid(t *testing.T) {
+	cases := map[string]struct {
+		setup  func(work string)
+		noInt  bool
+		errHas string
+	}{
+		"neither": {func(string) {}, true, ""},
+		"both": {func(w string) {
+			os.WriteFile(filepath.Join(w, submit.BranchFile), []byte("p/x\n"), 0o644)
+			os.WriteFile(filepath.Join(w, submit.CommitMsgFile), []byte("m\n"), 0o644)
+		}, false, ""},
+		"only the message": {func(w string) { os.WriteFile(filepath.Join(w, submit.CommitMsgFile), []byte("m\n"), 0o644) }, false, "names no branch"},
+		"only the branch":  {func(w string) { os.WriteFile(filepath.Join(w, submit.BranchFile), []byte("p/x\n"), 0o644) }, false, "absent or empty"},
+		"empty message file": {func(w string) {
+			os.WriteFile(filepath.Join(w, submit.BranchFile), []byte("p/x\n"), 0o644)
+			os.WriteFile(filepath.Join(w, submit.CommitMsgFile), nil, 0o644)
+		}, false, "absent or empty"},
+		"dangling branch symlink": {func(w string) {
+			os.Symlink("/nonexistent/target", filepath.Join(w, submit.BranchFile))
+			os.WriteFile(filepath.Join(w, submit.CommitMsgFile), []byte("m\n"), 0o644)
+		}, false, "symlink"},
+	}
+	for name, c := range cases {
+		t.Run(name, func(t *testing.T) {
+			work := t.TempDir()
+			c.setup(work)
+			in, err := submit.ReadIntent(work)
+			switch {
+			case c.noInt:
+				if !errors.Is(err, submit.ErrNoIntent) {
+					t.Fatalf("err=%v, want ErrNoIntent", err)
+				}
+			case c.errHas != "":
+				if err == nil || errors.Is(err, submit.ErrNoIntent) || !strings.Contains(err.Error(), c.errHas) {
+					t.Fatalf("err=%v, want an error containing %q and not ErrNoIntent", err, c.errHas)
+				}
+			default:
+				if err != nil || in.Branch != "p/x" || in.Message != "m" {
+					t.Fatalf("in=%+v err=%v", in, err)
+				}
+			}
+		})
+	}
+}
