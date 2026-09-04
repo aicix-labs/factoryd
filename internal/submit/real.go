@@ -177,6 +177,15 @@ type GateProvisioner struct {
 	Cfg *config.Config
 }
 
+// GateCanTraverse probes search permission on dir as the gate identity.
+func (g GateProvisioner) GateCanTraverse(ctx context.Context, dir string) (bool, error) {
+	prober, err := doctor.NewProber(g.Cfg.Gate.RunAs)
+	if err != nil {
+		return false, err
+	}
+	return prober.CanTraverse(ctx, dir)
+}
+
 func (g GateProvisioner) Provision(ctx context.Context, path string) error {
 	if err := os.MkdirAll(path, 0o755); err != nil {
 		return err

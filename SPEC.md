@@ -325,7 +325,17 @@ the turn, and the unprivileged fallback is named `process-group` in the result
 and fails `doctor`. Anything left in the cgroup makes the turn **not clean**:
 nothing follows it, and it counts as a failure. **The producer receives no
 credential** is proved by `doctor` as the producer: neither credential file may
-be readable by it, with the control that its own workdir is.
+be readable by it, with the control that its own workdir is. **The producer's
+home is closed to the gate, and that is re-proved at the crossing.** A
+hosted-model producer keeps its model credential under its home; the gate runs
+producer-authored code. `doctor` probes, as the gate, that it cannot *traverse*
+the home (search permission, not readability — a `0711` home is unreadable and
+still lets a known path such as `.codex/auth.json` be read). But `doctor` is an
+operator command that saw a moment, and the producer owns its home and can
+reopen it during its turn; so `submit` asks the gate identity the same question
+again, after the producer has quiesced and immediately before provisioning and
+running the gate, and refuses — exit 3, a boundary failure, not a red branch —
+if the answer changed.
 
 **The producer's sandbox is the supervisor's, not the agent's.**
 `roles.producer.sandbox.no_network` starts the turn in a new, empty network
@@ -1196,6 +1206,7 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §4.4 hard links | a credential hard-linked into the tree as a control file, or as source → refused: no commit, no draft, no push, nothing copied, no secret in any output | a single-link file crosses |
 | §4.4 one intent reader | only a message, only a branch, an empty message, a dangling branch link → an error the after-turn counts on the streak; neither file → no intent | both files → the declaration |
 | §4.4 producer holds no credential | the producer identity can read either credential file → `doctor` fails; a probe that cannot read even the producer's own workdir → `doctor` fails as an unproved boundary | the producer can read its workdir and neither token |
+| §4.4 producer home re-proved at the crossing | `doctor` green with the home at `0700`; the producer reopens it to `0711` during its turn → `submit` refuses before the gate (exit 3), nothing provisioned, pushed or opened; a `0711` home passes a read probe and fails the traversal probe | the home closed again → the gate runs and the change is pushed |
 | §6.4 the gate refuses | a deny path (either name of a rename), held content on an added line, an escalate path with no audit / a `BROKEN` audit / an audit on another head / an audit that tried nothing, a moved head, a closed change, an empty diff, a provider refusal → `merged` is refused **before** any merge call (the provider's own refusal excepted), no verdict file is written | a mergeable change is readied, merged with the expected head, verified, and recorded in file, state and comment |
 | §6.4 refuse, not downgrade | an operator-only result refuses; the recorded verdict is never one the gate substituted | the reviewer's own `operator-gated` signal records without merging |
 | §6.4 hold is on additions | a removed key and a `+++` header do not hold; an added key does | — |

@@ -96,8 +96,15 @@ func (g *fakeGate) Run(_ context.Context, _ *config.Config, exe string, env []st
 }
 
 type fakeProvisioner struct {
-	err   error
-	paths []string
+	err         error
+	paths       []string
+	traversable bool // what the gate identity can do to the producer's home, NOW
+	probed      []string
+}
+
+func (p *fakeProvisioner) GateCanTraverse(_ context.Context, dir string) (bool, error) {
+	p.probed = append(p.probed, dir)
+	return p.traversable, nil
 }
 
 func (p *fakeProvisioner) Provision(_ context.Context, path string) error {
@@ -1042,5 +1049,41 @@ func TestReadIntentDistinguishesNoneFromInvalid(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The reviewer's case: doctor was green (the home was closed when it
+// looked), the producer reopened its own home during its turn, and the
+// gate would run producer-authored code with that access. The boundary is
+// re-proved at the crossing, after the producer has quiesced: the gate is
+// refused, nothing is provisioned, pushed or opened.
+func TestGateIsRefusedWhenTheProducerReopenedItsHome(t *testing.T) {
+	home := "producer-home"
+	// Control: with the home closed to the gate, the gate runs and the
+	// probe was made against the declared home.
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "fix")
+	l.cfg.Roles.Producer.Env = map[string]string{"PATH": "/usr/bin", "HOME": filepath.Join(l.root, home)}
+	l.prov.traversable = false
+	if _, err := submit.Run(context.Background(), l.cfg, l.deps); err != nil {
+		t.Fatalf("closed home: %v", err)
+	}
+	if !l.gate.ran || len(l.prov.probed) == 0 || l.prov.probed[0] != filepath.Join(l.root, home) {
+		t.Fatalf("control: gate ran=%v probed=%v", l.gate.ran, l.prov.probed)
+	}
+
+	// The producer reopened its home after doctor looked.
+	l = newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "fix")
+	l.cfg.Roles.Producer.Env = map[string]string{"PATH": "/usr/bin", "HOME": filepath.Join(l.root, home)}
+	l.prov.traversable = true
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if err == nil || exitOf(t, err) != submit.ExitConfig || !strings.Contains(err.Error(), "traverse") {
+		t.Fatalf("err=%v, want exit %d refusing the crossing", err, submit.ExitConfig)
+	}
+	if l.gate.ran || len(l.prov.paths) != 0 || len(l.tr.pushed) != 0 || l.drv.opened != nil {
+		t.Fatalf("gate ran=%v provisioned=%v pushed=%v opened=%v; nothing may follow a reopened home", l.gate.ran, l.prov.paths, l.tr.pushed, l.drv.opened != nil)
 	}
 }

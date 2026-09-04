@@ -127,6 +127,12 @@ type GateRunner interface {
 // host, presented as the producer's fault: exactly the misreport §9.6 forbids.
 type Provisioner interface {
 	Provision(ctx context.Context, path string) error
+	// GateCanTraverse reports whether the GATE identity can pass through
+	// dir, probed now. The producer owns its home and can widen it after
+	// doctor looked; the gate runs producer-authored code later. Only a
+	// probe at this crossing, after the producer has quiesced, binds the
+	// state doctor saw to the state the gate gets.
+	GateCanTraverse(ctx context.Context, dir string) (bool, error)
 }
 
 // Deps are everything Run touches in the world.
@@ -273,6 +279,23 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	// so a relative path no longer exists; created as factoryd's it would be
 	// unwritable by the gate, and the gate's failure would be reported as a
 	// red branch. A missing or unprovisionable path exits 3, not 5.
+	// 5a. The producer's home, re-proved at the crossing. doctor is an
+	// operator command that saw a moment; the producer owns its home and
+	// can reopen it during its turn; the gate runs producer-authored code
+	// after. So the gate identity is asked NOW, with the producer quiesced,
+	// whether it can traverse that home -- and a yes is a boundary failure
+	// (exit 3), not a red branch: nothing the producer wrote is judged.
+	if home := cfg.Roles.Producer.Env["HOME"]; home != "" {
+		can, err := deps.Provision.GateCanTraverse(ctx, home)
+		if err != nil {
+			return Result{}, wrap(ExitConfig, err, "probing whether the gate can traverse the producer's home %s", home)
+		}
+		if can {
+			return Result{}, fail(ExitConfig, "the gate identity can traverse the producer's home %s; the producer reopened it after doctor, and producer-authored gate code would reach its model credential -- not running the gate", home)
+		}
+		fmt.Fprintf(log, "boundary: the gate cannot traverse %s\n", home)
+	}
+
 	for _, p := range cfg.Gate.RequiredWritablePaths {
 		resolved, err := cfg.ResolveGatePath(p)
 		if err != nil {
