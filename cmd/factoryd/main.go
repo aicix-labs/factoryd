@@ -32,6 +32,8 @@ usage:
                                                      exits 0 submitted, 3 config/identity, 4 nothing, 5 gate red
   factoryd health    --config <f> [--loop] [--json]  one model-free tick: detect, alert, write health.json
                                                      exits 0 healthy, 1 findings, 3 could not look
+  factoryd status    --config <f> [--config <g>] [--serve :8080] [--json] [--provider=false]
+                                                     read-only: is it working, what is it doing, what is it waiting on, what needs me
   factoryd scm       --config <f> <verb>...         drive the provider directly
   factoryd version
 
@@ -78,6 +80,8 @@ func main() {
 		os.Exit(runSubmit(args))
 	case "health":
 		os.Exit(runHealth(args))
+	case "status":
+		os.Exit(runStatus(args))
 	case "scm":
 		os.Exit(runSCM(args))
 	case "version":
@@ -86,7 +90,7 @@ func main() {
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		os.Exit(exitOK)
-	case "signal", "audit", "status":
+	case "signal", "audit":
 		// Named explicitly so the failure says what is missing. A subcommand
 		// that silently did nothing would be indistinguishable from one that
 		// ran and found nothing to do.

@@ -921,6 +921,52 @@ Rationale: during operation the most common question was *"is this working? I ha
 way to see status."* Everything the factory does is observable, but only if you know
 the six places to look. This is those six places.
 
+Implementation notes (step 7):
+
+- **"Needs me" and "working" are separate questions.** A gated change or a
+  waiting question is the factory waiting on the operator *by design*; it is
+  working, and it needs you. A provider that status cannot reach says nothing
+  about the factory; the open changes are shown as *unknown*, with the last good
+  list and its time beside the error, never blanked — "the provider is down" must
+  not read as "nothing is open". A dead or halted supervisor, a stop sentinel, a
+  missing or stale health document, or a state document status cannot read: not
+  working.
+- **What status could not read is shown, not hidden.** A page for a factory whose
+  state document is unreadable must not look like a page for an idle factory.
+- **Read-only, and shown to be.** Every file under the factory root is byte- and
+  mtime-identical after collecting and after serving both endpoints; the provider
+  sees nothing but a listing; any method but GET/HEAD is refused. There is no
+  control surface to mistake for one.
+- **The provider is asked once per health interval, not once per page load.** A
+  reload is not a reason for an API call. `--provider=false` runs status with no
+  credential at all, and says so on the page.
+- **Liveness is the process, not the record.** The supervisor's handle is checked
+  against the live process (start token), and the real process tree under it is
+  shown from `/proc`, so "supervising" and "supervising a turn that is actually
+  running `claude`" are different lines.
+- One-shot `factoryd status --config f` prints the same document as text and
+  exits 0 working / 1 not; `--json` prints the endpoint's document; `--serve`
+  hosts both. Several `--config` flags make one page.
+- **The page is unauthenticated, so nothing that reaches it may carry anything a
+  process said about itself.** argv routinely holds tokens; `/proc/<pid>/comm` is
+  writable by the process (`prctl(PR_SET_NAME)`); the executable path is a copy
+  of a binary named anything. A child holding a credential can encode it through
+  any of them, and the page would publish it. The tree therefore shows **pid and
+  structure only**, labelled from what factoryd itself recorded: `supervisor` for
+  the pid in the state document, `turn` for the pid the supervisor recorded for
+  the running turn, `child` for everything else. The supervisor is shown as pid
+  and start time, never as the `proc.Ref` whose descriptive `Command` is its own
+  argv. `--serve` warns when the address actually **bound** — not the flag, which
+  may be a hostname — is not loopback.
+- **Absent and unreadable are different answers.** No health document means the
+  tick never ran; a health document that exists and cannot be read or parsed is
+  named as such, is an error the page shows, and means *not working* — it must
+  not read as "the tick never ran here".
+- **The provider throttle keys on the last attempt, not the last good answer.**
+  After a failed refresh the last good list's time is already older than the
+  TTL; a throttle keyed on it would ask the provider on every reload — precisely
+  while the provider is down.
+
 ---
 
 ## 9. Evidence rules (normative)
@@ -1004,6 +1050,12 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §7 fan-out | one transport failing does not suppress the next, and the failure is named | every transport failing is an error that names each |
 | §7 reclamation scope | a cache root of `/`, one overlapping the factory root, a repository, a credential or an alert file, or a cache outside the root → refused at load; a cache path or entry that **resolves** outside the root at reclamation time → nothing deleted, `cache_unsafe` | a sibling that merely shares a string prefix is accepted; a cache inside the root is reclaimed |
 | §7 deletion follows the handle | the cache root is replaced by a symlink to a victim **after** it was opened and verified, before anything is deleted → the real root is reclaimed and the victim is intact, links included; the root swapped **between** the no-follow open and the bind → refused | the same root untouched reclaims exactly the oldest entry |
+| §8 read-only | every file under the factory root is byte- and mtime-identical after collecting and serving, with triggers, a question and a stop sentinel present to tempt consumption; POST is refused | the page and the JSON rendered, the provider was asked once |
+| §8 needs me | a dead supervisor, a halt, a stop sentinel, never supervised, an operator-gated verdict, a waiting question, no / stale / unhealthy health, an unreachable provider, an unreadable state document → each named | a healthy factory has an empty list and reads *working* |
+| §8 provider down | a failed refresh keeps the last good list visible with its own time beside the error | a refresh after the TTL is made; a reload inside it is not |
+| §8 throttle after failure | a failed refresh followed by reloads inside the TTL → the provider is asked **no** further time; after the TTL, once | — the positive control is the refresh after the TTL |
+| §8 unreadable health | a health document that is not JSON, or cannot be read → named, an error, *not working*, and not "the tick never ran" | an absent document reads as absent |
+| §8 no process-supplied label | a secret planted in the supervisor's recorded argv, in a live process's arguments, in its **comm** (rewritten by the process) and in its **executable path** (a copy named after the secret) appears in none of HTML, JSON or text | the processes **are** shown, by pid, labelled `turn` and `child` from factoryd's own records |
 | §7 root replaced after doctor | the root itself, or its renamed parent, replaced by a symlink after `doctor` passed → `cache_unsafe`, nothing deleted | — |
 | §7 symlink entry | a symlink entry is removed as a link; its target is intact | the link itself is gone and counted |
 | §7 could not look | a volume that will not stat, a provider that will not answer, a corrupt state document → `factoryd health` exits **3** | findings alone exit 1; a live supervisor exits 0 |

@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"net"
 	"os"
 	"path/filepath"
 	"testing"
@@ -75,5 +76,35 @@ func TestHealthExitCodes(t *testing.T) {
 	}
 	if code := run(); code != exitConfig {
 		t.Fatalf("corrupt state: exit %d, want %d (could not look is not a finding)", code, exitConfig)
+	}
+}
+
+// The exposure warning is judged on the address actually bound. A hostname
+// is not a loopback just because it is not a literal; only a loopback IP is.
+func TestBoundToLoopbackJudgesTheAddress(t *testing.T) {
+	cases := map[string]struct {
+		addr net.Addr
+		want bool
+	}{
+		"127.0.0.1": {&net.TCPAddr{IP: net.ParseIP("127.0.0.1"), Port: 1}, true},
+		"::1":       {&net.TCPAddr{IP: net.ParseIP("::1"), Port: 1}, true},
+		"0.0.0.0":   {&net.TCPAddr{IP: net.ParseIP("0.0.0.0"), Port: 1}, false},
+		"10.0.0.5":  {&net.TCPAddr{IP: net.ParseIP("10.0.0.5"), Port: 1}, false},
+		"nil ip":    {&net.TCPAddr{Port: 1}, false},
+		"not tcp":   {&net.UnixAddr{Name: "/x"}, false},
+	}
+	for name, c := range cases {
+		if got := boundToLoopback(c.addr); got != c.want {
+			t.Errorf("%s: %v, want %v", name, got, c.want)
+		}
+	}
+	// And against a real bind, which is what the CLI inspects.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Skip(err)
+	}
+	defer ln.Close()
+	if !boundToLoopback(ln.Addr()) {
+		t.Fatal("a real loopback bind was not recognised")
 	}
 }
