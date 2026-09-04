@@ -899,6 +899,15 @@ A changed mtime resets the spin counter. Without this, a legitimate multi-turn t
 trips the circuit breaker and halts the factory — a check firing on the wrong
 condition.
 
+**A model cannot set an exit code by narrating it.** `claude -p` and
+`codex exec` exit 0 whatever the model concluded; the supervisor reads the exit
+code, so a turn that correctly decided it had nothing to do and touched nothing
+reads as a clean turn that achieved nothing — the spin counter moves, the fail
+streak does not (canary issue #27). The outcome must be derived from the
+observable effect: `examples/turn-wrapper.sh` runs the agent, and exits non-zero
+when `$FACTORYD_PROGRESS` did not move, passing the agent's own non-zero exit
+through unchanged. Wire agent CLIs through it, or an equivalent, never bare.
+
 ### 6.4 Audits
 
 An escalate-class change requires a recorded adversarial pass before merge, enforced

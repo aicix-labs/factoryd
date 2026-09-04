@@ -196,9 +196,13 @@ func TestNeedsMeNamesEachCondition(t *testing.T) {
 		stillWorking bool
 	}{
 		"dead supervisor": {func(l *lab, t *testing.T) { l.alive[100] = false }, "producer supervisor pid 100 is dead", false},
-		"halted": {func(l *lab, t *testing.T) {
+		"halted, sentinel already gone": {func(l *lab, t *testing.T) {
 			l.state(t, func(s *state.State) { r := s.Role(state.RoleReviewer); r.Halted, r.HaltReason = true, "spin abort" })
-		}, "reviewer supervisor halted: spin abort", false},
+		}, "sentinel already cleared; restart to resume", false},
+		"halted, sentinel present": {func(l *lab, t *testing.T) {
+			l.state(t, func(s *state.State) { r := s.Role(state.RoleReviewer); r.Halted, r.HaltReason = true, "spin abort" })
+			os.WriteFile(l.cfg.StopPath("reviewer"), []byte("reason: spin abort\n"), 0o644)
+		}, "remove " + "/", false},
 		"stop sentinel": {func(l *lab, t *testing.T) { os.WriteFile(l.cfg.StopPath("producer"), []byte("x"), 0o644) }, "stop sentinel", false},
 		"never supervised": {func(l *lab, t *testing.T) {
 			l.state(t, func(s *state.State) { s.Role(state.RoleProducer).Supervisor = nil })
@@ -482,5 +486,22 @@ func TestNoProcessSuppliedLabelReachesAnyOutput(t *testing.T) {
 	if !strings.Contains(j, fmt.Sprintf(`"pid": %d`, child.Process.Pid)) || !strings.Contains(j, `"label": "turn"`) ||
 		!strings.Contains(j, fmt.Sprintf(`"pid": %d`, grandchild)) || !strings.Contains(j, `"label": "child"`) {
 		t.Fatalf("the live processes are not shown by pid with factoryd's own labels:\n%s", j)
+	}
+}
+
+// The remedy names the sentinel that exists, and only then (#26).
+func TestHaltRemedyFollowsTheSentinel(t *testing.T) {
+	l := newLab(t)
+	l.state(t, func(s *state.State) { r := s.Role(state.RoleReviewer); r.Halted, r.HaltReason = true, "fail_abort" })
+	os.WriteFile(l.cfg.StopPath("reviewer"), []byte("x"), 0o644)
+	s := l.collect()
+	if !strings.Contains(strings.Join(s.NeedsMe, "\n"), "remove "+l.cfg.StopPath("reviewer")+" and restart") {
+		t.Fatalf("needs=%v; with the sentinel present the remedy must name it", s.NeedsMe)
+	}
+	os.Remove(l.cfg.StopPath("reviewer"))
+	s = l.collect()
+	joined := strings.Join(s.NeedsMe, "\n")
+	if strings.Contains(joined, "remove ") || !strings.Contains(joined, "sentinel already cleared; restart to resume") {
+		t.Fatalf("needs=%v; with the sentinel gone the remedy must not tell the operator to remove it", s.NeedsMe)
 	}
 }
