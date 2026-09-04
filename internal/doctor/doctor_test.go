@@ -380,6 +380,7 @@ func TestIndividualFailuresAreCaught(t *testing.T) {
 			// identity cannot read it (#47 review).
 			name: "reviewer can read the operator credential",
 			mutate: func(t *testing.T, c *config.Config) {
+				writeToken(t, filepath.Join(c.Paths.Root, "operator.token"), "the-operator")
 				c.Credentials.Operator = config.CredentialRef{File: filepath.Join(c.Paths.Root, "operator.token")}
 				c.Roles.Reviewer.RunAs = &config.RunAs{User: "reviewer-reads-operator-token"}
 			},
@@ -388,6 +389,7 @@ func TestIndividualFailuresAreCaught(t *testing.T) {
 		{
 			name: "operator credential configured but the reviewer runs as factoryd itself",
 			mutate: func(t *testing.T, c *config.Config) {
+				writeToken(t, filepath.Join(c.Paths.Root, "operator.token"), "the-operator")
 				c.Credentials.Operator = config.CredentialRef{File: filepath.Join(c.Paths.Root, "operator.token")}
 				c.Roles.Reviewer.RunAs = nil
 			},
@@ -396,6 +398,7 @@ func TestIndividualFailuresAreCaught(t *testing.T) {
 		{
 			name: "reviewer read probe has no positive control",
 			mutate: func(t *testing.T, c *config.Config) {
+				writeToken(t, filepath.Join(c.Paths.Root, "operator.token"), "the-operator")
 				c.Credentials.Operator = config.CredentialRef{File: filepath.Join(c.Paths.Root, "operator.token")}
 				c.Roles.Reviewer.RunAs = &config.RunAs{User: "reviewer-reads-nothing"}
 			},
@@ -1040,11 +1043,49 @@ func (p recordingProber) CanTraverse(ctx context.Context, path string) (bool, er
 	return p.Prober.CanTraverse(ctx, path)
 }
 
+// Distinct file paths are not distinct principals. An operator file that
+// holds the reviewer's token is unreadable by the reviewer identity and
+// still one authority: the provider's stable id says so, and doctor fails
+// "operator identity" (#47 review).
+func TestOperatorFileHoldingTheReviewerTokenIsOneAuthority(t *testing.T) {
+	cfg := fixture(t)
+	reviewerTok, err := os.ReadFile(cfg.Credentials.Reviewer.File)
+	if err != nil {
+		t.Fatal(err)
+	}
+	op := filepath.Join(cfg.Paths.Root, "operator.token")
+	if err := os.WriteFile(op, reviewerTok, 0o600); err != nil {
+		t.Fatal(err)
+	}
+	cfg.Credentials.Operator = config.CredentialRef{File: op}
+	cfg.Roles.Reviewer.RunAs = &config.RunAs{User: "factoryd-reviewer"} // cannot read the operator file
+	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
+	if r.OK() {
+		t.Fatalf("doctor passed with the reviewer's token behind the operator path:\n%s", r)
+	}
+	names := failedNames(r)
+	found := false
+	for _, n := range names {
+		if n == "operator identity" {
+			found = true
+		}
+	}
+	if !found || !strings.Contains(r.String(), "operator and reviewer both authenticate as") {
+		t.Fatalf("failures %v; want operator identity naming the shared authority:\n%s", names, r)
+	}
+	// And the unreadability probe passed, as it must: the path boundary held
+	// and was not the check that caught this.
+	if strings.Contains(r.String(), "FAIL  reviewer cannot read operator credential") {
+		t.Fatalf("the path probe failed; this case is about the id check:\n%s", r)
+	}
+}
+
 // With an operator credential the reviewer cannot read, doctor passes and
 // prints the reviewer's refusal and its control (positive control for the
 // three negative cases above).
 func TestOperatorCredentialUnreadableByTheReviewerPasses(t *testing.T) {
 	cfg := fixture(t)
+	writeToken(t, filepath.Join(cfg.Paths.Root, "operator.token"), "the-operator")
 	cfg.Credentials.Operator = config.CredentialRef{File: filepath.Join(cfg.Paths.Root, "operator.token")}
 	cfg.Roles.Reviewer.RunAs = &config.RunAs{User: "factoryd-reviewer"}
 	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
@@ -1052,7 +1093,7 @@ func TestOperatorCredentialUnreadableByTheReviewerPasses(t *testing.T) {
 		t.Fatalf("doctor failed:\n%s", r)
 	}
 	text := r.String()
-	for _, want := range []string{"reviewer cannot read operator credential", "reviewer read probe control", "producer cannot read operator credential", "gate cannot read operator credential"} {
+	for _, want := range []string{"reviewer cannot read operator credential", "reviewer read probe control", "producer cannot read operator credential", "gate cannot read operator credential", "operator identity"} {
 		if !strings.Contains(text, want) {
 			t.Fatalf("doctor output lacks %q:\n%s", want, text)
 		}

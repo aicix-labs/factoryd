@@ -56,10 +56,15 @@ and the gate never marks a draft ready.
 ## What works today
 
 `factoryd scm close <id> [reason]` retires a superseded draft as the operator
-principal (`credentials.operator`, a third token the reviewer identity cannot
-read, proved by `doctor`); no provider offers a conditional close, so the
-automated reviewer protocol never closes. Refused for anything not an open
-draft, believed only when the re-read says closed.
+principal: `credentials.operator`, a third token the reviewer identity cannot
+read and a third *provider identity*, both proved by `doctor` and re-proved
+before every close. No provider offers a conditional close, so the automated
+reviewer protocol never closes; what the reviewer's own token can do at the
+provider directly is the provider's RBAC, which factoryd does not claim to
+bound. Refused for anything not an open draft, believed only when the re-read
+says closed. The examples run the reviewer as `factoryd-reviewer`, which can
+read `reviewer.token` (0640 root:factoryd-reviewer) and not `operator.token`
+(0600 root).
 
 A submission submit refuses for a reason that cannot change is not retried:
 the block is recorded, the declaration quarantined, and `status` and `health`
@@ -86,6 +91,8 @@ FAIL  producer workdir             /var/lib/factoryd/widgets/clone (worktree)
       /elsewhere/.git/worktrees/w. Its refs live in the parent repository,
       outside the producer's sandbox, so the producer cannot commit
 ok    gate command                 bash -c go build ./... && go vet ./... && ...
+ok    reviewer cannot read operator credential factoryd-reviewer (uid 1002) cannot read /etc/factoryd/widgets/operator.token
+ok    reviewer read probe control  factoryd-reviewer (uid 1002) can read /etc/factoryd/widgets/reviewer.token, so the refusal above is a refusal
 ok    alert file                   file /var/log/factoryd/widgets-alerts.log: probe alert delivered
 ok    alert command                command /usr/local/bin/notify-operator: probe alert delivered
 ok    health thresholds            alert after 3 ticks, repeat every 1800s; stale trigger 900s, turn grace 120s, disk headroom 10%, 1 bounded cache(s)
@@ -95,8 +102,9 @@ ok    credential reviewer          file /etc/factoryd/widgets/reviewer.token
 ok    identity reviewer            factory-reviewer (id 2002)
 ok    repository                   repository reachable
 ok    distinct identities          producer producer-bot (id 1001), reviewer factory-reviewer (id 2002)
+ok    operator identity            operator krolle (id 3003), distinct from producer producer-bot (id 1001) and reviewer factory-reviewer (id 2002) by provider id
 
-1 of 13 checks FAILED: producer workdir
+1 of 16 checks FAILED: producer workdir
 ```
 
 the model-free health tick — one observation, or `--loop`. It detects, alerts

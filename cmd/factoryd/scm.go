@@ -12,6 +12,7 @@ import (
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/factory"
+	"github.com/aicix-labs/factoryd/internal/principal"
 	"github.com/aicix-labs/factoryd/internal/scm"
 )
 
@@ -62,41 +63,30 @@ func runSCM(args []string) int {
 		fmt.Fprintf(os.Stderr, "factoryd scm: %v\n", err)
 		return exitConfig
 	}
-	// The operator principal is resolved only for the verb that needs it,
-	// and never falls back to a role's token.
-	operator := func(ctx context.Context) (scm.Driver, error) {
-		o := cfg.Credentials.Operator
-		if o.File == "" {
+	operator := operatorPrincipal(cfg, factory.NewDriver)
+	return scmVerb(context.Background(), d, operator, rest[0], rest[1:], &printer{json: *asJSON})
+}
+
+// operatorPrincipal resolves the operator's driver for the one verb that
+// needs it. It never falls back to a role's token, and it proves the
+// operator a third PROVIDER identity immediately before use: all three
+// credentials resolved in this process's context and compared by stable
+// id, a role that cannot be resolved being an error, never a role skipped
+// (#47 review). Two files holding one token are one authority.
+func operatorPrincipal(cfg *config.Config, newDriver principal.DriverBuilder) func(context.Context) (scm.Driver, error) {
+	return func(ctx context.Context) (scm.Driver, error) {
+		if cfg.Credentials.Operator.File == "" {
 			return nil, errors.New("credentials.operator is not configured; close is an operator's act and needs the operator's own credential (a file the reviewer and producer identities cannot read)")
 		}
-		tok, err := o.Resolve()
+		if _, err := principal.Resolve(ctx, cfg, newDriver); err != nil {
+			return nil, err
+		}
+		tok, err := cfg.Credentials.Operator.Resolve()
 		if err != nil {
 			return nil, fmt.Errorf("operator credential: %w", err)
 		}
-		od, err := factory.NewDriver(cfg, tok)
-		if err != nil {
-			return nil, err
-		}
-		who, err := od.Whoami(ctx)
-		if err != nil {
-			return nil, fmt.Errorf("operator identity: %w", err)
-		}
-		for _, r := range []struct {
-			name string
-			ref  config.CredentialRef
-		}{{"reviewer", cfg.Credentials.Reviewer}, {"producer", cfg.Credentials.Producer}} {
-			rt, err := r.ref.Resolve()
-			if err != nil {
-				continue // a role token this caller cannot read is a role it is not
-			}
-			rw, err := od.WhoamiWith(ctx, rt)
-			if err == nil && rw.ID == who.ID {
-				return nil, fmt.Errorf("the operator credential authenticates as %s, the %s; the operator is a third principal or it is no boundary", who.Login, r.name)
-			}
-		}
-		return od, nil
+		return newDriver(cfg, tok)
 	}
-	return scmVerb(context.Background(), d, operator, rest[0], rest[1:], &printer{json: *asJSON})
 }
 
 // scmVerb dispatches one verb against the role's driver. close alone uses

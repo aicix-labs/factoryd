@@ -3,8 +3,12 @@ package main
 import (
 	"context"
 	"errors"
+	"os"
+	"path/filepath"
+	"strings"
 	"testing"
 
+	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/scm"
 )
 
@@ -97,5 +101,70 @@ func TestScmCloseRunsOnlyAsTheOperatorPrincipal(t *testing.T) {
 	}
 	if rc := run(&closeDriver{state: scm.StateOpen}); rc != exitError {
 		t.Fatal("close with no id was accepted")
+	}
+}
+
+// tokenDriver is a provider whose identity is its token: two files with
+// the same content are one principal.
+type tokenDriver struct {
+	scm.Driver
+	token  string
+	closes *[]string
+	closed *bool
+}
+
+func (d tokenDriver) Whoami(context.Context) (scm.Identity, error) {
+	return scm.Identity{ID: "id-" + d.token, Login: d.token}, nil
+}
+func (d tokenDriver) Get(context.Context, scm.ChangeID) (scm.Change, error) {
+	st := scm.StateOpen
+	if *d.closed {
+		st = scm.StateClosed
+	}
+	return scm.Change{ID: "48", State: st, Draft: true}, nil
+}
+func (d tokenDriver) Close(_ context.Context, _ scm.ChangeID, reason string) error {
+	*d.closes = append(*d.closes, d.token+":"+reason)
+	*d.closed = true
+	return nil
+}
+
+// Immediately before a close, the three identities are resolved and
+// compared by provider id. An operator file that holds the reviewer's
+// token -- path-distinct, one authority -- is refused and nothing is
+// closed; a role token that cannot be read is refused, not skipped (#47
+// review).
+func TestCloseRefusesAnOperatorThatIsTheReviewerByProviderID(t *testing.T) {
+	root := t.TempDir()
+	write := func(name, tok string) config.CredentialRef {
+		p := filepath.Join(root, name)
+		if err := os.WriteFile(p, []byte(tok+"\n"), 0o600); err != nil {
+			t.Fatal(err)
+		}
+		return config.CredentialRef{File: p}
+	}
+	var closes []string
+	closed := false
+	build := func(cfg *config.Config, token string) (scm.Driver, error) {
+		return tokenDriver{token: token, closes: &closes, closed: &closed}, nil
+	}
+	cfg := &config.Config{Credentials: config.Credentials{
+		Producer: write("producer.token", "p"), Reviewer: write("reviewer.token", "r"), Operator: write("operator.token", "r")}}
+	role := &closeDriver{state: scm.StateOpen}
+	out := &printer{}
+	if rc := scmVerb(context.Background(), role, operatorPrincipal(cfg, build), "close", []string{"48"}, out); rc != exitError || len(closes) != 0 || len(role.closes) != 0 {
+		t.Fatalf("rc=%d closes=%v role=%v; the reviewer's token behind the operator path closed", rc, closes, role.closes)
+	}
+	// A distinct third identity closes, as the operator.
+	cfg.Credentials.Operator = write("operator.token", "o")
+	if rc := scmVerb(context.Background(), role, operatorPrincipal(cfg, build), "close", []string{"48"}, out); rc != exitOK || len(closes) != 1 || !strings.HasPrefix(closes[0], "o:") || len(role.closes) != 0 {
+		t.Fatalf("rc=%d closes=%v role=%v", rc, closes, role.closes)
+	}
+	// A producer token this process cannot read is a refusal, never a role
+	// left out of the comparison.
+	closes, closed = nil, false
+	os.Remove(cfg.Credentials.Producer.File)
+	if rc := scmVerb(context.Background(), role, operatorPrincipal(cfg, build), "close", []string{"48"}, out); rc != exitError || len(closes) != 0 {
+		t.Fatalf("rc=%d closes=%v; an unresolved role was skipped", rc, closes)
 	}
 }

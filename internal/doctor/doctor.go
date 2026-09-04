@@ -22,6 +22,7 @@ import (
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/factory"
 	"github.com/aicix-labs/factoryd/internal/gittransport"
+	"github.com/aicix-labs/factoryd/internal/principal"
 	"github.com/aicix-labs/factoryd/internal/scm"
 )
 
@@ -584,6 +585,22 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 		add("distinct identities", fmt.Errorf("producer and reviewer both authenticate as %s; the producer could merge its own work", p), "")
 	default:
 		add("distinct identities", nil, fmt.Sprintf("producer %s, reviewer %s", p, v))
+	}
+	// The operator is a third PROVIDER principal, or it is no boundary: two
+	// files holding one token are two paths to one authority, and the
+	// unreadability probe above cannot tell (#47 review). Resolved here, in
+	// doctor's own context, by stable id; and again immediately before
+	// every close.
+	if o := cfg.Credentials.Operator; o.File != "" || o.Env != "" {
+		three, err := principal.Resolve(ctx, cfg, principal.DriverBuilder(newDriver))
+		switch {
+		case err != nil:
+			add("operator identity", err, o.Describe())
+		case three.Operator == nil:
+			add("operator identity", fmt.Errorf("undecided: the operator credential resolved to no identity"), o.Describe())
+		default:
+			add("operator identity", nil, fmt.Sprintf("operator %s, distinct from producer %s and reviewer %s by provider id", *three.Operator, three.Producer, three.Reviewer))
+		}
 	}
 
 	return r

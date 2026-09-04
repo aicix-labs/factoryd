@@ -1041,14 +1041,23 @@ neither provider offers a conditional close, so between a read and a close
 another party can mark the change ready or merge it, and the close still
 lands or reports success — the race submit avoids by never closing. Retiring
 a superseded draft is an *operator's* act, and the boundary that keeps it out
-of the reviewer's reach is a credential, not a flag: `credentials.operator`
-is a third principal — a file, never an environment variable, distinct from
-both role tokens — that `factoryd scm close <id> [reason]` alone resolves,
-through a driver the role's token never builds, after confirming it does not
-authenticate as the reviewer or the producer. `doctor` proves, *as the
-reviewer*, that it cannot read that file (with the control that it can read
-its own), and as the producer and the gate likewise; a reviewer running as
-factoryd itself is reported as no boundary. The verb refuses a change that is
+of *factoryd's* reach is a credential, not a flag: `credentials.operator` is
+a third principal — a file, never an environment variable — that `factoryd
+scm close <id> [reason]` alone resolves, through a driver the role's token
+never builds. Path-distinct is not principal-distinct: two files holding one
+token are one authority. So all three credentials are resolved in a
+factory-owned context and compared by the provider's *stable id* — at `doctor`
+time (`operator identity`) and again immediately before every close — and an
+equal or unresolved identity is a refusal, never a role skipped. `doctor` also
+proves, *as the reviewer*, that it cannot read the operator file (with the
+control that it can read its own), and as the producer and the gate likewise;
+a reviewer running as factoryd itself is reported as no boundary. **What this
+does and does not bound:** every verb factoryd ships closes only as the
+operator principal, and the reviewer turn cannot obtain that principal. Whether
+the reviewer's *own* provider token can close a change by calling the provider
+directly is the provider's RBAC — GitHub and GitLab grant close with write
+access — and factoryd does not claim to bound it. A deployment that needs that
+bound gives the reviewer a token without it. The verb refuses a change that is
 not an open draft at the last read, closes with the reason (default
 "superseded by a newer submission"), and believes only a re-read that says
 *closed* — merged in the window is reported as merged, never as success. The
