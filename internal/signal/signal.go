@@ -325,16 +325,18 @@ func RecordMerged(ctx context.Context, cfg *config.Config, d scm.Driver, id scm.
 	if change.HeadSHA == "" {
 		return state.Verdict{}, "", fmt.Errorf("change %s reports no head sha; the merge cannot be verified", id)
 	}
-	target := change.TargetBranch
-	if target == "" {
-		target = cfg.TargetBranch
+	// The configured target, not the change's: a draft opened for main can
+	// be retargeted and merged into release, and that is not this
+	// factory's cycle completing (#49 review).
+	if change.TargetBranch != cfg.TargetBranch {
+		return state.Verdict{}, "", fmt.Errorf("change %s targets %q, not this factory's target %q; a merge elsewhere is not this cycle's merge", id, change.TargetBranch, cfg.TargetBranch)
 	}
-	on, err := d.IsAncestor(ctx, change.HeadSHA, target)
+	on, err := d.IsAncestor(ctx, change.HeadSHA, cfg.TargetBranch)
 	if err != nil {
-		return state.Verdict{}, "", fmt.Errorf("verifying %s on %s: %w", change.HeadSHA, target, err)
+		return state.Verdict{}, "", fmt.Errorf("verifying %s on %s: %w", change.HeadSHA, cfg.TargetBranch, err)
 	}
 	if !on {
-		return state.Verdict{}, "", fmt.Errorf("change %s says merged but its head %s is not on %s; not recording a merge that is not there", id, change.HeadSHA, target)
+		return state.Verdict{}, "", fmt.Errorf("change %s says merged but its head %s is not on %s; not recording a merge that is not there", id, change.HeadSHA, cfg.TargetBranch)
 	}
 	v := state.Verdict{
 		ChangeID: string(id), Kind: state.VerdictMerged, SHA: change.HeadSHA, Summary: summary, At: now(),

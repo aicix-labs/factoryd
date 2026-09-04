@@ -44,6 +44,9 @@ type Deps struct {
 	// Lookup reads one change at the provider, for Reconcile. Nil means
 	// no reconciliation: the cycle record is taken as it stands.
 	Lookup func(ctx context.Context, id scm.ChangeID) (scm.Change, error)
+	// Ancestor reports whether sha is reachable from ref at the provider.
+	// Reconcile needs it: "merged" alone does not say where (#49 review).
+	Ancestor func(ctx context.Context, sha, ref string) (bool, error)
 }
 
 // Result is what a refresh did.
@@ -140,16 +143,20 @@ func Decide(st *state.State) (run bool, reason string) {
 	}
 }
 
-// Reconcile brings an open cycle up to date with the provider by one read
-// (#43): a change the reviewer signalled operator-gated and a human then
-// merged left the cycle open forever, refusing every refresh and never
-// telling the producer its work landed. Nothing watches the provider;
-// this asks once, at the moment a refresh is being decided, and only
-// about the cycle's own change. Merged finishes the cycle; closed without
-// a merge ends it too (the draft is gone; its branch is still at the
-// provider), noted as such. A read that fails leaves the record as it is
-// -- unknown is not finished -- and says so.
-func Reconcile(ctx context.Context, _ *config.Config, st *state.State, lookup func(context.Context, scm.ChangeID) (scm.Change, error), now time.Time) (changed bool, note string) {
+// Reconcile brings an open cycle up to date with the provider (#43): a
+// change the reviewer signalled operator-gated and a human then merged
+// left the cycle open forever, refusing every refresh and never telling
+// the producer its work landed. Nothing watches the provider; this asks
+// at the moment a refresh is being decided, and only about the cycle's
+// own change. "Merged" alone is not enough (#49 review): a draft opened
+// for the configured target can be retargeted and merged elsewhere, and
+// finishing the cycle on that would reset the producer's tree to a branch
+// the work never reached. So merged finishes the cycle only when the
+// change's target IS the configured target and its head is an ancestor
+// of it at the provider. Closed without a merge ends the cycle too (the
+// draft is gone; its branch is still at the provider). Anything else, a
+// read that fails included, leaves the record as it is and says why.
+func Reconcile(ctx context.Context, cfg *config.Config, st *state.State, lookup func(context.Context, scm.ChangeID) (scm.Change, error), ancestor func(context.Context, string, string) (bool, error), now time.Time) (changed bool, note string) {
 	c := st.Cycle
 	if lookup == nil || c == nil || c.Phase != state.CycleOpen || c.ChangeID == "" {
 		return false, ""
@@ -160,8 +167,21 @@ func Reconcile(ctx context.Context, _ *config.Config, st *state.State, lookup fu
 	}
 	switch ch.State {
 	case scm.StateMerged:
-		st.SetCycle(state.CycleFinished, now).Note = "change " + c.ChangeID + " found merged at the provider (reconciled at refresh time)"
-		return true, "cycle finished: change " + c.ChangeID + " is merged at the provider"
+		if ch.TargetBranch != cfg.TargetBranch {
+			return false, fmt.Sprintf("cycle left open: change %s is merged into %q, not the configured target %q; its work did not land here", c.ChangeID, ch.TargetBranch, cfg.TargetBranch)
+		}
+		if ancestor == nil || ch.HeadSHA == "" {
+			return false, fmt.Sprintf("cycle left open: change %s is merged but its landing on %s cannot be verified", c.ChangeID, cfg.TargetBranch)
+		}
+		on, err := ancestor(ctx, ch.HeadSHA, cfg.TargetBranch)
+		if err != nil {
+			return false, fmt.Sprintf("cycle left open: could not verify change %s on %s (%v)", c.ChangeID, cfg.TargetBranch, err)
+		}
+		if !on {
+			return false, fmt.Sprintf("cycle left open: change %s says merged but its head %s is not on %s", c.ChangeID, short(ch.HeadSHA), cfg.TargetBranch)
+		}
+		st.SetCycle(state.CycleFinished, now).Note = "change " + c.ChangeID + " found merged into " + cfg.TargetBranch + " at the provider (reconciled at refresh time)"
+		return true, "cycle finished: change " + c.ChangeID + " is merged into " + cfg.TargetBranch + " at the provider"
 	case scm.StateClosed:
 		st.SetCycle(state.CycleFinished, now).Note = "change " + c.ChangeID + " found closed without a merge at the provider (reconciled at refresh time)"
 		return true, "cycle finished: change " + c.ChangeID + " was closed without a merge at the provider"
@@ -192,7 +212,7 @@ func Guarded(ctx context.Context, cfg *config.Config, deps Deps, force bool) (Re
 		if st.Cycle != nil {
 			prev = st.Cycle.Phase
 		}
-		if changed, note := Reconcile(ctx, cfg, st, deps.Lookup, time.Now()); changed || note != "" {
+		if changed, note := Reconcile(ctx, cfg, st, deps.Lookup, deps.Ancestor, time.Now()); changed || note != "" {
 			reconciled = note
 		}
 		if !force {
@@ -234,7 +254,7 @@ func BeforeTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 					return err
 				}
 				deps, built = d, true
-				if _, note := Reconcile(ctx, cfg, st, deps.Lookup, time.Now()); note != "" {
+				if _, note := Reconcile(ctx, cfg, st, deps.Lookup, deps.Ancestor, time.Now()); note != "" {
 					msg = note + "; "
 				}
 			}

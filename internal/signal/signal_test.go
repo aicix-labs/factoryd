@@ -535,6 +535,17 @@ func TestOperatorRecordsAMergeMadeOutsideFactoryd(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(l2.cfg.OutboxDir(), "42.json")); !os.IsNotExist(err) {
 		t.Fatal("a verdict was written for a refused record")
 	}
+	// Retargeted (#49 review): the change now targets release and is merged
+	// there. Not this factory's merge; refused, nothing written.
+	l4 := newLab(t)
+	l4.drv.change.State = scm.StateMerged
+	l4.drv.change.TargetBranch = "release"
+	if _, _, err := signal.RecordMerged(context.Background(), l4.cfg, l4.drv, "42", "", nil); err == nil || !strings.Contains(err.Error(), `targets "release", not this factory's target "main"`) {
+		t.Fatalf("a retargeted merge was recorded: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(l4.cfg.OutboxDir(), "42.json")); !os.IsNotExist(err) {
+		t.Fatal("a verdict was written for a retargeted merge")
+	}
 	// Merged per the provider but the head is not on the target: refused.
 	l3 := newLab(t)
 	l3.drv.change.State = scm.StateMerged
