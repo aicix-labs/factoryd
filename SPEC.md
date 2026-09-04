@@ -882,7 +882,10 @@ diffs and withholds ones that are too large; GitHub omits the patch of a large o
 binary file. A file whose content was not delivered is marked *incomplete* by the
 driver, and when any `hold_diff_regexes` are configured the `merged` signal is
 refused rather than evaluated on an empty patch — which would pass exactly the
-file most worth looking at. Then: merge with the expected head, verify by
+file most worth looking at. A rename with a blank patch is where that hides most:
+it is incomplete unless the driver *proves* it path-only — GitHub by zero
+additions and deletions, GitLab (which gives no per-file counts) by equal blob
+ids at the old path on the base and the new path on the head. Then: merge with the expected head, verify by
 ancestry (§5.1).
 Every verdict is written to `outbox/<id>.json` first — that is the handoff — then
 recorded in the state document, then posted as a comment; a failed comment is
@@ -1130,7 +1133,7 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §6.4 no self-merge | the reviewer's stable id equals the author's, or the author's id is unknown → every verdict refused; compared on ids, so a login collision does not pass | distinct ids record and merge |
 | §6.4 audit authorship | an audit posted by the change's author, by a third party, or with no authenticated author → ignored and named, neither clearing nor vetoing; a body that claims `posted_by` yields no author at all, and both drivers set it from the provider's comment author | the reviewer's own audit on the exact head counts beside a producer's forged ones; the reviewer's own `BROKEN` refuses |
 | §6.4 no auto-ready | a `merged` signal on a draft is refused with the explicit step; the gate never calls `SetDraft` | a change already ready merges |
-| §6.4 incomplete diff | a collapsed / too-large / patch-less changed file with hold rules configured → refused, not read as "nothing added"; both drivers flag it | with no hold rules, path policy still decides |
+| §6.4 incomplete diff | a collapsed / too-large / patch-less changed file with hold rules configured → refused, not read as "nothing added"; both drivers flag it. A **rename with a blank patch** is incomplete unless proved path-only: GitHub by zero additions and deletions, GitLab by equal blob ids at the old path on the base and the new path on the head — a differing blob, a failed lookup, or missing diff refs is content not delivered | with no hold rules, path policy still decides; the recorded pure rename on both providers is reported complete **by proof** |
 | §7 root replaced after doctor | the root itself, or its renamed parent, replaced by a symlink after `doctor` passed → `cache_unsafe`, nothing deleted | — |
 | §7 symlink entry | a symlink entry is removed as a link; its target is intact | the link itself is gone and counted |
 | §7 could not look | a volume that will not stat, a provider that will not answer, a corrupt state document → `factoryd health` exits **3** | findings alone exit 1; a live supervisor exits 0 |

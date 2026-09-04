@@ -224,7 +224,15 @@ func (d *Driver) Diff(ctx context.Context, id scm.ChangeID) ([]scm.FileDiff, err
 			// GitHub omits the patch of a file that is too large or binary.
 			// A file with changes and no patch is a file whose content was
 			// not delivered; it is said so, not read as "nothing added".
-			if f.Patch == "" && f.Status != "removed" && f.Status != "renamed" && (f.Additions+f.Deletions > 0 || f.Status == "added" || f.Status == "modified") {
+			// A pure path-only rename is proved by zero additions and
+			// deletions; a rename WITH changes and no patch is a rename whose
+			// content was not delivered -- where a blank patch hides the most.
+			switch {
+			case f.Patch != "" || f.Status == "removed":
+			case f.Status == "renamed" && f.Additions+f.Deletions == 0:
+			case f.Status == "renamed":
+				fd.Incomplete, fd.IncompleteReason = true, "renamed with content changes but no patch delivered"
+			case f.Additions+f.Deletions > 0 || f.Status == "added" || f.Status == "modified":
 				fd.Incomplete, fd.IncompleteReason = true, "no patch delivered (large or binary)"
 			}
 			out = append(out, fd)

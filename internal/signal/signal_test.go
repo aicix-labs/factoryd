@@ -234,6 +234,9 @@ func TestRefusals(t *testing.T) {
 		"incomplete diff with hold rules": {func(l *lab) {
 			l.drv.diffs = []scm.FileDiff{{Path: "vendor/blob.bin", Added: 3, Incomplete: true, IncompleteReason: "too_large"}}
 		}, "merged", "auto", "s", signal.ExitRefused, "did not deliver its content"},
+		"renamed file with omitted content": {func(l *lab) {
+			l.drv.diffs = []scm.FileDiff{{Path: "internal/tokens.go", OldPath: "internal/plain.go", Renamed: true, Added: 12, Incomplete: true, IncompleteReason: "renamed with content changes but no patch delivered"}}
+		}, "merged", "auto", "s", signal.ExitRefused, "did not deliver its content"},
 	}
 	for name, c := range cases {
 		t.Run(name, func(t *testing.T) {

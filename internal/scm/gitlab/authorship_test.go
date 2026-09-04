@@ -87,3 +87,59 @@ func TestDiffMarksCollapsedAndTooLargeIncomplete(t *testing.T) {
 		}
 	}
 }
+
+// GitLab gives no per-file counts, so a rename with an empty diff is proved
+// path-only by comparing blobs: the old path on the base against the new
+// path on the head. Equal blobs are a pure rename; anything else, or a
+// lookup that fails, is content not delivered.
+func TestRenameWithEmptyDiffIsProvedByBlobs(t *testing.T) {
+	type tc struct {
+		name     string
+		oldBlob  string
+		newBlob  string
+		refs     bool
+		lookupOK bool
+		want     bool // incomplete
+	}
+	for _, c := range []tc{
+		{"equal blobs: pure rename", "b1", "b1", true, true, false},
+		{"different blobs: changes hidden", "b1", "b2", true, true, true},
+		{"lookup fails", "b1", "b1", true, false, true},
+		{"no diff refs", "b1", "b1", false, true, true},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			d := glServer(t, func(w http.ResponseWriter, r *http.Request) {
+				switch {
+				case strings.HasSuffix(r.URL.Path, "/diffs"):
+					json.NewEncoder(w).Encode([]map[string]any{{"old_path": "old/name.go", "new_path": "new/name.go", "renamed_file": true, "diff": ""}})
+				case strings.HasSuffix(r.URL.Path, "/merge_requests/7"):
+					m := map[string]any{"iid": 7, "state": "opened", "sha": "head", "changes_count": "1", "source_branch": "s", "target_branch": "main", "author": map[string]any{"username": "u", "id": 1}}
+					if c.refs {
+						m["diff_refs"] = map[string]any{"head_sha": "head", "base_sha": "base"}
+					}
+					json.NewEncoder(w).Encode(m)
+				case strings.Contains(r.URL.Path, "/repository/files/"):
+					if !c.lookupOK {
+						http.Error(w, `{"message":"404 File Not Found"}`, 404)
+						return
+					}
+					ref := r.URL.Query().Get("ref")
+					blob := c.newBlob
+					if ref == "base" {
+						blob = c.oldBlob
+					}
+					json.NewEncoder(w).Encode(map[string]any{"blob_id": blob})
+				default:
+					http.NotFound(w, r)
+				}
+			})
+			fs, err := d.Diff(context.Background(), "7")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if len(fs) != 1 || fs[0].Incomplete != c.want {
+				t.Fatalf("incomplete=%v (%s), want %v", fs[0].Incomplete, fs[0].IncompleteReason, c.want)
+			}
+		})
+	}
+}

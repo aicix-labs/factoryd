@@ -39,8 +39,141 @@
         }
       ],
       "header": {
-        "Link": "\u003chttps://gitlab.example.com/api/v4/projects/acme%2Fwidgets/merge_requests/42/diffs?id=acme%2Fwidgets\u0026merge_request_iid=30\u0026page=1\u0026per_page=100\u0026unidiff=false\u003e; rel=\"first\", \u003chttps://gitlab.example.com/api/v4/projects/acme%2Fwidgets/merge_requests/42/diffs?id=acme%2Fwidgets\u0026merge_request_iid=30\u0026page=1\u0026per_page=100\u0026unidiff=false\u003e; rel=\"last\"",
+        "Link": "\u003chttps://gitlab.example.com/api/v4/projects/acme%2Fwidgets/merge_requests/42/diffs?id=acme%2Fwidgets\u0026merge_request_iid=62\u0026page=1\u0026per_page=100\u0026unidiff=false\u003e; rel=\"first\", \u003chttps://gitlab.example.com/api/v4/projects/acme%2Fwidgets/merge_requests/42/diffs?id=acme%2Fwidgets\u0026merge_request_iid=62\u0026page=1\u0026per_page=100\u0026unidiff=false\u003e; rel=\"last\"",
         "X-Total-Pages": "1"
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/v4/projects/acme%2Fwidgets/merge_requests/42",
+      "status": 200,
+      "body": {
+        "assignee": null,
+        "assignees": [],
+        "author": {
+          "avatar_url": "https://secure.gravatar.com/avatar/ecc55d65ed7cf1a3fe8e030a7880675cf47dabb0f717ec42a9cadf3ec66b53d3?s=80\u0026d=identicon",
+          "id": 1001,
+          "locked": false,
+          "name": "aicix-devops",
+          "public_email": null,
+          "state": "active",
+          "username": "producer-bot",
+          "web_url": "https://gitlab.example.com/producer-bot"
+        },
+        "blocking_discussions_resolved": true,
+        "changes_count": "2",
+        "closed_at": null,
+        "closed_by": null,
+        "created_at": "2026-09-01T10:00:00Z",
+        "description": null,
+        "detailed_merge_status": "mergeable",
+        "diff_refs": {
+          "base_sha": "f631837ae4d1e3a87f0503d436587182c8ab0fc9",
+          "head_sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+          "start_sha": "f631837ae4d1e3a87f0503d436587182c8ab0fc9"
+        },
+        "discussion_locked": null,
+        "downvotes": 0,
+        "draft": false,
+        "first_contribution": false,
+        "first_deployed_to_production_at": null,
+        "force_remove_source_branch": null,
+        "has_conflicts": false,
+        "head_pipeline": null,
+        "id": 1001,
+        "iid": 42,
+        "imported": false,
+        "imported_from": "none",
+        "labels": [
+          "factory"
+        ],
+        "latest_build_finished_at": null,
+        "latest_build_started_at": null,
+        "merge_after": null,
+        "merge_commit_sha": null,
+        "merge_error": null,
+        "merge_status": "can_be_merged",
+        "merge_user": null,
+        "merge_when_pipeline_succeeds": false,
+        "merged_at": null,
+        "merged_by": null,
+        "milestone": null,
+        "pipeline": null,
+        "prepared_at": "2026-09-01T10:00:00Z",
+        "project_id": 1,
+        "reference": "!62",
+        "references": {
+          "full": "acme/widgets!62",
+          "relative": "!62",
+          "short": "!62"
+        },
+        "reviewers": [],
+        "sha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "should_remove_source_branch": null,
+        "source_branch": "producer/fix-thing",
+        "source_project_id": 1001,
+        "squash": false,
+        "squash_commit_sha": null,
+        "squash_on_merge": false,
+        "state": "opened",
+        "subscribed": true,
+        "target_branch": "main",
+        "target_project_id": 1001,
+        "task_completion_status": {
+          "completed_count": 0,
+          "count": 0
+        },
+        "time_stats": {
+          "human_time_estimate": null,
+          "human_total_time_spent": null,
+          "time_estimate": 0,
+          "total_time_spent": 0
+        },
+        "title": "gate: match command position, not the mention",
+        "updated_at": "2026-09-01T10:00:00Z",
+        "upvotes": 0,
+        "user": {
+          "can_merge": true
+        },
+        "user_notes_count": 0,
+        "web_url": "https://gitlab.example.com/acme/widgets/-/merge_requests/42",
+        "work_in_progress": false
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/v4/projects/acme%2Fwidgets/repository/files/old%2Fname.go?ref=f631837ae4d1e3a87f0503d436587182c8ab0fc9",
+      "status": 200,
+      "body": {
+        "blob_id": "fa77e41200a75455eff939e52868d5502725a00c",
+        "commit_id": "f631837ae4d1e3a87f0503d436587182c8ab0fc9",
+        "content": "cGFja2FnZSBvbGQK",
+        "content_sha256": "9d5f3657ffe7280255b5b331fa3d2c197c2b3abd9f659b22d7a137497920317b",
+        "encoding": "base64",
+        "execute_filemode": false,
+        "file_name": "name.go",
+        "file_path": "old/name.go",
+        "last_commit_id": "f631837ae4d1e3a87f0503d436587182c8ab0fc9",
+        "ref": "f631837ae4d1e3a87f0503d436587182c8ab0fc9",
+        "size": 12
+      }
+    },
+    {
+      "method": "GET",
+      "path": "/api/v4/projects/acme%2Fwidgets/repository/files/new%2Fname.go?ref=aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+      "status": 200,
+      "body": {
+        "blob_id": "fa77e41200a75455eff939e52868d5502725a00c",
+        "commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "content": "cGFja2FnZSBvbGQK",
+        "content_sha256": "9d5f3657ffe7280255b5b331fa3d2c197c2b3abd9f659b22d7a137497920317b",
+        "encoding": "base64",
+        "execute_filemode": false,
+        "file_name": "name.go",
+        "file_path": "new/name.go",
+        "last_commit_id": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "ref": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+        "size": 12
       }
     }
   ]

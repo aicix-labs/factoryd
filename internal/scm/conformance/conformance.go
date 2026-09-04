@@ -310,6 +310,19 @@ func scDiff(ctx context.Context, d scm.Driver, f Factory) error {
 	if b.OldPath != "old/name.go" || b.Path != "new/name.go" {
 		return fmt.Errorf("Diff[1] rename = %q -> %q, want old/name.go -> new/name.go", b.OldPath, b.Path)
 	}
+	// The fixture's rename is path-only. A driver must say so by PROOF, not
+	// by assuming a blank patch on a rename means nothing changed: GitHub
+	// proves it by zero additions and deletions, GitLab by comparing the
+	// blob at the old path on the base with the new path on the head. A
+	// driver that skipped the proof would report this incomplete (fail
+	// closed, but wrongly); one that assumed would pass a rename that hid
+	// content -- the case the gate exists for.
+	if b.Incomplete {
+		return fmt.Errorf("Diff[1] is a pure rename reported incomplete (%s); the driver did not prove it path-only", b.IncompleteReason)
+	}
+	if a.Incomplete {
+		return fmt.Errorf("Diff[0] has a delivered patch and is reported incomplete (%s)", a.IncompleteReason)
+	}
 	return nil
 }
 

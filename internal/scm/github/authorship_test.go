@@ -83,3 +83,25 @@ func TestDiffMarksAFileWithoutAPatchIncomplete(t *testing.T) {
 		}
 	}
 }
+
+// A rename with content changes and no patch is a rename whose content was
+// not delivered -- where a blank patch hides the most. A pure path-only
+// rename is proved by zero additions and deletions, and is complete.
+func TestRenameWithChangesAndNoPatchIsIncomplete(t *testing.T) {
+	d := ghServer(t, func(w http.ResponseWriter, r *http.Request) {
+		json.NewEncoder(w).Encode([]map[string]any{
+			{"filename": "new/secret.go", "previous_filename": "old/plain.go", "status": "renamed", "additions": 12, "deletions": 3},
+			{"filename": "new/same.go", "previous_filename": "old/same.go", "status": "renamed", "additions": 0, "deletions": 0},
+		})
+	})
+	fs, err := d.Diff(context.Background(), "7")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !fs[0].Incomplete || !strings.Contains(fs[0].IncompleteReason, "renamed with content changes") {
+		t.Fatalf("changed rename without a patch read as complete: %+v", fs[0])
+	}
+	if fs[1].Incomplete {
+		t.Fatalf("pure rename read as incomplete: %+v", fs[1])
+	}
+}
