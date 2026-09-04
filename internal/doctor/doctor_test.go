@@ -40,11 +40,12 @@ func builder(listErr error) doctor.DriverBuilder {
 // fakeProber answers the boundary question from a table: which directories
 // the "producer" can write. Never touches privilege.
 type fakeProber struct {
-	name     string
-	writable map[string]bool
-	readable map[string]bool
-	rootOnly map[string]bool
-	err      error
+	name        string
+	writable    map[string]bool
+	readable    map[string]bool
+	traversable map[string]bool
+	rootOnly    map[string]bool
+	err         error
 }
 
 func (f fakeProber) Describe() string {
@@ -68,6 +69,13 @@ func (f fakeProber) CanExec(_ context.Context, path string) (bool, error) {
 	}
 	return !f.rootOnly[path], nil
 }
+func (f fakeProber) CanTraverse(_ context.Context, path string) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.traversable[path], nil
+}
+
 func (f fakeProber) CanRead(_ context.Context, path string) (bool, error) {
 	if f.err != nil {
 		return false, f.err
@@ -103,14 +111,15 @@ func healthyDeps(cfg *config.Config, listErr error) doctor.Deps {
 			if ra != nil && ra.User == "outbox-locked" {
 				return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true}, readable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
 			}
-			if ra != nil && ra.User == "gate-reads-home" {
+			if ra != nil && ra.User == "gate-traverses-home" {
 				w := map[string]bool{}
 				for _, p := range cfg.Gate.RequiredWritablePaths {
 					if r, err := cfg.ResolveGatePath(p); err == nil {
 						w[r] = true
 					}
 				}
-				return fakeProber{name: "fake-gate (uid 4343)", writable: w, readable: map[string]bool{cfg.Roles.Producer.Env["HOME"]: true}}, nil
+				// readable: false (0711 is not readable); traversable: true.
+				return fakeProber{name: "fake-gate (uid 4343)", writable: w, readable: map[string]bool{}, traversable: map[string]bool{cfg.Roles.Producer.Env["HOME"]: true}}, nil
 			}
 			if ra != nil && ra.User == "factoryd-gate" {
 				w := map[string]bool{}
@@ -362,11 +371,13 @@ func TestIndividualFailuresAreCaught(t *testing.T) {
 			wantName: "containment",
 		},
 		{
-			// The gate can read the producer's HOME: producer-authored build
-			// code could read the model credential kept there.
-			name:     "gate can read the producer home",
-			mutate:   func(t *testing.T, c *config.Config) { c.Gate.RunAs = &config.RunAs{User: "gate-reads-home"} },
-			wantName: "gate cannot read producer home",
+			// The 0711 case: the producer's HOME is neither readable nor
+			// listable by the gate, and the gate can still traverse it to a
+			// known descendant such as .codex/auth.json. A read probe passes
+			// this; the traversal probe must fail it.
+			name:     "gate can traverse the producer home (0711)",
+			mutate:   func(t *testing.T, c *config.Config) { c.Gate.RunAs = &config.RunAs{User: "gate-traverses-home"} },
+			wantName: "gate cannot traverse producer home",
 		},
 		{
 			name:     "no alert transport",
