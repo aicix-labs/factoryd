@@ -176,6 +176,26 @@ func exitText(e *int) string {
 	return fmt.Sprint(*e)
 }
 
+// need is one "needs you" entry as the page renders it: the first
+// paragraph -- by convention the verdict and its reason -- shown, the rest
+// behind a disclosure. Authored line structure is kept (pre-wrap): a
+// reviewer's summary is written to stand alone and often runs to several
+// paragraphs with regexes in it, and collapsing it into one run-on line
+// buried the actionable sentence and broke the patterns at arbitrary
+// points (#46). Escaping is the template's; this only splits.
+type need struct {
+	First, Rest string
+}
+
+// splitNeed splits at the first blank line. A single paragraph has no Rest.
+func splitNeed(s string) need {
+	s = strings.TrimSpace(s)
+	if i := strings.Index(s, "\n\n"); i >= 0 {
+		return need{First: strings.TrimSpace(s[:i]), Rest: strings.TrimSpace(s[i+2:])}
+	}
+	return need{First: s}
+}
+
 var pageTmpl = template.Must(template.New("page").Funcs(template.FuncMap{
 	"roleLine": roleLine, "exitText": exitText,
 	"draft": func(b bool) string {
@@ -187,6 +207,7 @@ var pageTmpl = template.Must(template.New("page").Funcs(template.FuncMap{
 	"rfc":   func(t time.Time) string { return t.Format(time.RFC3339) },
 	"pct":   func(f float64) string { return fmt.Sprintf("%.1f%%", f) },
 	"deref": func(b *bool) bool { return b != nil && *b },
+	"split": splitNeed,
 }).Parse(`<!doctype html><meta charset="utf-8"><title>factoryd status</title>
 <meta http-equiv="refresh" content="15">
 <style>
@@ -198,11 +219,14 @@ ul{margin:.25rem 0;padding-left:1.25rem}code{background:#f0f0f0;padding:0 .2em}
 table{border-collapse:collapse}td,th{text-align:left;padding:.15rem .6rem .15rem 0;vertical-align:top}
 .tree{font-family:ui-monospace,monospace;font-size:12px;white-space:pre}
 small{color:#666}
+.need{white-space:pre-wrap;overflow-wrap:anywhere;border-left:3px solid #b00020;padding:.4rem .75rem;margin:.5rem 0;background:#fff6f6}
+.need summary{cursor:pointer;font-weight:600}
+.need .rest{margin-top:.5rem}
 </style>
 {{range .}}<section>
 <h1>{{.Factory}} <span class="{{if .Working}}ok{{else}}bad{{end}}">{{if .Working}}working{{else}}NOT WORKING{{end}}</span>
 <small>{{.Provider}} → {{.Target}} · {{rfc .At}}</small></h1>
-{{if .NeedsMe}}<h2 class="bad">Needs you</h2><ul>{{range .NeedsMe}}<li>{{.}}</li>{{end}}</ul>{{end}}
+{{if .NeedsMe}}<h2 class="bad">Needs you</h2>{{range .NeedsMe}}{{$n := split .}}{{if $n.Rest}}<details class="need"><summary>{{$n.First}}</summary><div class="rest">{{$n.Rest}}</div></details>{{else}}<div class="need">{{$n.First}}</div>{{end}}{{end}}{{end}}
 <h2>Right now</h2>
 {{template "roles" .}}
 <h2>Health</h2>

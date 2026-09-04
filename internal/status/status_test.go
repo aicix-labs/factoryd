@@ -558,3 +558,63 @@ func TestBlockedSubmissionIsANeed(t *testing.T) {
 		t.Fatalf("text:\n%s", status.Text(s))
 	}
 }
+
+// A "needs you" entry keeps the structure its author gave it (#46): the
+// first paragraph -- the verdict and its reason -- is the visible summary,
+// the rest is behind a disclosure, newlines survive in a pre-wrap block,
+// and provider-authored text stays escaped. A one-paragraph entry is a
+// plain block, not a disclosure with nothing behind it.
+func TestNeedsYouKeepsParagraphsAndCollapsesTheRest(t *testing.T) {
+	l := newLab(t)
+	long := "OPERATOR-GATED (scope policy; not fixable by resubmit).\n\nChange 57 adds deploy/x.sh; it matches deny regex ^deploy/ and no allow regex.\nA human must take the script or widen allow_regexes.\n\n<b>not markup</b>"
+	l.state(t, func(s *state.State) {
+		s.Role(state.RoleProducer).Blocked = &state.Block{Disposition: "blocked", Reason: long, At: l.now}
+	})
+	srv, _ := status.NewServer([]*status.Collector{status.New(l.cfg, l.deps)})
+	ts := httptest.NewServer(srv.Handler())
+	defer ts.Close()
+	resp, err := http.Get(ts.URL + "/")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body, _ := io.ReadAll(resp.Body)
+	resp.Body.Close()
+	page := string(body)
+	if !strings.Contains(page, `<details class="need"><summary>`) {
+		t.Fatalf("a multi-paragraph need is not a disclosure:\n%s", page)
+	}
+	// The summary is the first paragraph and nothing more.
+	sum := page[strings.Index(page, "<summary>")+len("<summary>") : strings.Index(page, "</summary>")]
+	if !strings.Contains(sum, "not fixable by resubmit") || strings.Contains(sum, "deny regex") {
+		t.Fatalf("summary = %q; want the first paragraph alone", sum)
+	}
+	// The rest keeps its newline between the two sentences of paragraph 2.
+	rest := page[strings.Index(page, `<div class="rest">`)+len(`<div class="rest">`) : strings.Index(page, "</details>")]
+	if !strings.Contains(rest, "no allow regex.\nA human must") {
+		t.Fatalf("rest lost its line structure: %q", rest)
+	}
+	if strings.Contains(page, "<b>not markup</b>") || !strings.Contains(page, "&lt;b&gt;not markup&lt;/b&gt;") {
+		t.Fatal("provider-authored text was not escaped")
+	}
+	if !strings.Contains(page, ".need{white-space:pre-wrap") {
+		t.Fatal("the need block is not pre-wrap; newlines would collapse")
+	}
+	if strings.Contains(page, "<li>"+sum) {
+		t.Fatal("needs are still list items")
+	}
+
+	// One paragraph: a plain block, no disclosure.
+	l2 := newLab(t)
+	l2.state(t, func(s *state.State) {
+		s.Role(state.RoleProducer).Blocked = &state.Block{Disposition: "blocked", Reason: "one line only", At: l2.now}
+	})
+	srv2, _ := status.NewServer([]*status.Collector{status.New(l2.cfg, l2.deps)})
+	ts2 := httptest.NewServer(srv2.Handler())
+	defer ts2.Close()
+	resp2, _ := http.Get(ts2.URL + "/")
+	body2, _ := io.ReadAll(resp2.Body)
+	resp2.Body.Close()
+	if strings.Contains(string(body2), "<details") || !strings.Contains(string(body2), `<div class="need">`) {
+		t.Fatalf("a one-paragraph need rendered wrong:\n%s", body2)
+	}
+}
