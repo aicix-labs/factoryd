@@ -312,7 +312,16 @@ func needsMe(cfg *config.Config, s Snapshot, st *state.State) []string {
 		v := s.Roles[string(r)]
 		switch {
 		case v.Halted:
-			out = append(out, fmt.Sprintf("%s supervisor halted: %s -- clear the stop sentinel and restart", r, v.HaltReason))
+			// The remedy is phrased from the sentinel's CURRENT existence, not
+			// from the recorded halt (#26): an operator told to clear a
+			// sentinel that is already gone finds nothing and distrusts the
+			// page. The fact (the halt, its reason) is the record's; the
+			// instruction is the disk's.
+			if v.Stopped {
+				out = append(out, fmt.Sprintf("%s supervisor halted: %s -- remove %s and restart", r, v.HaltReason, cfg.StopPath(string(r))))
+			} else {
+				out = append(out, fmt.Sprintf("%s supervisor halted: %s -- sentinel already cleared; restart to resume", r, v.HaltReason))
+			}
 		case v.Stopped:
 			out = append(out, fmt.Sprintf("%s has a stop sentinel on disk; it will not start until it is removed", r))
 		case v.Supervisor == nil:

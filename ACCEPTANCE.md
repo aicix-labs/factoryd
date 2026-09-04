@@ -127,6 +127,13 @@ the branch family by prefix.
 
 ### Operating notes from the runs
 
+- **"A second pass with agent CLIs changes nothing except who writes the code"
+  was not quite true** (#27): an agent CLI exits 0 whatever the model concluded,
+  and a model cannot set an exit code by narrating it. Wire agent CLIs through
+  `examples/turn-wrapper.sh` (or an equivalent), which derives the turn's exit
+  code from whether `$FACTORYD_PROGRESS` moved; the wrapper is tested for each
+  way it can be wrong (`TestTurnWrapperDerivesTheExitCodeFromProgress`).
+
 - **Never run `git` as root in the producer's clone.** git refuses a
   repository owned by someone else ("dubious ownership"), and the honest
   reading of that refusal is that the repository is not yours: it is the

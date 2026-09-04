@@ -220,6 +220,22 @@ func TestHaltedIsItsOwnCondition(t *testing.T) {
 	if !hasKey(rep, "halted/producer") || hasKey(rep, "supervisor_dead/producer") {
 		t.Fatalf("findings=%v", keys(rep))
 	}
+	// The remedy follows the sentinel's existence (#26).
+	detail := func(rep health.Report) string {
+		for _, f := range rep.Findings {
+			if f.Key == "halted/producer" {
+				return f.Detail
+			}
+		}
+		return ""
+	}
+	if d := detail(rep); !strings.Contains(d, "sentinel already cleared") {
+		t.Fatalf("detail=%q; no sentinel on disk, yet the operator is not told so", d)
+	}
+	os.WriteFile(l.cfg.StopPath("producer"), []byte("x"), 0o644)
+	if d := detail(l.tick(t)); !strings.Contains(d, "remove "+l.cfg.StopPath("producer")) {
+		t.Fatalf("detail=%q; the sentinel exists and is not named", d)
+	}
 }
 
 // Liveness that cannot be determined is not liveness.

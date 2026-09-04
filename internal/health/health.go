@@ -354,8 +354,12 @@ func checkRoles(cfg *config.Config, st *state.State, p Probes, at time.Time) []F
 		rs := st.Role(r)
 		role := string(r)
 		if rs.Halted {
+			remedy := "sentinel already cleared; restart to resume"
+			if _, err := os.Lstat(cfg.StopPath(role)); err == nil {
+				remedy = "remove " + cfg.StopPath(role) + " and restart"
+			}
 			out = append(out, Finding{Key: "halted/" + role, Summary: fmt.Sprintf("%s supervisor halted: %s", role, rs.HaltReason),
-				Detail: fmt.Sprintf("halted at %s; clear with the stop sentinel removed and a restart", rs.HaltedAt.Format(time.RFC3339))})
+				Detail: fmt.Sprintf("halted at %s; %s", rs.HaltedAt.Format(time.RFC3339), remedy)})
 			continue
 		}
 		if rs.Supervisor != nil {
