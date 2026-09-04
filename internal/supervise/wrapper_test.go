@@ -36,6 +36,14 @@ func TestTurnWrapperDerivesTheExitCodeFromProgress(t *testing.T) {
 		}
 		return 0
 	}
+	// The same-second case, made deterministic: the baseline is an exact
+	// second and the agent's touch is one nanosecond later. Real progress;
+	// a whole-second compare would call it none.
+	os.Chtimes(progress, time.Unix(1700000000, 0), time.Unix(1700000000, 0))
+	if code := run(`touch -d @1700000000.000000001 "$FACTORYD_PROGRESS"; exit 0`); code != 0 {
+		t.Fatalf("progress within the same second: wrapper exited %d, want 0 (nanosecond precision)", code)
+	}
+	os.Chtimes(progress, old, old)
 	if code := run("exit 0"); code != 1 {
 		t.Fatalf("agent exited 0 without progress: wrapper exited %d, want 1", code)
 	}

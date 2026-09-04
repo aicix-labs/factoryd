@@ -15,10 +15,18 @@
 set -u
 [ -n "${FACTORYD_PROGRESS:-}" ] || { echo "turn-wrapper: FACTORYD_PROGRESS is not set; not running under a factoryd supervisor" >&2; exit 3; }
 [ $# -ge 1 ] || { echo "turn-wrapper: no agent command given" >&2; exit 3; }
-before=$(stat -c %Y "$FACTORYD_PROGRESS" 2>/dev/null || echo none)
+# Nanosecond precision: a turn that touches the marker within the same
+# second as the baseline is real progress, and a whole-second compare would
+# turn it into a failure -- the worse mistake. GNU stat's %.9Y; a stat that
+# cannot give it is refused rather than degraded to seconds.
+mtime() { stat -c %.9Y "$1" 2>/dev/null; }
+if [ -e "$FACTORYD_PROGRESS" ] && ! mtime "$FACTORYD_PROGRESS" | grep -q '\.[0-9]\{9\}$'; then
+  echo "turn-wrapper: stat cannot report nanosecond mtimes here; refusing to derive an exit code from whole seconds" >&2; exit 3
+fi
+before=$(mtime "$FACTORYD_PROGRESS" || echo none)
 "$@"
 rc=$?
-after=$(stat -c %Y "$FACTORYD_PROGRESS" 2>/dev/null || echo none)
+after=$(mtime "$FACTORYD_PROGRESS" || echo none)
 if [ "$rc" -ne 0 ]; then
   exit "$rc"
 fi
