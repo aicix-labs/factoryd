@@ -267,6 +267,29 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 				add("gate cannot read "+cred.name+" credential", nil, cred.file)
 			}
 		}
+		// The producer's HOME holds whatever model credential its agent CLI
+		// keeps (codex: ~/.codex/auth.json). The gate runs producer-authored
+		// code; it must not be able to read that either. "The home happens
+		// to be 0700" is not evidence -- the canary found codex creating
+		// .codex as 0775 beside a 0600 auth.json -- so this is probed as the
+		// gate, like the two provider credentials are.
+		// Probed for TRAVERSAL, not reading: a 0711 home is neither readable
+		// nor listable and passes a read probe, while producer-authored gate
+		// code that knows the path $HOME/.codex/auth.json reads it all the
+		// same. Search permission is the exposure.
+		if home, herr := cfg.ProducerHome(); herr != nil {
+			// Never probed against the wrong directory: a relative home is a
+			// failure, not a skipped check.
+			add("producer home", herr, cfg.Roles.Producer.Env["HOME"])
+		} else if home != "" {
+			if can, err := gate.CanTraverse(ctx, home); err != nil {
+				add("gate cannot traverse producer home", fmt.Errorf("undecided: %v", err), home)
+			} else if can {
+				add("gate cannot traverse producer home", fmt.Errorf("%s CAN traverse %s; producer-authored build code that knows a path under it -- its own model credential -- can read it", gate.Describe(), home), home)
+			} else {
+				add("gate cannot traverse producer home", nil, home)
+			}
+		}
 		provisioned := 0
 		for _, p := range cfg.Gate.RequiredWritablePaths {
 			resolved, err := cfg.ResolveGatePath(p)

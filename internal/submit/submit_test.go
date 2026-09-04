@@ -96,8 +96,24 @@ func (g *fakeGate) Run(_ context.Context, _ *config.Config, exe string, env []st
 }
 
 type fakeProvisioner struct {
-	err   error
-	paths []string
+	err         error
+	paths       []string
+	traversable bool // what the gate identity can do to the producer's home, NOW
+	probed      []string
+}
+
+func (p *fakeProvisioner) GateCanTraverse(_ context.Context, dir string) (bool, error) {
+	p.probed = append(p.probed, dir)
+	return p.traversable, nil
+}
+
+// provisionOpens models what a privileged chown of a path that reaches the
+// home does: after it, the gate can traverse the home.
+type opensOnProvision struct{ *fakeProvisioner }
+
+func (p opensOnProvision) Provision(ctx context.Context, path string) error {
+	p.fakeProvisioner.traversable = true
+	return p.fakeProvisioner.Provision(ctx, path)
 }
 
 func (p *fakeProvisioner) Provision(_ context.Context, path string) error {
@@ -1042,5 +1058,145 @@ func TestReadIntentDistinguishesNoneFromInvalid(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+// The reviewer's case: doctor was green (the home was closed when it
+// looked), the producer reopened its own home during its turn, and the
+// gate would run producer-authored code with that access. The boundary is
+// re-proved at the crossing, after the producer has quiesced: the gate is
+// refused, nothing is provisioned, pushed or opened.
+func TestGateIsRefusedWhenTheProducerReopenedItsHome(t *testing.T) {
+	home := "producer-home"
+	// Control: with the home closed to the gate, the gate runs and the
+	// probe was made against the declared home.
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "fix")
+	l.cfg.Roles.Producer.Env = map[string]string{"PATH": "/usr/bin", "HOME": filepath.Join(l.root, home)}
+	l.prov.traversable = false
+	if _, err := submit.Run(context.Background(), l.cfg, l.deps); err != nil {
+		t.Fatalf("closed home: %v", err)
+	}
+	if !l.gate.ran || len(l.prov.probed) == 0 || l.prov.probed[0] != filepath.Join(l.root, home) {
+		t.Fatalf("control: gate ran=%v probed=%v", l.gate.ran, l.prov.probed)
+	}
+
+	// The producer reopened its home after doctor looked.
+	l = newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "fix")
+	l.cfg.Roles.Producer.Env = map[string]string{"PATH": "/usr/bin", "HOME": filepath.Join(l.root, home)}
+	l.prov.traversable = true
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if err == nil || exitOf(t, err) != submit.ExitConfig || !strings.Contains(err.Error(), "traverse") {
+		t.Fatalf("err=%v, want exit %d refusing the crossing", err, submit.ExitConfig)
+	}
+	if l.gate.ran || len(l.prov.paths) != 0 || len(l.tr.pushed) != 0 || l.drv.opened != nil {
+		t.Fatalf("gate ran=%v provisioned=%v pushed=%v opened=%v; nothing may follow a reopened home", l.gate.ran, l.prov.paths, l.tr.pushed, l.drv.opened != nil)
+	}
+}
+
+// A declared gate path that overlaps the producer's home would be chowned
+// to the gate by this privileged process, granting exactly the traversal
+// the boundary refuses. Refused before any ownership change: the
+// provisioner is never called. The lab config bypasses Validate, so this
+// is the second lock being tested, and the symlink case is the one the
+// lexical first lock cannot see.
+func TestGatePathReachingTheProducerHomeIsRefusedBeforeAnyChown(t *testing.T) {
+	for name, mk := range map[string]func(l *lab, home string) string{
+		"equal to the home": func(l *lab, home string) string { return home },
+		"under the home":    func(l *lab, home string) string { return filepath.Join(home, ".codex") },
+		"a symlink into the home": func(l *lab, home string) string {
+			link := filepath.Join(l.root, "build-out")
+			if err := os.Symlink(home, link); err != nil {
+				t.Fatal(err)
+			}
+			return link
+		},
+		"a not-yet-existing path under a symlink into the home": func(l *lab, home string) string {
+			link := filepath.Join(l.root, "cache-link")
+			if err := os.Symlink(home, link); err != nil {
+				t.Fatal(err)
+			}
+			return filepath.Join(link, "go", "build")
+		},
+	} {
+		t.Run(name, func(t *testing.T) {
+			l := newLab(t)
+			l.edit(t, "src/a.go")
+			l.declare(t, "producer/fix", "fix")
+			home := filepath.Join(l.root, "producer-home")
+			if err := os.MkdirAll(home, 0o700); err != nil {
+				t.Fatal(err)
+			}
+			l.cfg.Roles.Producer.Env = map[string]string{"PATH": "/usr/bin", "HOME": home}
+			l.cfg.Gate.RequiredWritablePaths = []string{mk(l, home)}
+			_, err := submit.Run(context.Background(), l.cfg, l.deps)
+			if err == nil || exitOf(t, err) != submit.ExitConfig || !strings.Contains(err.Error(), "overlaps the producer's home") {
+				t.Fatalf("err=%v", err)
+			}
+			if len(l.prov.paths) != 0 {
+				t.Fatalf("the provisioner was called (%v); ownership would have changed before the refusal", l.prov.paths)
+			}
+			if l.gate.ran || len(l.tr.pushed) != 0 {
+				t.Fatalf("gate ran=%v pushed=%v", l.gate.ran, l.tr.pushed)
+			}
+		})
+	}
+}
+
+// Defense in depth: a provisioning that reached the home by a route neither
+// lock saw is caught by the re-probe after provisioning; the gate does not
+// run.
+func TestGateIsRefusedIfProvisioningOpenedTheHome(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "fix")
+	home := filepath.Join(l.root, "producer-home")
+	os.MkdirAll(home, 0o700)
+	l.cfg.Roles.Producer.Env = map[string]string{"PATH": "/usr/bin", "HOME": home}
+	l.cfg.Gate.RequiredWritablePaths = []string{"build/out"} // innocent on its face
+	l.deps.Provision = opensOnProvision{l.prov}
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if err == nil || exitOf(t, err) != submit.ExitConfig || !strings.Contains(err.Error(), "AFTER provisioning") {
+		t.Fatalf("err=%v", err)
+	}
+	if l.gate.ran || len(l.tr.pushed) != 0 {
+		t.Fatalf("gate ran=%v pushed=%v after the home was opened by provisioning", l.gate.ran, l.tr.pushed)
+	}
+}
+
+// The differing-CWD regression: a relative producer HOME, with submit
+// running from a directory that is not the producer workdir. The probe
+// must not be made against the wrong directory and come back green;
+// submit refuses the home as relative, before the gate.
+func TestRelativeProducerHomeIsRefusedFromADifferentCWD(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "fix")
+	l.cfg.Roles.Producer.Env = map[string]string{"PATH": "/usr/bin", "HOME": "private"}
+	// Plant a closed "private" under the producer workdir (what the turn
+	// means) AND an open one under submit's own cwd (what a naive probe
+	// would see).
+	if err := os.MkdirAll(filepath.Join(l.work, "private"), 0o700); err != nil {
+		t.Fatal(err)
+	}
+	elsewhere := t.TempDir()
+	if err := os.MkdirAll(filepath.Join(elsewhere, "private"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	wd, _ := os.Getwd()
+	if err := os.Chdir(elsewhere); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chdir(wd) })
+	l.prov.traversable = false // a naive probe would report green
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if err == nil || exitOf(t, err) != submit.ExitConfig || !strings.Contains(err.Error(), "relative") {
+		t.Fatalf("err=%v; a relative home must be refused, not probed in the wrong directory", err)
+	}
+	if len(l.prov.probed) != 0 || l.gate.ran || len(l.tr.pushed) != 0 {
+		t.Fatalf("probed=%v gate=%v pushed=%v", l.prov.probed, l.gate.ran, l.tr.pushed)
 	}
 }

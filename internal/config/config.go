@@ -678,8 +678,17 @@ func (c *Config) Validate() error {
 			add("gate.required_writable_paths contains an empty entry")
 			continue
 		}
-		if _, err := c.ResolveGatePath(p); err != nil {
+		resolved, err := c.ResolveGatePath(p)
+		if err != nil {
 			add("gate.required_writable_paths: %v", err)
+			continue
+		}
+		// A gate path is provisioned -- created and chowned to the gate --
+		// by a privileged submit. One that overlaps the producer's home
+		// would hand the gate exactly the traversal the boundary denies it,
+		// after doctor and submit both said no.
+		if home, herr := c.ProducerHome(); herr == nil && home != "" && PathsOverlap(resolved, home) {
+			add("gate.required_writable_paths: %q resolves to %s, which overlaps the producer's home %s; provisioning it would grant the gate the producer's model credential", p, resolved, home)
 		}
 	}
 
@@ -778,6 +787,10 @@ func (c *Config) Validate() error {
 		default:
 			add("alerts[%d]: kind %q is not one of file, command", i, a.Kind)
 		}
+	}
+
+	if _, err := c.ProducerHome(); err != nil {
+		add("%v", err)
 	}
 
 	// FACTORYD_* is reserved: the supervisor generates those for every turn
@@ -1133,6 +1146,24 @@ func (c *Config) TurnEnv(role string, factoryd map[string]string, supervisorEnv 
 		out = append(out, k+"="+env[k])
 	}
 	return out
+}
+
+// ProducerHome is the producer's declared HOME, the directory whose
+// contents the gate must not reach. It is "" when none is declared, and
+// an ERROR when the declared value is relative: to the turn a relative
+// HOME means "under the producer workdir" (the runner starts it there), to
+// doctor or submit it would mean "under wherever this process runs" -- and
+// a probe green about the wrong directory is worse than no probe. Every
+// caller takes the home through this, so no path can see the raw value.
+func (c *Config) ProducerHome() (string, error) {
+	home := c.Roles.Producer.Env["HOME"]
+	if home == "" {
+		return "", nil
+	}
+	if !filepath.IsAbs(home) {
+		return "", fmt.Errorf("roles.producer.env.HOME %q is relative; it would name a directory under the producer workdir to the turn and a directory under the probing process's own working directory to doctor and submit, so the boundary could not be enforced", home)
+	}
+	return filepath.Clean(home), nil
 }
 
 // PathWithin reports whether p is inside (or is) dir, lexically. Both are

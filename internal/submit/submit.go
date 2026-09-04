@@ -127,6 +127,12 @@ type GateRunner interface {
 // host, presented as the producer's fault: exactly the misreport §9.6 forbids.
 type Provisioner interface {
 	Provision(ctx context.Context, path string) error
+	// GateCanTraverse reports whether the GATE identity can pass through
+	// dir, probed now. The producer owns its home and can widen it after
+	// doctor looked; the gate runs producer-authored code later. Only a
+	// probe at this crossing, after the producer has quiesced, binds the
+	// state doctor saw to the state the gate gets.
+	GateCanTraverse(ctx context.Context, dir string) (bool, error)
 }
 
 // Deps are everything Run touches in the world.
@@ -273,6 +279,49 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	// so a relative path no longer exists; created as factoryd's it would be
 	// unwritable by the gate, and the gate's failure would be reported as a
 	// red branch. A missing or unprovisionable path exits 3, not 5.
+	// 5a. The producer's home, re-proved at the crossing. doctor is an
+	// operator command that saw a moment; the producer owns its home and
+	// can reopen it during its turn; the gate runs producer-authored code
+	// after. So the gate identity is asked NOW, with the producer quiesced,
+	// whether it can traverse that home -- and a yes is a boundary failure
+	// (exit 3), not a red branch: nothing the producer wrote is judged.
+	// The home comes through one helper that refuses a relative value: to
+	// the turn a relative HOME is under the producer workdir; to this
+	// process it would be under its own working directory, and a probe
+	// green about the wrong directory is worse than none.
+	home, herr := cfg.ProducerHome()
+	if herr != nil {
+		return Result{}, wrap(ExitConfig, herr, "producer home")
+	}
+	if home != "" {
+		can, err := deps.Provision.GateCanTraverse(ctx, home)
+		if err != nil {
+			return Result{}, wrap(ExitConfig, err, "probing whether the gate can traverse the producer's home %s", home)
+		}
+		if can {
+			return Result{}, fail(ExitConfig, "the gate identity can traverse the producer's home %s; the producer reopened it after doctor, and producer-authored gate code would reach its model credential -- not running the gate", home)
+		}
+		fmt.Fprintf(log, "boundary: the gate cannot traverse %s\n", home)
+	}
+
+	// 5b. No gate path may overlap the producer's home, judged PHYSICALLY:
+	// a declared path is chowned to the gate by this privileged process,
+	// and one that reaches into the home -- a symlink planted under a
+	// declared path, say -- would grant the gate exactly the traversal
+	// just refused, after the probe and before the gate. Judged before any
+	// ownership changes; Validate's lexical check is the first lock.
+	if home != "" {
+		physHome := gittransport.PhysicalPrefix(home)
+		for _, p := range cfg.Gate.RequiredWritablePaths {
+			resolved, err := cfg.ResolveGatePath(p)
+			if err != nil {
+				return Result{}, wrap(ExitConfig, err, "gate path %s", p)
+			}
+			if phys := gittransport.PhysicalPrefix(resolved); config.PathsOverlap(phys, physHome) {
+				return Result{}, fail(ExitConfig, "gate path %q resolves to %s, which overlaps the producer's home %s; provisioning it would hand the gate the producer's model credential -- not provisioning, not running the gate", p, phys, physHome)
+			}
+		}
+	}
 	for _, p := range cfg.Gate.RequiredWritablePaths {
 		resolved, err := cfg.ResolveGatePath(p)
 		if err != nil {
@@ -280,6 +329,18 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		}
 		if err := deps.Provision.Provision(ctx, resolved); err != nil {
 			return Result{}, wrap(ExitConfig, err, "gate path %s could not be provisioned for the gate", p)
+		}
+	}
+	// 5c. Defense in depth: provisioning changed ownership under the gate;
+	// the boundary is asked again after it, so a path that reached the home
+	// by a route neither lock saw still refuses the gate.
+	if home != "" {
+		can, err := deps.Provision.GateCanTraverse(ctx, home)
+		if err != nil {
+			return Result{}, wrap(ExitConfig, err, "re-probing the producer's home %s after provisioning", home)
+		}
+		if can {
+			return Result{}, fail(ExitConfig, "the gate identity can traverse the producer's home %s AFTER provisioning the gate paths; a declared path reached the home -- not running the gate", home)
 		}
 	}
 	exe, err := config.LookPathIn(cfg.Gate.Env["PATH"], cfg.Gate.Command[0])

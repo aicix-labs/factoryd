@@ -25,6 +25,12 @@ type Prober interface {
 	// against credential files: a gate that can read the reviewer's token has
 	// the two-party model in its hands.
 	CanRead(ctx context.Context, path string) (bool, error)
+	// CanTraverse reports whether the principal can pass THROUGH the
+	// directory at path -- search permission, access(2) with X_OK -- which
+	// is the question for a directory that holds a known secret: a 0711
+	// home is neither readable nor listable, and a process that knows the
+	// path $HOME/.codex/auth.json reads it all the same.
+	CanTraverse(ctx context.Context, path string) (bool, error)
 	// CanExec reports whether the principal can execute the file at path,
 	// traversal included. An execute bit is not executability: a root-owned
 	// 0700 binary has one, and doctor running as root can run it, and the
@@ -104,16 +110,28 @@ func (p *setuidProber) CanWrite(ctx context.Context, dir string) (bool, error) {
 	return false, fmt.Errorf("could not run the probe as %s: %w (factoryd needs CAP_SETUID or root to switch user)", p.Describe(), err)
 }
 
+// CanTraverse asks for search permission as the principal: access(2) with
+// X_OK under its real uid, which is what an openat through that directory
+// would be granted or refused.
+func (p *setuidProber) CanTraverse(ctx context.Context, path string) (bool, error) {
+	return p.probeShell(ctx, `test -x "$1"`, path)
+}
+
 // CanRead attempts a read as the principal, by the same mechanism as CanWrite.
 func (p *setuidProber) CanRead(ctx context.Context, path string) (bool, error) {
+	return p.probeShell(ctx, `test -r "$1"`, path)
+}
+
+// probeShell runs a one-line test as the principal and reports its truth.
+// "Could not run" is undecided, never a refusal: a probe that cannot start
+// has verified nothing.
+func (p *setuidProber) probeShell(ctx context.Context, script, path string) (bool, error) {
 	if uint32(os.Geteuid()) == p.uid {
 		return false, fmt.Errorf("doctor runs as uid %d, the same identity as %s; there is no boundary to verify", p.uid, p.name)
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	// access(2) under the principal's real uid, for a file or a directory
-	// alike: what the kernel would answer an open, without opening.
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", `test -r "$1"`, "probe", path)
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", script, "probe", path)
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: p.uid, Gid: p.gid, Groups: []uint32{}}}
 	err := cmd.Run()
@@ -124,7 +142,7 @@ func (p *setuidProber) CanRead(ctx context.Context, path string) (bool, error) {
 	if asExitError(err, &ee) {
 		return false, nil
 	}
-	return false, fmt.Errorf("could not run the read probe as %s: %w (factoryd needs CAP_SETUID or root to switch user)", p.Describe(), err)
+	return false, fmt.Errorf("could not run the probe as %s: %w (factoryd needs CAP_SETUID or root to switch user)", p.Describe(), err)
 }
 
 // CanExec attempts test -x as the principal, by the same mechanism as the
