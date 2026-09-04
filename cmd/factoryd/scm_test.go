@@ -11,6 +11,7 @@ import (
 // closeDriver is the provider as the close verb sees it.
 type closeDriver struct {
 	scm.Driver
+	name     string
 	state    scm.ChangeState
 	ready    bool     // the change is no longer a draft
 	closes   []string // reasons passed to Close
@@ -37,49 +38,64 @@ func (d *closeDriver) Close(_ context.Context, _ scm.ChangeID, reason string) er
 	return nil
 }
 
-// close is an operator's acknowledged act: refused without --operator,
-// refused for anything that is not an open draft, and believed only when
-// the re-read says closed -- merged in the window is reported as merged,
-// never as success (#36, #47 review).
-func TestScmCloseIsAnOperatorActAndVerifiesClosed(t *testing.T) {
+// close reaches Driver.Close only through the operator principal: the
+// role's own driver -- the one the reviewer turn holds -- never receives
+// the call, whatever arguments are passed (#36, #47 review). And it
+// closes only an open draft, believing only a re-read that says closed.
+func TestScmCloseRunsOnlyAsTheOperatorPrincipal(t *testing.T) {
 	out := &printer{}
-	run := func(d *closeDriver, args ...string) int { return scmVerb(context.Background(), d, "close", args, out) }
-
-	d := &closeDriver{state: scm.StateOpen}
-	if rc := run(d, "48"); rc != exitError || len(d.closes) != 0 {
-		t.Fatalf("without --operator: rc=%d closes=%v; the reviewer protocol must not close", rc, d.closes)
+	role := &closeDriver{name: "reviewer", state: scm.StateOpen}
+	t.Cleanup(func() {
+		if len(role.closes) != 0 {
+			t.Errorf("the role's driver received Close(%v); the reviewer closed", role.closes)
+		}
+	})
+	noOperator := func(context.Context) (scm.Driver, error) {
+		return nil, errors.New("credentials.operator is not configured")
 	}
-	if rc := run(d, "--operator", "48"); rc != exitOK || len(d.closes) != 1 || d.closes[0] != "superseded by a newer submission" {
-		t.Fatalf("rc=%d closes=%v", rc, d.closes)
-	}
-	d = &closeDriver{state: scm.StateOpen}
-	if rc := run(d, "--operator", "48", "duplicate", "of", "50"); rc != exitOK || d.closes[0] != "duplicate of 50" {
-		t.Fatalf("rc=%d closes=%v", rc, d.closes)
-	}
-
-	for _, st := range []scm.ChangeState{scm.StateMerged, scm.StateClosed} {
-		d := &closeDriver{state: st}
-		if rc := run(d, "--operator", "48"); rc != exitError || len(d.closes) != 0 {
-			t.Fatalf("%s: rc=%d closes=%v; only an open change is closed", st, rc, d.closes)
+	// Without an operator principal nothing closes, whatever is passed.
+	for _, args := range [][]string{{"48"}, {"--operator", "48"}, {"48", "--operator"}, {"48", "reason"}} {
+		if rc := scmVerb(context.Background(), role, noOperator, "close", args, out); rc != exitError {
+			t.Fatalf("args %v: rc=%d; without the operator credential close must refuse", args, rc)
 		}
 	}
-	d = &closeDriver{state: scm.StateOpen, ready: true}
-	if rc := run(d, "--operator", "48"); rc != exitError || len(d.closes) != 0 {
-		t.Fatalf("ready change: rc=%d closes=%v; a change that left the producer's hands is not a superseded draft", rc, d.closes)
+	if rc := scmVerb(context.Background(), role, nil, "close", []string{"48"}, out); rc != exitError {
+		t.Fatal("no operator seam at all, yet close proceeded")
 	}
-	d = &closeDriver{state: scm.StateOpen, after: scm.StateOpen}
-	if rc := run(d, "--operator", "48"); rc != exitError {
+
+	op := &closeDriver{name: "operator", state: scm.StateOpen}
+	asOperator := func(context.Context) (scm.Driver, error) { return op, nil }
+	run := func(o *closeDriver, args ...string) int {
+		op = o
+		return scmVerb(context.Background(), role, asOperator, "close", args, out)
+	}
+	if rc := run(op, "48"); rc != exitOK || len(op.closes) != 1 || op.closes[0] != "superseded by a newer submission" {
+		t.Fatalf("rc=%d closes=%v", rc, op.closes)
+	}
+	o := &closeDriver{state: scm.StateOpen}
+	if rc := run(o, "48", "duplicate", "of", "50"); rc != exitOK || o.closes[0] != "duplicate of 50" {
+		t.Fatalf("rc=%d closes=%v", rc, o.closes)
+	}
+	for _, st := range []scm.ChangeState{scm.StateMerged, scm.StateClosed} {
+		o := &closeDriver{state: st}
+		if rc := run(o, "48"); rc != exitError || len(o.closes) != 0 {
+			t.Fatalf("%s: rc=%d closes=%v; only an open change is closed", st, rc, o.closes)
+		}
+	}
+	o = &closeDriver{state: scm.StateOpen, ready: true}
+	if rc := run(o, "48"); rc != exitError || len(o.closes) != 0 {
+		t.Fatalf("ready change: rc=%d closes=%v; a change that left the producer's hands is not a superseded draft", rc, o.closes)
+	}
+	if rc := run(&closeDriver{state: scm.StateOpen, after: scm.StateOpen}, "48"); rc != exitError {
 		t.Fatal("the provider's word was taken as proof the change closed")
 	}
-	d = &closeDriver{state: scm.StateOpen, after: scm.StateMerged}
-	if rc := run(d, "--operator", "48"); rc != exitError {
+	if rc := run(&closeDriver{state: scm.StateOpen, after: scm.StateMerged}, "48"); rc != exitError {
 		t.Fatal("a change merged in the window was reported as retired")
 	}
-	d = &closeDriver{state: scm.StateOpen, closeErr: errors.New("403")}
-	if rc := run(d, "--operator", "48"); rc != exitError {
+	if rc := run(&closeDriver{state: scm.StateOpen, closeErr: errors.New("403")}, "48"); rc != exitError {
 		t.Fatal("a failed close exited 0")
 	}
-	if rc := run(&closeDriver{state: scm.StateOpen}, "--operator"); rc != exitError {
+	if rc := run(&closeDriver{state: scm.StateOpen}); rc != exitError {
 		t.Fatal("close with no id was accepted")
 	}
 }

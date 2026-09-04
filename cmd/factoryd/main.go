@@ -58,8 +58,8 @@ verbs for scm:
   comment <id> <body>             post a comment
   set-draft <id> true|false       mark draft or ready
   merge <id> <expected-head>      merge, then verify the commit landed
-  close --operator <id> [reason]  retire a superseded open draft; an operator's act (no provider
-                                  offers a conditional close), verified closed afterwards
+  close <id> [reason]             retire a superseded open draft as the OPERATOR principal
+                                  (credentials.operator, unreadable by the roles), verified closed
 
 flags for supervise:
   --role <r>       producer or reviewer (required)

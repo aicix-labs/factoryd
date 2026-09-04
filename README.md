@@ -55,10 +55,11 @@ and the gate never marks a draft ready.
 
 ## What works today
 
-`factoryd scm close --operator <id> [reason]` retires a superseded draft: an
-operator's acknowledged act (no provider offers a conditional close, so the
-automated reviewer protocol never closes), refused for anything not an open
-draft, and believed only when the re-read says closed.
+`factoryd scm close <id> [reason]` retires a superseded draft as the operator
+principal (`credentials.operator`, a third token the reviewer identity cannot
+read, proved by `doctor`); no provider offers a conditional close, so the
+automated reviewer protocol never closes. Refused for anything not an open
+draft, believed only when the re-read says closed.
 
 A submission submit refuses for a reason that cannot change is not retried:
 the block is recorded, the declaration quarantined, and `status` and `health`

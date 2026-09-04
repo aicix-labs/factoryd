@@ -105,6 +105,17 @@ func healthyDeps(cfg *config.Config, listErr error) doctor.Deps {
 			if ra != nil && ra.User == "reads-nothing" {
 				return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true, cfg.OutboxDir(): true}, readable: map[string]bool{}}, nil
 			}
+			// The reviewer principal: reads its own credential, never the
+			// operator's -- unless the test says so.
+			if ra != nil && ra.User == "factoryd-reviewer" {
+				return fakeProber{name: "fake-reviewer (uid 4444)", writable: map[string]bool{cfg.TurnWorkdir("reviewer"): true}, readable: map[string]bool{cfg.Credentials.Reviewer.File: true}}, nil
+			}
+			if ra != nil && ra.User == "reviewer-reads-operator-token" {
+				return fakeProber{name: "fake-reviewer (uid 4444)", writable: map[string]bool{cfg.TurnWorkdir("reviewer"): true}, readable: map[string]bool{cfg.Credentials.Reviewer.File: true, cfg.Credentials.Operator.File: true}}, nil
+			}
+			if ra != nil && ra.User == "reviewer-reads-nothing" {
+				return fakeProber{name: "fake-reviewer (uid 4444)", writable: map[string]bool{cfg.TurnWorkdir("reviewer"): true}, readable: map[string]bool{}}, nil
+			}
 			if ra != nil && ra.User == "inbox-locked" {
 				return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.OutboxDir(): true}, readable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
 			}
@@ -363,6 +374,32 @@ func TestIndividualFailuresAreCaught(t *testing.T) {
 				c.Roles.Producer.RunAs = &config.RunAs{User: "outbox-locked"}
 			},
 			wantName: "handoff outbox as producer",
+		},
+		{
+			// The operator principal is a boundary only if the reviewer
+			// identity cannot read it (#47 review).
+			name: "reviewer can read the operator credential",
+			mutate: func(t *testing.T, c *config.Config) {
+				c.Credentials.Operator = config.CredentialRef{File: filepath.Join(c.Paths.Root, "operator.token")}
+				c.Roles.Reviewer.RunAs = &config.RunAs{User: "reviewer-reads-operator-token"}
+			},
+			wantName: "reviewer cannot read operator credential",
+		},
+		{
+			name: "operator credential configured but the reviewer runs as factoryd itself",
+			mutate: func(t *testing.T, c *config.Config) {
+				c.Credentials.Operator = config.CredentialRef{File: filepath.Join(c.Paths.Root, "operator.token")}
+				c.Roles.Reviewer.RunAs = nil
+			},
+			wantName: "reviewer cannot read operator credential",
+		},
+		{
+			name: "reviewer read probe has no positive control",
+			mutate: func(t *testing.T, c *config.Config) {
+				c.Credentials.Operator = config.CredentialRef{File: filepath.Join(c.Paths.Root, "operator.token")}
+				c.Roles.Reviewer.RunAs = &config.RunAs{User: "reviewer-reads-nothing"}
+			},
+			wantName: "reviewer read probe control",
 		},
 		{
 			name:     "turns cannot be contained",
@@ -1001,4 +1038,23 @@ type recordingProber struct {
 func (p recordingProber) CanTraverse(ctx context.Context, path string) (bool, error) {
 	*p.asked = append(*p.asked, path)
 	return p.Prober.CanTraverse(ctx, path)
+}
+
+// With an operator credential the reviewer cannot read, doctor passes and
+// prints the reviewer's refusal and its control (positive control for the
+// three negative cases above).
+func TestOperatorCredentialUnreadableByTheReviewerPasses(t *testing.T) {
+	cfg := fixture(t)
+	cfg.Credentials.Operator = config.CredentialRef{File: filepath.Join(cfg.Paths.Root, "operator.token")}
+	cfg.Roles.Reviewer.RunAs = &config.RunAs{User: "factoryd-reviewer"}
+	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
+	if !r.OK() {
+		t.Fatalf("doctor failed:\n%s", r)
+	}
+	text := r.String()
+	for _, want := range []string{"reviewer cannot read operator credential", "reviewer read probe control", "producer cannot read operator credential", "gate cannot read operator credential"} {
+		if !strings.Contains(text, want) {
+			t.Fatalf("doctor output lacks %q:\n%s", want, text)
+		}
+	}
 }

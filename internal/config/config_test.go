@@ -428,3 +428,37 @@ func TestReviewerCredentialCannotReplaceAGeneratedValue(t *testing.T) {
 		t.Fatalf("an ordinary credential name was not injected:\n%s", strings.Join(env, "\n"))
 	}
 }
+
+// The operator principal is a boundary only as a third secret: a file the
+// role identities cannot read, distinct from both role tokens, never an
+// environment variable (#47 review).
+func TestOperatorCredentialMustBeAThirdFile(t *testing.T) {
+	base := func(t *testing.T) *config.Config {
+		t.Helper()
+		c, err := config.Load("../../examples/factory.github.json")
+		if err != nil {
+			t.Fatal(err)
+		}
+		return c
+	}
+	c := base(t)
+	c.Credentials.Operator = c.Credentials.Reviewer
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "credentials.operator and credentials.reviewer point at the same secret") {
+		t.Fatalf("operator == reviewer accepted: %v", err)
+	}
+	c = base(t)
+	c.Credentials.Operator = c.Credentials.Producer
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "credentials.operator and credentials.producer point at the same secret") {
+		t.Fatalf("operator == producer accepted: %v", err)
+	}
+	c = base(t)
+	c.Credentials.Operator = config.CredentialRef{Env: "OPERATOR_TOKEN"}
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "credentials.operator.env is not accepted") {
+		t.Fatalf("operator from env accepted: %v", err)
+	}
+	c = base(t)
+	c.Credentials.Operator = config.CredentialRef{File: "/etc/factoryd/widgets/operator.token"}
+	if err := c.Validate(); err != nil {
+		t.Fatalf("a distinct operator file refused: %v", err)
+	}
+}

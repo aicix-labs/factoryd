@@ -3,6 +3,7 @@ package main
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -61,12 +62,49 @@ func runSCM(args []string) int {
 		fmt.Fprintf(os.Stderr, "factoryd scm: %v\n", err)
 		return exitConfig
 	}
-	return scmVerb(context.Background(), d, rest[0], rest[1:], &printer{json: *asJSON})
+	// The operator principal is resolved only for the verb that needs it,
+	// and never falls back to a role's token.
+	operator := func(ctx context.Context) (scm.Driver, error) {
+		o := cfg.Credentials.Operator
+		if o.File == "" {
+			return nil, errors.New("credentials.operator is not configured; close is an operator's act and needs the operator's own credential (a file the reviewer and producer identities cannot read)")
+		}
+		tok, err := o.Resolve()
+		if err != nil {
+			return nil, fmt.Errorf("operator credential: %w", err)
+		}
+		od, err := factory.NewDriver(cfg, tok)
+		if err != nil {
+			return nil, err
+		}
+		who, err := od.Whoami(ctx)
+		if err != nil {
+			return nil, fmt.Errorf("operator identity: %w", err)
+		}
+		for _, r := range []struct {
+			name string
+			ref  config.CredentialRef
+		}{{"reviewer", cfg.Credentials.Reviewer}, {"producer", cfg.Credentials.Producer}} {
+			rt, err := r.ref.Resolve()
+			if err != nil {
+				continue // a role token this caller cannot read is a role it is not
+			}
+			rw, err := od.WhoamiWith(ctx, rt)
+			if err == nil && rw.ID == who.ID {
+				return nil, fmt.Errorf("the operator credential authenticates as %s, the %s; the operator is a third principal or it is no boundary", who.Login, r.name)
+			}
+		}
+		return od, nil
+	}
+	return scmVerb(context.Background(), d, operator, rest[0], rest[1:], &printer{json: *asJSON})
 }
 
-// scmVerb dispatches one verb against a driver. Separate from the credential
-// and driver construction so a verb's guards can be tested against a fake.
-func scmVerb(ctx context.Context, d scm.Driver, verb string, rest []string, out *printer) int {
+// scmVerb dispatches one verb against the role's driver. close alone uses
+// the operator principal, obtained through operator(); a verb that could
+// reach Driver.Close through the role's driver would be the reviewer
+// closing. Separate from credential and driver construction so guards can
+// be tested against fakes.
+func scmVerb(ctx context.Context, d scm.Driver, operator func(context.Context) (scm.Driver, error), verb string, rest []string, out *printer) int {
 	need := func(n int, form string) bool {
 		if len(rest) < n {
 			fmt.Fprintf(os.Stderr, "factoryd scm %s: usage: %s\n", verb, form)
@@ -201,26 +239,23 @@ func scmVerb(ctx context.Context, d scm.Driver, verb string, rest []string, out 
 		// and the close another party can mark the change ready, or merge
 		// it, and the close still lands or reports success. Submit avoids
 		// that race by never closing; the automated reviewer protocol does
-		// too (#47 review). So this is an OPERATOR's act, acknowledged with
-		// --operator after reading the change, never a reviewer-safe verb.
-		// The window is narrowed, not removed: the change must be an open
-		// draft at the last read, and afterwards it must be closed --
-		// merged is reported as what it is, not as success.
-		if !need(1, "close --operator <id> [reason]") {
+		// too. So close runs as the OPERATOR principal only -- a credential
+		// the reviewer identity cannot read (#47 review) -- through a driver
+		// the role's token never builds. The window is narrowed, not
+		// removed: the change must be an open draft at the last read, and
+		// afterwards it must be closed; merged is reported as what it is.
+		if !need(1, "close <id> [reason]") {
 			return exitError
 		}
-		operator := false
-		if rest[0] == "--operator" {
-			operator, rest = true, rest[1:]
-			if !need(1, "close --operator <id> [reason]") {
-				return exitError
-			}
+		if operator == nil {
+			return out.fail(errors.New("close: no operator principal available"))
 		}
-		if !operator {
-			return out.fail(fmt.Errorf("close is an operator's act, not part of the automated reviewer protocol: neither provider offers a conditional close, so between the read and the close another party can mark the change ready or merge it. Read the change, then run: factoryd scm close --operator %s [reason]", rest[0]))
+		od, err := operator(ctx)
+		if err != nil {
+			return out.fail(fmt.Errorf("close: %w", err))
 		}
 		id := scm.ChangeID(rest[0])
-		c, err := d.Get(ctx, id)
+		c, err := od.Get(ctx, id)
 		if err != nil {
 			return out.fail(err)
 		}
@@ -234,11 +269,11 @@ func scmVerb(ctx context.Context, d scm.Driver, verb string, rest []string, out 
 		if len(rest) > 1 {
 			reason = strings.Join(rest[1:], " ")
 		}
-		if err := d.Close(ctx, id, reason); err != nil {
+		if err := od.Close(ctx, id, reason); err != nil {
 			return out.fail(err)
 		}
 		// Verified, not believed: re-read, and only closed is success.
-		after, err := d.Get(ctx, id)
+		after, err := od.Get(ctx, id)
 		if err != nil {
 			return out.fail(fmt.Errorf("close reported success but the change could not be re-read: %w", err))
 		}

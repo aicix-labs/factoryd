@@ -24,6 +24,9 @@
     },
     "reviewer": {
       "file": "/etc/factoryd/widgets/reviewer.token"
+    },
+    "operator": {
+      "file": "/etc/factoryd/widgets/operator.token"
     }
   },
   "gate": {

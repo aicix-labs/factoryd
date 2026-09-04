@@ -135,6 +135,13 @@ type Git struct {
 type Credentials struct {
 	Producer CredentialRef `json:"producer"`
 	Reviewer CredentialRef `json:"reviewer"`
+	// Operator is a third principal, optional: the human's own token, used
+	// only by `scm close` to retire a superseded draft. It is the boundary
+	// that keeps closing out of the automated reviewer protocol -- a flag
+	// is a string any turn can pass, a credential the reviewer identity
+	// cannot read is not (#47 review). Doctor proves the reviewer and the
+	// producer cannot read it. Unset means close is unavailable.
+	Operator CredentialRef `json:"operator,omitempty"`
 }
 
 // CredentialRef points at a secret. Exactly one of File or Env must be set --
@@ -705,6 +712,19 @@ func (c *Config) Validate() error {
 	}
 	if p, r := c.Credentials.Producer, c.Credentials.Reviewer; p == r && (p.File != "" || p.Env != "") {
 		add("credentials.producer and credentials.reviewer point at the same secret (%s); the two-party split is the property that catches defects", p.Describe())
+	}
+	if o := c.Credentials.Operator; o.File != "" || o.Env != "" {
+		if o.File != "" && o.Env != "" {
+			add("credentials.operator sets both file and env; exactly one is required")
+		}
+		if o.Env != "" {
+			add("credentials.operator.env is not accepted: an environment variable is readable by whatever inherits it; the operator credential must be a file the role identities cannot read")
+		}
+		for role, ref := range map[string]CredentialRef{"producer": c.Credentials.Producer, "reviewer": c.Credentials.Reviewer} {
+			if ref == o {
+				add("credentials.operator and credentials.%s point at the same secret (%s); the operator is a third principal or it is no boundary", role, o.Describe())
+			}
+		}
 	}
 
 	if len(c.Gate.Command) == 0 {

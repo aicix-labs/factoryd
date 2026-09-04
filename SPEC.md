@@ -1040,14 +1040,21 @@ new draft's body. **The automated reviewer protocol does not close either**:
 neither provider offers a conditional close, so between a read and a close
 another party can mark the change ready or merge it, and the close still
 lands or reports success — the race submit avoids by never closing. Retiring
-a superseded draft is an *operator's* act, acknowledged: `factoryd scm close
---operator <id> [reason]` refuses without the flag and says why, refuses a
-change that is not an open draft at the last read, closes with the reason
-(default "superseded by a newer submission"), and believes only a re-read that
-says *closed* — merged in the window is reported as merged, never as success.
-The window is narrowed, not removed; the flag is the acknowledgement of that.
-An open family that only grows makes "which one do I review" load-bearing;
-the operator's close is how the family stays one draft wide.
+a superseded draft is an *operator's* act, and the boundary that keeps it out
+of the reviewer's reach is a credential, not a flag: `credentials.operator`
+is a third principal — a file, never an environment variable, distinct from
+both role tokens — that `factoryd scm close <id> [reason]` alone resolves,
+through a driver the role's token never builds, after confirming it does not
+authenticate as the reviewer or the producer. `doctor` proves, *as the
+reviewer*, that it cannot read that file (with the control that it can read
+its own), and as the producer and the gate likewise; a reviewer running as
+factoryd itself is reported as no boundary. The verb refuses a change that is
+not an open draft at the last read, closes with the reason (default
+"superseded by a newer submission"), and believes only a re-read that says
+*closed* — merged in the window is reported as merged, never as success. The
+window is narrowed, not removed. An open family that only grows makes "which
+one do I review" load-bearing; the operator's close is how the family stays
+one draft wide.
 
 ### 6.4 Audits
 
