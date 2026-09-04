@@ -1154,8 +1154,8 @@ func TestAfterTurnFailureCountsOnTheFailStreak(t *testing.T) {
 	}
 }
 
-// A turn that left processes running is not clean: nothing follows it and
-// it counts on the fail streak.
+// A turn that left processes running and recorded no progress is not clean:
+// nothing follows it and it counts on the fail streak.
 func TestLeftoverTurnIsNotCleanAndNothingFollowsIt(t *testing.T) {
 	fx := newFixture(t)
 	fx.wake(t)
@@ -1286,5 +1286,43 @@ func TestAHaltWhoseSentinelWasNeverWrittenIsNotResetByARestart(t *testing.T) {
 	}
 	if rs := fx.roleState(t); rs.Halted || rs.SentinelWritten || rs.LastHalt == nil {
 		t.Fatalf("the reset did not clear the halt: %+v", rs)
+	}
+}
+
+// Real agent CLIs leave helpers behind after doing their work. A leftover
+// turn that recorded progress stands: the strays are killed, the turn is
+// not counted as failed, nothing is re-armed, and the leak is counted as
+// hygiene (#33). Counting it as failed retried a finished review and grew
+// the change family by a draft per retry.
+func TestLeftoverTurnThatRecordedProgressStandsAndIsNotRetried(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	ran := 0
+	fx.afterTurn = func(context.Context, supervise.Turn, supervise.TurnResult) (string, error) { ran++; return "", nil }
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		fx.progress(t)
+		return supervise.TurnResult{ExitCode: 0, Leftover: true}
+	}}
+	s := fx.newSupervisor(t, r, 1)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := r.count(); got != 1 {
+		t.Fatalf("ran %d turns, want 1: a leftover turn with progress was retried", got)
+	}
+	if ran != 1 {
+		t.Fatalf("after-turn ran %d times, want 1: the strays were killed before the runner returned, so the turn's follow-up may run", ran)
+	}
+	if _, err := os.Stat(fx.cfg.RetryPath("reviewer")); !os.IsNotExist(err) {
+		t.Fatalf("a retry was re-armed for a turn that did its work (stat err=%v)", err)
+	}
+	rs := fx.roleState(t)
+	if rs.LastTurn == nil || rs.LastTurn.ExitCode == nil || *rs.LastTurn.ExitCode != 0 || rs.FailStreak != 0 || rs.Halted {
+		t.Fatalf("the turn was counted as failed: %+v", rs)
+	}
+	if rs.LeftoverTurns != 1 {
+		t.Fatalf("leftover_turns=%d, want 1: the leak was not counted, so its silence reads as clean", rs.LeftoverTurns)
 	}
 }

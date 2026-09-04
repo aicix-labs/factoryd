@@ -521,3 +521,16 @@ func TestClearedHaltIsInformationNotANeed(t *testing.T) {
 		t.Fatalf("text:\n%s", status.Text(s))
 	}
 }
+
+// A leak that was killed is shown as hygiene, never hidden (#33).
+func TestLeftoverTurnsAreShownAsHygiene(t *testing.T) {
+	l := newLab(t)
+	l.state(t, func(s *state.State) { s.Role(state.RoleReviewer).LeftoverTurns = 3 })
+	s := l.collect()
+	if !s.Working || len(s.NeedsMe) != 0 {
+		t.Fatalf("working=%v needs=%v; a killed leak is not a need", s.Working, s.NeedsMe)
+	}
+	if !strings.Contains(status.Text(s), "3 turn(s) left processes behind") {
+		t.Fatalf("text:\n%s", status.Text(s))
+	}
+}

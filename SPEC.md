@@ -322,8 +322,15 @@ it — whatever session a child made for itself — and the cgroup is verified
 empty before anything follows. A process group cannot give this (`setsid(2)`
 leaves it), so privileged factoryd that cannot create the cgroup refuses to start
 the turn, and the unprivileged fallback is named `process-group` in the result
-and fails `doctor`. Anything left in the cgroup makes the turn **not clean**:
-nothing follows it, and it counts as a failure. **The producer receives no
+and fails `doctor`. Anything left in the cgroup is killed and verified gone before the
+turn is judged. What it means depends on whether the turn did its work: a
+leftover turn that recorded no progress is **not clean** — nothing follows it,
+and it counts as a failure — while one that recorded progress **stands**, its
+follow-up runs, nothing is re-armed, and the leak is counted as hygiene
+(`leftover_turns`, shown by `status`). Real agent CLIs leave helpers behind
+after posting their audit and signalling; counting such a turn as failed
+retried a finished review, and under supersession every redundant verdict grew
+the change family by a draft (#33). **The producer receives no
 credential** is proved by `doctor` as the producer: neither credential file may
 be readable by it, with the control that its own workdir is. **The producer's
 home is closed to the gate, and that is re-proved at the crossing.** A
