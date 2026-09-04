@@ -457,6 +457,20 @@ func TestVerdictTurnIsToldEveryVerdictExactly(t *testing.T) {
 	if _, err := os.Stat(filepath.Join(fx2.root, "started")); err == nil {
 		t.Fatal("the turn started on a verdict the runner could not read")
 	}
+	// The old document shape -- valid JSON, a change and a kind, no branch
+	// lineage -- is the exact input that reintroduces the stale-family
+	// failure. The turn does not start.
+	fx4, r4, _ := execFixture(t, []string{"sh", "-c", "touch \"$FACTORYD_ROOT/started\""}, 30)
+	oldShape := filepath.Join(fx4.outbox, "51.json")
+	os.WriteFile(oldShape, []byte(`{"change_id":"51","kind":"changes-requested","sha":"abc","summary":"s","at":"2026-09-04T00:00:00Z"}`), 0o644)
+	tn4 := turn(fx4, 0)
+	tn4.Triggers = []watch.Trigger{{Label: "verdict", Path: oldShape}}
+	if _, err := r4.Run(context.Background(), tn4, nil); err == nil || !strings.Contains(err.Error(), "lineage") {
+		t.Fatalf("err=%v; a pre-#31 verdict must be refused, not given to the turn with an empty family", err)
+	}
+	if _, err := os.Stat(filepath.Join(fx4.root, "started")); err == nil {
+		t.Fatal("the turn started on a verdict with no lineage")
+	}
 	// A wake turn: the keys exist and are empty, the mapping is [].
 	fx3, r3, out3 := execFixture(t, []string{"sh", "-c", "env | grep '^FACTORYD_\\(VERDICTS\\|CHANGE_BRANCH\\)='"}, 30)
 	if _, err := r3.Run(context.Background(), turn(fx3, 0), nil); err != nil {

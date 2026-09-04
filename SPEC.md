@@ -905,8 +905,12 @@ scalar that named the first one's family for all would send a fix to the wrong
 change. The scalar keys `FACTORYD_VERDICT`, `FACTORYD_CHANGE_ID` and
 `FACTORYD_CHANGE_BRANCH` name the verdict only when the turn carries exactly
 one, and are empty otherwise; on a turn with no verdict all four are present,
-the array `[]`. A verdict file the runner cannot read or parse is a runner
-error: the turn does not start, rather than starting with empty values. Found on the first production cycle (#29):
+the array `[]`. A verdict file the runner cannot read or parse — or whose lineage
+is incomplete or incoherent: an unknown kind, no change id, a filename that
+does not match it, no branch, or a declared family that is not the family of
+its branch — is a runner error: the turn does not start, rather than starting
+with empty values. A pre-#31 verdict document (no branch lineage) is refused
+for exactly that reason. Found on the first production cycle (#29):
 without the family name the producer re-declared a stale one from its seed
 clone and got an unrelated draft beside the change under review, not a
 superseding one.

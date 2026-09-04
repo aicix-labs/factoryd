@@ -279,9 +279,6 @@ func (r *ExecRunner) env(t Turn) ([]string, error) {
 			// facts it carries. It is a runner error, said as such.
 			return nil, fmt.Errorf("verdict trigger %s: %w", tr.Path, err)
 		}
-		if v.ChangeID == "" || v.Kind == "" {
-			return nil, fmt.Errorf("verdict trigger %s: document names no change or no kind", tr.Path)
-		}
 		verdicts = append(verdicts, VerdictEnv{Path: tr.Path, ChangeID: v.ChangeID, Kind: v.Kind, SHA: v.SHA, Branch: v.Branch, DeclaredBranch: v.DeclaredBranch})
 	}
 	if len(verdicts) > 0 {
