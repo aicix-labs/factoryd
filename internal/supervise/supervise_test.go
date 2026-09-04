@@ -1251,7 +1251,7 @@ func TestAHaltWhoseSentinelWasNeverWrittenIsNotResetByARestart(t *testing.T) {
 	if err := s.Run(ctx); !errors.Is(err, supervise.ErrHalted) {
 		t.Fatalf("Run returned %v, want ErrHalted", err)
 	}
-	if rs := fx.roleState(t); !rs.Halted || rs.SentinelWritten {
+	if rs := fx.roleState(t); !rs.Halted || rs.SentinelWritten == nil || *rs.SentinelWritten {
 		t.Fatalf("halt state: %+v", rs)
 	}
 	s.Close()
@@ -1268,7 +1268,7 @@ func TestAHaltWhoseSentinelWasNeverWrittenIsNotResetByARestart(t *testing.T) {
 	}
 	s2.Close()
 	rs := fx.roleState(t)
-	if !rs.Halted || rs.LastHalt != nil || !rs.SentinelWritten {
+	if !rs.Halted || rs.LastHalt != nil || rs.SentinelWritten == nil || !*rs.SentinelWritten {
 		t.Fatalf("the refused restart did not keep the halt and persist the sentinel: %+v", rs)
 	}
 	if body, err := os.ReadFile(stop); err != nil || !strings.Contains(string(body), rs.HaltReason) {
@@ -1284,7 +1284,7 @@ func TestAHaltWhoseSentinelWasNeverWrittenIsNotResetByARestart(t *testing.T) {
 	if err := s3.Run(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Run after the reset: %v", err)
 	}
-	if rs := fx.roleState(t); rs.Halted || rs.SentinelWritten || rs.LastHalt == nil {
+	if rs := fx.roleState(t); rs.Halted || rs.SentinelWritten != nil || rs.LastHalt == nil {
 		t.Fatalf("the reset did not clear the halt: %+v", rs)
 	}
 }
@@ -1324,5 +1324,67 @@ func TestLeftoverTurnThatRecordedProgressStandsAndIsNotRetried(t *testing.T) {
 	}
 	if rs.LeftoverTurns != 1 {
 		t.Fatalf("leftover_turns=%d, want 1: the leak was not counted, so its silence reads as clean", rs.LeftoverTurns)
+	}
+}
+
+// A halt recorded by a binary that predates sentinel_written has the field
+// absent. Absent is unknown, not "never written": the operator removed a
+// sentinel that was on disk, and the documented resume must work the first
+// time, not the second (#37).
+func TestHaltRecordedBeforeSentinelWrittenExistedResumesOnTheFirstRestart(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	// The state a pre-#32 binary left: halted, reason, time, no field.
+	_, err := state.Update(fx.cfg.StatePath(), fx.cfg.Name, func(st *state.State) error {
+		rs := st.Role(state.RoleReviewer)
+		rs.Halted, rs.HaltReason, rs.HaltedAt, rs.SentinelWritten = true, "fail_abort before the upgrade", time.Now().Add(-time.Hour), nil
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(fx.cfg.StatePath()); strings.Contains(string(b), "sentinel_written") {
+		t.Fatalf("the pre-upgrade state must not carry the field:\n%s", b)
+	}
+	// The operator followed the printed instruction: the sentinel is gone.
+	s := fx.newSupervisor(t, &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult { fx.progress(t); return supervise.TurnResult{} }}, 1)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the first restart after the upgrade did not resume: %v", err)
+	}
+	rs := fx.roleState(t)
+	if rs.Halted || rs.LastHalt == nil || rs.LastHalt.Reason != "fail_abort before the upgrade" {
+		t.Fatalf("the halt was not cleared on the first restart: %+v", rs)
+	}
+	if _, err := os.Stat(fx.cfg.StopPath("reviewer")); !os.IsNotExist(err) {
+		t.Fatalf("a sentinel was written for a halt the operator had already resumed (err=%v)", err)
+	}
+}
+
+// A control-plane halt (haltNow) whose sentinel write fails records the
+// failure explicitly, so the next start cannot mistake it for a halt that
+// predates the field and resume on its own (#37).
+func TestControlPlaneHaltRecordsAFailedSentinelWriteExplicitly(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	stop := fx.cfg.StopPath("reviewer")
+	r := &fakeRunner{act: func(_ int, tr supervise.Turn) supervise.TurnResult {
+		for _, trig := range tr.Triggers {
+			os.Remove(trig.Path)
+		}
+		lockInbox(t, fx)          // consumed, then the retry marker cannot be written: haltNow
+		_ = os.Mkdir(stop, 0o755) // and the sentinel write fails too
+		return supervise.TurnResult{ExitCode: 1}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted", err)
+	}
+	rs := fx.roleState(t)
+	if !rs.Halted || rs.SentinelWritten == nil || *rs.SentinelWritten {
+		t.Fatalf("a failed sentinel write must be recorded as false, not left absent: %+v", rs)
 	}
 }

@@ -110,12 +110,16 @@ type RoleState struct {
 	Halted     bool      `json:"halted"`
 	HaltReason string    `json:"halt_reason,omitempty"`
 	HaltedAt   time.Time `json:"halted_at,omitempty"`
-	// SentinelWritten records that the halt's stop sentinel was persisted.
-	// The reset is the removal of a sentinel that was written; a halt whose
-	// sentinel write failed has nothing an operator could have removed, so
-	// a restart re-persists it and refuses rather than reading the missing
-	// file as an acknowledgement (#32 review).
-	SentinelWritten bool `json:"sentinel_written,omitempty"`
+	// SentinelWritten records whether the halt's stop sentinel was
+	// persisted. The reset is the removal of a sentinel that was written; a
+	// halt whose sentinel write failed has nothing an operator could have
+	// removed, so a restart re-persists it and refuses rather than reading
+	// the missing file as an acknowledgement (#32 review). Three states,
+	// deliberately: false is recorded with the halt and true after the
+	// write, so nil means the halt was recorded by a binary that predates
+	// the field. Nil is unknown, not "never written": a removed sentinel
+	// is honoured as the reset (#37).
+	SentinelWritten *bool `json:"sentinel_written,omitempty"`
 	// LeftoverTurns counts turns that recorded progress but left processes
 	// behind after the leader exited. The strays are killed and verified
 	// gone; the turn stands (#33). The count is the hygiene signal an
@@ -127,6 +131,9 @@ type RoleState struct {
 	// nothing cleared kept health and status red after the role recovered.
 	LastHalt *Halt `json:"last_halt,omitempty"`
 }
+
+// Bool is a pointer to b, for the tri-state fields.
+func Bool(b bool) *bool { return &b }
 
 // Halt is a cleared halt, kept for the record.
 type Halt struct {
