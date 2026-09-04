@@ -61,6 +61,10 @@ type TurnResult struct {
 // and the leak is counted as hygiene, not failure (#33).
 const ExitLeftover = 1001
 
+// ExitBeforeTurnFailed is recorded for a turn whose before-turn step failed;
+// the agent never ran.
+const ExitBeforeTurnFailed = 1002
+
 // ExitAfterTurnFailed is the exit code recorded for a turn whose agent
 // exited zero but whose after-turn step failed. It is outside any code a
 // process can return, so it is never mistaken for the agent's own.
@@ -101,6 +105,15 @@ type Options struct {
 	// rather than hanging one.
 	MaxTurns int
 
+	// BeforeTurn runs before the turn's command is started, with the turn
+	// and its triggers. It is how the producer's workdir is brought to the
+	// target branch when no change is in flight (#35). An error from it is
+	// a failed turn: the command does not run, the triggers stay pending,
+	// and it counts on the fail streak -- a factory whose workdir cannot be
+	// refreshed is stalled, and a turn over a stale tree is the silent case
+	// this exists to prevent. The returned string is logged.
+	BeforeTurn func(ctx context.Context, t Turn) (string, error)
+
 	// AfterTurn runs after a turn that exited zero and was not interrupted,
 	// before progress and consumption are judged. It is how SUBMIT follows
 	// the producer's turn in the §3 loop: the turn declares intent in files
@@ -114,7 +127,8 @@ type Options struct {
 
 // Supervisor is one role's loop.
 type Supervisor struct {
-	afterTurn func(ctx context.Context, t Turn, res TurnResult) (string, error)
+	beforeTurn func(ctx context.Context, t Turn) (string, error)
+	afterTurn  func(ctx context.Context, t Turn, res TurnResult) (string, error)
 	cfg       *config.Config
 	role      string
 	runner    Runner
@@ -171,7 +185,8 @@ func New(opts Options) (*Supervisor, error) {
 	}
 
 	s := &Supervisor{
-		afterTurn: opts.AfterTurn,
+		beforeTurn: opts.BeforeTurn,
+		afterTurn:  opts.AfterTurn,
 		cfg:       opts.Config,
 		role:      opts.Role,
 		runner:    opts.Runner,

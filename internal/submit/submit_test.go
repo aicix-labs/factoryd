@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"errors"
+	"github.com/aicix-labs/factoryd/internal/state"
 	"io"
 	"os"
 	"os/exec"
@@ -287,6 +288,12 @@ func TestSubmitOpensADraftAndSignals(t *testing.T) {
 	}
 	if r.Branch != want {
 		t.Fatalf("result branch = %s, want %s", r.Branch, want)
+	}
+	// The submission is on record for the refresh step (#35): without it a
+	// draft in flight looks like nothing in flight and the next turn's
+	// refresh discards the tree the producer is iterating on.
+	if st, err := state.Load(l.cfg.StatePath(), l.cfg.Name); err != nil || st.LastSubmit == nil || st.LastSubmit.ChangeID != "42" || st.LastSubmit.Branch != want || st.LastSubmit.At.IsZero() {
+		t.Fatalf("last_submit not recorded: %+v %v", st, err)
 	}
 	if l.drv.opened == nil || l.drv.opened.Title != "gate: match command position" || l.drv.opened.TargetBranch != "main" {
 		t.Fatalf("draft spec = %+v", l.drv.opened)

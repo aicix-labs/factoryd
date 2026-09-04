@@ -93,6 +93,25 @@ operator ──brief──▶ ┌───────────┐
                           └──▶ back to PRODUCER (supervisor relaunches)
 ```
 
+**REFRESH precedes a producer turn** (#35). The producer's workdir is a clone
+that nothing else brings forward: the producer holds no provider credential and
+may run without network, and factoryd never runs git in a directory the producer
+can write (§4.4). So before a producer turn, when no change of the producer's is
+in flight (`last_submit` with no `merged` verdict in `last_verdict`), the
+supervisor fetches the target branch into its own clone, writes a git bundle
+under `<root>/refresh/` where the producer can read it, and starts this binary's
+`_refresh` verb *as the producer*, in the producer's repository, which fetches
+from the bundle and makes the tree exactly that commit: branch pointed, reset
+hard, and cleaned of everything untracked or ignored — a stale
+`.producer-branch` would be a resubmission. The result is verified by sha, not
+by the helper's exit. A change in flight is logged and left alone; a refresh
+that fails is a failed turn on the streak, and the agent does not run over a
+tree the step could not prepare: the stale case looks like a model ignoring its
+brief, and the state that explains it is the one place nobody looks.
+`factoryd refresh --config <f>` is the same step by hand; it refuses while a
+change is in flight unless `--force`d. Anything the producer wants to keep
+across cycles belongs under the cache root, not in the tree.
+
 Both agent roles are **one-shot turns**. Neither polls, waits, or loops. The
 supervisors own all continuity. This is the single most important change from v1,
 where each agent was told to "run forever" and reliably did not.

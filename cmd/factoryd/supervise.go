@@ -47,6 +47,12 @@ func runSupervise(args []string) int {
 		},
 		Log:      log,
 		MaxTurns: *maxTurns,
+		BeforeTurn: func() func(context.Context, supervise.Turn) (string, error) {
+			if *role == "producer" {
+				return producerBeforeTurn(cfg)
+			}
+			return nil
+		}(),
 		AfterTurn: func() func(context.Context, supervise.Turn, supervise.TurnResult) (string, error) {
 			if *role == "producer" {
 				return producerAfterTurn(cfg)

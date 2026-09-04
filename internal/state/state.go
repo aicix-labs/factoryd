@@ -137,6 +137,13 @@ type RoleState struct {
 // Bool is a pointer to b, for the tri-state fields.
 func Bool(b bool) *bool { return &b }
 
+// Submit is a draft submit opened, for the record.
+type Submit struct {
+	ChangeID string    `json:"change_id"`
+	Branch   string    `json:"branch"`
+	At       time.Time `json:"at"`
+}
+
 // Halt is a cleared halt, kept for the record.
 type Halt struct {
 	Reason    string    `json:"reason"`
@@ -281,6 +288,11 @@ type State struct {
 
 	// LastVerdict is the most recent verdict recorded, whatever it was.
 	LastVerdict *Verdict `json:"last_verdict,omitempty"`
+	// LastSubmit is the most recent draft submit opened. With LastVerdict
+	// it says whether the producer has a change in flight: a submission
+	// with no merged verdict yet is one, and the workdir is not refreshed
+	// under it (#35).
+	LastSubmit *Submit `json:"last_submit,omitempty"`
 
 	// Health is the cadence record of the health tick: for each standing
 	// condition, when it was first seen and last alerted. It lives here, under

@@ -127,6 +127,15 @@ the branch family by prefix.
 
 ### Operating notes from the runs
 
+- **The producer's workdir is refreshed before a turn** (#35). The second
+  production cycle found the clone one merge behind with cycle 1's script
+  still untracked; the brief described the merged tree, the producer saw an
+  older one, declared nothing five times, and halted — every signal right,
+  the workdir simply not the thing the brief described. The supervisor now
+  brings it to the target branch before a producer turn with no change in
+  flight (SPEC §3, REFRESH), and `factoryd refresh` does it by hand. The
+  clean is total: caches the model wants to keep belong under the cache root.
+
 - **The verdict now names the family to re-declare** (#29). A fix is never an
   in-place update: it is a new immutable branch that *supersedes* the old draft
   only when declared under the same family name. The first production cycle

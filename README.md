@@ -55,6 +55,11 @@ and the gate never marks a draft ready.
 
 ## What works today
 
+The producer's workdir is refreshed to the target branch before a turn when no
+change is in flight, by a helper running as the producer from a bundle factoryd
+wrote (`factoryd refresh --config <f>` by hand, `--force` under a change in
+flight). Nothing else brings a credential-less, network-less producer forward.
+
 ```console
 $ factoryd doctor --config examples/factory.github.json
 ok    config                       widgets, provider github, target branch main

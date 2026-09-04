@@ -442,6 +442,15 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	for _, f := range []string{BranchFile, CommitMsgFile} {
 		_ = os.Remove(filepath.Join(work, f))
 	}
+	// The submission is recorded where the refresh step can see it: a
+	// submission with no merged verdict yet is a change in flight, and the
+	// workdir is not refreshed under it (#35).
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		st.LastSubmit = &state.Submit{ChangeID: string(change.ID), Branch: branch, At: time.Now()}
+		return nil
+	}); err != nil {
+		return Result{}, wrap(ExitConfig, err, "recording the submission in state")
+	}
 	return Result{Exit: ExitSubmitted, Reason: "submitted", Change: &change, Branch: branch, Supersedes: supersedes}, nil
 }
 

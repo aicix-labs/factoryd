@@ -57,12 +57,13 @@ func (f *fakeRunner) count() int {
 }
 
 type fixture struct {
-	afterTurn func(ctx context.Context, t supervise.Turn, res supervise.TurnResult) (string, error)
-	cfg       *config.Config
-	root      string
-	inbox     string
-	outbox    string
-	slept     []time.Duration
+	beforeTurn func(ctx context.Context, t supervise.Turn) (string, error)
+	afterTurn  func(ctx context.Context, t supervise.Turn, res supervise.TurnResult) (string, error)
+	cfg        *config.Config
+	root       string
+	inbox      string
+	outbox     string
+	slept      []time.Duration
 }
 
 func currentUser(t *testing.T) string {
@@ -161,8 +162,9 @@ func (fx *fixture) newSupervisor(t *testing.T, r supervise.Runner, maxTurns int)
 			fx.slept = append(fx.slept, d)
 			return ctx.Err()
 		},
-		MaxTurns:  maxTurns,
-		AfterTurn: fx.afterTurn,
+		MaxTurns:   maxTurns,
+		BeforeTurn: fx.beforeTurn,
+		AfterTurn:  fx.afterTurn,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1412,5 +1414,56 @@ func TestControlPlaneHaltRecordsAFailedSentinelWriteExplicitly(t *testing.T) {
 	rs := fx.roleState(t)
 	if !rs.Halted || rs.SentinelWritten == nil || *rs.SentinelWritten {
 		t.Fatalf("a failed sentinel write must be recorded as false, not left absent: %+v", rs)
+	}
+}
+
+// The before-turn step is how the producer's workdir is refreshed (#35). It
+// runs before the command, with the turn; a failure is a failed turn on the
+// streak with the command never run and the trigger left pending, because
+// a turn over a tree the step could not prepare is the silent case.
+func TestBeforeTurnRunsFirstAndItsFailureIsAFailedTurnWithoutRunningTheAgent(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	var seq []string
+	fx.beforeTurn = func(_ context.Context, tn supervise.Turn) (string, error) {
+		seq = append(seq, "before:"+tn.Triggers[0].Label)
+		return "refreshed", nil
+	}
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		seq = append(seq, "turn")
+		fx.progress(t)
+		return supervise.TurnResult{}
+	}}
+	s := fx.newSupervisor(t, r, 1)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run: %v", err)
+	}
+	if got := strings.Join(seq, ","); got != "before:wake,turn" {
+		t.Fatalf("sequence %s", got)
+	}
+	s.Close()
+
+	// Now the step fails.
+	fx2 := newFixture(t)
+	fx2.wake(t)
+	fx2.beforeTurn = func(context.Context, supervise.Turn) (string, error) {
+		return "", errors.New("refresh: workdir is at abc, not def")
+	}
+	r2 := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		t.Error("the agent ran over an unprepared tree")
+		return supervise.TurnResult{}
+	}}
+	s2 := fx2.newSupervisor(t, r2, 50)
+	if err := s2.Run(ctx); !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted: before-turn failures did not count on the streak", err)
+	}
+	rs := fx2.roleState(t)
+	if rs.LastTurn == nil || rs.LastTurn.ExitCode == nil || *rs.LastTurn.ExitCode != supervise.ExitBeforeTurnFailed {
+		t.Fatalf("last turn %+v, want exit %d", rs.LastTurn, supervise.ExitBeforeTurnFailed)
+	}
+	if _, err := os.Stat(filepath.Join(fx2.inbox, "wake")); err != nil {
+		t.Fatalf("the trigger was consumed by a turn that never ran: %v", err)
 	}
 }
