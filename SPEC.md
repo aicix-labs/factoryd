@@ -299,6 +299,17 @@ incomplete response it should refuse.
 Exit codes are part of the contract: `0` submitted · `4` nothing to submit ·
 `5` gate failed · `3` configuration/identity failure.
 
+**The producer's sandbox is the supervisor's, not the agent's.**
+`roles.producer.sandbox.no_network` starts the turn in a new, empty network
+namespace, created by factoryd as root at clone before the identity switch; a
+factoryd that cannot create it refuses to start the turn rather than starting it
+connected. `doctor` proves it from inside: a listener doctor opens must be
+unreachable from the sandboxed probe and reachable from the unsandboxed one.
+SUBMIT is the producer supervisor's **after-turn step**: after a turn that
+exited clean and declared intent, the supervisor runs submit outside the sandbox
+as itself; a submit that fails on configuration or identity counts on the fail
+streak like a turn that exited non-zero.
+
 **The producer credential governs the git transport, not only the API.** The
 contract and its verification oracle are in §5.4; this is why it exists, and it
 is stated separately because it is the half an implementer will miss: `fetch` and
@@ -803,6 +814,13 @@ channel that always works when both roles share a host.
 | `outbox/answer.md` | reviewer → producer | reply to a question |
 | `outbox/<id>.json` | reviewer → producer | a verdict |
 | `inbox/producer-progress` | producer → supervisor | mtime = "I advanced" (§6.3) |
+
+Both directories are **the producer's to write**: it consumes its brief and
+records progress in the inbox, and consumes the verdicts and answers that arrive
+in the outbox. `doctor` probes both as the producer identity, because factoryd
+being able to write them says nothing — found in the acceptance run, where a
+root-owned inbox made every clean producer turn read as "no progress" and a
+root-owned outbox left every verdict unconsumed.
 
 The **question channel** is a v2 addition. v1 defined signalling only for the push
 path, so an agent blocked *before* having something to push had no way to reach its

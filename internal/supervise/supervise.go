@@ -40,6 +40,11 @@ type TurnResult struct {
 	TimedOut bool
 }
 
+// ExitAfterTurnFailed is the exit code recorded for a turn whose agent
+// exited zero but whose after-turn step failed. It is outside any code a
+// process can return, so it is never mistaken for the agent's own.
+const ExitAfterTurnFailed = 1000
+
 // Runner executes one turn. started is called with a handle to the turn's
 // process as soon as there is one, so the supervisor can record it in state and
 // the status page can show a real process tree.
@@ -74,17 +79,28 @@ type Options struct {
 	// wants; tests set it so a loop that never terminates fails as a test
 	// rather than hanging one.
 	MaxTurns int
+
+	// AfterTurn runs after a turn that exited zero and was not interrupted,
+	// before progress and consumption are judged. It is how SUBMIT follows
+	// the producer's turn in the §3 loop: the turn declares intent in files
+	// and exits; the supervisor, outside the sandbox and as itself, does
+	// the git and network work. An error from it is a failed turn -- it
+	// counts on the fail streak like an agent that exited non-zero, because
+	// a factory whose submit keeps failing is stalled exactly the same way.
+	// The returned string is logged.
+	AfterTurn func(ctx context.Context, t Turn, res TurnResult) (string, error)
 }
 
 // Supervisor is one role's loop.
 type Supervisor struct {
-	cfg     *config.Config
-	role    string
-	runner  Runner
-	log     *slog.Logger
-	now     func() time.Time
-	sleep   func(context.Context, time.Duration) error
-	maxTurn int
+	afterTurn func(ctx context.Context, t Turn, res TurnResult) (string, error)
+	cfg       *config.Config
+	role      string
+	runner    Runner
+	log       *slog.Logger
+	now       func() time.Time
+	sleep     func(context.Context, time.Duration) error
+	maxTurn   int
 
 	watcher *watch.Watcher
 	turnSeq int
@@ -134,13 +150,14 @@ func New(opts Options) (*Supervisor, error) {
 	}
 
 	s := &Supervisor{
-		cfg:     opts.Config,
-		role:    opts.Role,
-		runner:  opts.Runner,
-		log:     opts.Log,
-		now:     opts.Now,
-		sleep:   opts.Sleep,
-		maxTurn: opts.MaxTurns,
+		afterTurn: opts.AfterTurn,
+		cfg:       opts.Config,
+		role:      opts.Role,
+		runner:    opts.Runner,
+		log:       opts.Log,
+		now:       opts.Now,
+		sleep:     opts.Sleep,
+		maxTurn:   opts.MaxTurns,
 	}
 	if s.log == nil {
 		s.log = slog.New(slog.NewTextHandler(os.Stderr, nil))

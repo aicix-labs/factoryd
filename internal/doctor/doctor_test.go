@@ -85,6 +85,12 @@ func healthyDeps(cfg *config.Config, listErr error) doctor.Deps {
 		// producer may write only its workdir; the gate may write the declared
 		// paths and nothing else, and may read no credential.
 		NewProber: func(ra *config.RunAs) (doctor.Prober, error) {
+			if ra != nil && ra.User == "inbox-locked" {
+				return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.OutboxDir(): true}}, nil
+			}
+			if ra != nil && ra.User == "outbox-locked" {
+				return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true}}, nil
+			}
 			if ra != nil && ra.User == "factoryd-gate" {
 				w := map[string]bool{}
 				for _, p := range cfg.Gate.RequiredWritablePaths {
@@ -94,7 +100,7 @@ func healthyDeps(cfg *config.Config, listErr error) doctor.Deps {
 				}
 				return fakeProber{name: "fake-gate (uid 4343)", writable: w}, nil
 			}
-			return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+			return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true, cfg.OutboxDir(): true}}, nil
 		},
 		GitIdentity: func(_ context.Context, _ *config.Config, _ scm.Driver, secret string) (string, error) {
 			return secret, nil // the fake driver's login IS the token
@@ -286,6 +292,23 @@ func TestIndividualFailuresAreCaught(t *testing.T) {
 				c.Paths.CacheRoot = filepath.Join(c.Paths.Root, "no-such-cache")
 			},
 			wantName: "cache root",
+		},
+		{
+			// factoryd can write the inbox (it made it); the producer cannot.
+			// Found in the acceptance run: every producer turn read as "no
+			// progress" while exiting clean.
+			name: "producer cannot write the inbox",
+			mutate: func(t *testing.T, c *config.Config) {
+				c.Roles.Producer.RunAs = &config.RunAs{User: "inbox-locked"}
+			},
+			wantName: "handoff inbox as producer",
+		},
+		{
+			name: "producer cannot write the outbox",
+			mutate: func(t *testing.T, c *config.Config) {
+				c.Roles.Producer.RunAs = &config.RunAs{User: "outbox-locked"}
+			},
+			wantName: "handoff outbox as producer",
 		},
 		{
 			name:     "no alert transport",
@@ -484,7 +507,7 @@ func TestBoundaryTransportAndGateFailuresAreCaught(t *testing.T) {
 							filepath.Join(cfg.Paths.SubmitRepo, ".git"):      true,
 							filepath.Join(cfg.Paths.SubmitRepo, "build/out"): true}}, nil
 					}
-					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true, cfg.OutboxDir(): true}}, nil
 				}
 			},
 			wantName: "gate cannot touch .git", wantText: "plant a hook",
@@ -498,7 +521,7 @@ func TestBoundaryTransportAndGateFailuresAreCaught(t *testing.T) {
 							writable: map[string]bool{filepath.Join(cfg.Paths.SubmitRepo, "build/out"): true},
 							readable: map[string]bool{cfg.Credentials.Reviewer.File: true}}, nil
 					}
-					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true, cfg.OutboxDir(): true}}, nil
 				}
 			},
 			wantName: "gate cannot read reviewer credential", wantText: "two-party",
@@ -512,7 +535,7 @@ func TestBoundaryTransportAndGateFailuresAreCaught(t *testing.T) {
 					if ra.User == "factoryd-gate" {
 						return fakeProber{name: "gate", writable: map[string]bool{}}, nil
 					}
-					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true, cfg.OutboxDir(): true}}, nil
 				}
 			},
 			wantName: "gate can write build/out", wantText: "declared it needs",
@@ -563,7 +586,7 @@ func TestBoundaryTransportAndGateFailuresAreCaught(t *testing.T) {
 							writable: map[string]bool{filepath.Join(cfg.Paths.SubmitRepo, "build/out"): true}},
 							gitDir: git, calls: &calls}, nil
 					}
-					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true, cfg.OutboxDir(): true}}, nil
 				}
 			},
 			wantName: "gate cannot touch .git after provisioning", wantText: "once the declared paths exist",
@@ -579,7 +602,7 @@ func TestBoundaryTransportAndGateFailuresAreCaught(t *testing.T) {
 							writable: map[string]bool{filepath.Join(cfg.Paths.SubmitRepo, "build/out"): true},
 							rootOnly: map[string]bool{exe: true}}, nil
 					}
-					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true, cfg.OutboxDir(): true}}, nil
 				}
 			},
 			wantName: "gate can run its command", wantText: "doctor could",
@@ -613,7 +636,7 @@ func TestBoundaryTransportAndGateFailuresAreCaught(t *testing.T) {
 						return fakeProber{name: "gate", writable: map[string]bool{filepath.Join(cfg.Paths.SubmitRepo, "build/out"): true}}, nil
 					}
 					// writable: the DEFAULT workdir only, not the override
-					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true, cfg.OutboxDir(): true}}, nil
 				}
 			},
 			wantName: "producer can write its workdir", wantText: "every turn would fail",
@@ -632,7 +655,7 @@ func TestBoundaryTransportAndGateFailuresAreCaught(t *testing.T) {
 					case "factoryd-reviewer":
 						return fakeProber{name: "reviewer", writable: map[string]bool{cfg.Paths.Root: true}, rootOnly: map[string]bool{exe: true}}, nil
 					}
-					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+					return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true, cfg.OutboxDir(): true}}, nil
 				}
 			},
 			wantName: "reviewer can run its command", wantText: "doctor could",
@@ -753,7 +776,7 @@ func TestOrdinaryGatePathsAreAccepted(t *testing.T) {
 			return fakeProber{name: "gate", writable: map[string]bool{
 				filepath.Join(cfg.Paths.SubmitRepo, "build/out"): true, outside: true}}, nil
 		}
-		return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+		return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true, cfg.OutboxDir(): true}}, nil
 	}
 	r := doctor.RunWith(context.Background(), cfg, d)
 	if !r.OK() {
@@ -784,7 +807,7 @@ func TestSymlinkedSubmitRepoCannotSmuggleAGrantIntoDotGit(t *testing.T) {
 		if ra.User == "factoryd-gate" {
 			return &owningProber{fakeProber: fakeProber{name: "gate"}, owned: &owned}, nil
 		}
-		return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+		return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true, cfg.OutboxDir(): true}}, nil
 	}
 	r := doctor.RunWith(context.Background(), cfg, d)
 
@@ -827,7 +850,7 @@ func TestReviewerUnderItsOwnIdentityPasses(t *testing.T) {
 		case "factoryd-reviewer":
 			return fakeProber{name: "reviewer", writable: map[string]bool{cfg.Paths.Root: true}}, nil
 		}
-		return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+		return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true, cfg.OutboxDir(): true}}, nil
 	}
 	r := doctor.RunWith(context.Background(), cfg, d)
 	if !r.OK() {

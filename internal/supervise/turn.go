@@ -197,6 +197,18 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 		s.log.Error("turn could not run", "turn", turn.ID, "err", runErr)
 	}
 
+	// After a clean turn, the supervisor's own follow-up (submit, for the
+	// producer). Its failure is the turn's failure.
+	if runErr == nil && res.ExitCode == 0 && !res.TimedOut && s.afterTurn != nil {
+		msg, err := s.afterTurn(ctx, turn, res)
+		if err != nil {
+			s.log.Error("after-turn step failed; counting the turn as failed", "turn", turn.ID, "err", err)
+			res.ExitCode = ExitAfterTurnFailed
+		} else if msg != "" {
+			s.log.Info("after-turn step", "turn", turn.ID, "result", msg)
+		}
+	}
+
 	after := s.progressMTime()
 	remaining, err := s.watcher.Pending()
 	if err != nil {

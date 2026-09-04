@@ -8,7 +8,9 @@ package main
 
 import (
 	"fmt"
+	"net"
 	"os"
+	"time"
 )
 
 // Exit codes are part of the CLI contract.
@@ -84,6 +86,17 @@ func main() {
 		os.Exit(runHealth(args))
 	case "status":
 		os.Exit(runStatus(args))
+	case "_netprobe":
+		// Internal: doctor's sandbox probe. Exit 0 if addr is reachable.
+		if len(args) != 1 {
+			os.Exit(exitError)
+		}
+		c, err := net.DialTimeout("tcp", args[0], 3*time.Second)
+		if err != nil {
+			os.Exit(1)
+		}
+		c.Close()
+		os.Exit(exitOK)
 	case "signal":
 		os.Exit(runSignal(args))
 	case "audit":

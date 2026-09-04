@@ -3,6 +3,7 @@ package supervise_test
 import (
 	"bytes"
 	"context"
+	"errors"
 	"io"
 	"os"
 	"path/filepath"
@@ -309,5 +310,19 @@ func TestRunAsCredentialDropsSupplementaryGroups(t *testing.T) {
 	}
 	if len(cred.Groups) != 0 {
 		t.Fatalf("Groups = %v, want none", cred.Groups)
+	}
+}
+
+// A turn that asks for no_network must not start connected when factoryd
+// cannot create the namespace. Unprivileged, that is every test run.
+func TestNoNetworkRefusesToStartConnectedWithoutRoot(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root; the refusal path is for the unprivileged case")
+	}
+	f, r, _ := execFixture(t, []string{"true"}, 5)
+	f.cfg.Roles.Reviewer.Sandbox = &config.Sandbox{NoNetwork: true}
+	_, err := r.Run(context.Background(), supervise.Turn{ID: "t", Role: "reviewer"}, nil)
+	if err == nil || !errors.Is(err, supervise.ErrNoNetworkNeedsRoot) {
+		t.Fatalf("err=%v; the turn must not start without the sandbox it was promised", err)
 	}
 }

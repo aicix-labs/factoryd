@@ -65,6 +65,15 @@ func (r *ExecRunner) Run(ctx context.Context, t Turn, started func(proc.Ref)) (T
 	// takes its children too. A turn that spawns a build and times out would
 	// otherwise leave the build running and the next turn racing it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// The sandbox is applied by the supervisor at clone, before the identity
+	// switch: a new network namespace is root's to create, and the turn
+	// inherits an empty one it cannot leave. Without the privilege, the
+	// turn must not start connected instead.
+	if spec.Sandbox != nil && spec.Sandbox.NoNetwork {
+		if err := applyNoNetwork(cmd.SysProcAttr); err != nil {
+			return TurnResult{ExitCode: -1}, fmt.Errorf("exec: %s turn: sandbox.no_network: %w", r.Role, err)
+		}
+	}
 	// The producer runs as its own OS identity -- the same mechanism doctor's
 	// write probe uses, so what the probe verified is what the turn runs as.
 	// Without the privilege to switch, the turn must not start as factoryd

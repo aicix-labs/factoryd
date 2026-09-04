@@ -1,0 +1,103 @@
+{
+  "schema_version": 5,
+  "name": "widgets-acceptance",
+  "provider": "github",
+  "github": {
+    "owner": "acme",
+    "repo": "widgets"
+  },
+  "target_branch": "main",
+  "git": {
+    "remote": "https://github.com/acme/widgets.git",
+    "transport": "https"
+  },
+  "paths": {
+    "root": "/var/lib/factoryd/widgets",
+    "producer_workdir": "/var/lib/factoryd/widgets/work",
+    "submit_repo": "/var/lib/factoryd/widgets/submit",
+    "cache_root": "/var/cache/factoryd/widgets"
+  },
+  "credentials": {
+    "producer": {
+      "file": "/etc/factoryd/widgets/producer.token"
+    },
+    "reviewer": {
+      "file": "/etc/factoryd/widgets/reviewer.token"
+    }
+  },
+  "gate": {
+    "command": [
+      "true"
+    ],
+    "env": {
+      "PATH": "/usr/bin:/bin",
+      "HOME": "/var/lib/factoryd/widgets"
+    },
+    "required_writable_paths": [
+      "build/out"
+    ],
+    "run_as": {
+      "user": "factoryd-gate"
+    }
+  },
+  "roles": {
+    "producer": {
+      "command": [
+        "/usr/local/lib/factoryd/acceptance/producer-turn.sh"
+      ],
+      "env": {
+        "PATH": "/usr/bin:/bin"
+      },
+      "run_as": {
+        "user": "factoryd-producer"
+      },
+      "sandbox": {
+        "no_network": true
+      },
+      "timeout_seconds": 120
+    },
+    "reviewer": {
+      "command": [
+        "/usr/local/lib/factoryd/acceptance/reviewer-turn.sh"
+      ],
+      "env": {
+        "PATH": "/usr/bin:/bin",
+        "FACTORYD_CONFIG": "/etc/factoryd/widgets.json"
+      },
+      "timeout_seconds": 300
+    }
+  },
+  "alerts": [
+    {
+      "kind": "file",
+      "path": "/var/log/factoryd/widgets-alerts.log"
+    }
+  ],
+  "health": {
+    "alert_after": 2,
+    "repeat_seconds": 600,
+    "stale_trigger_seconds": 300,
+    "turn_grace_seconds": 60,
+    "disk_min_free_percent": 10,
+    "caches": [
+      {
+        "path": "/var/cache/factoryd/widgets/go",
+        "max_bytes": 5368709120
+      }
+    ]
+  },
+  "scope": {
+    "deny_regexes": [
+      "^ci/"
+    ],
+    "allow_regexes": [
+      "^ci/.*\\.md$"
+    ],
+    "hold_diff_regexes": [
+      "-----BEGIN [A-Z ]*PRIVATE KEY-----"
+    ],
+    "escalate_regexes": [
+      "(^|/)auth"
+    ]
+  }
+}

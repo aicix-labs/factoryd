@@ -11,6 +11,8 @@ import (
 	"fmt"
 	"github.com/aicix-labs/factoryd/internal/alert"
 	"github.com/aicix-labs/factoryd/internal/health"
+	"github.com/aicix-labs/factoryd/internal/supervise"
+	"net"
 	"os"
 	"path/filepath"
 	"strings"
@@ -93,6 +95,9 @@ type Deps struct {
 	GitIdentity func(ctx context.Context, cfg *config.Config, d scm.Driver, secret string) (string, error)
 	// GitGuard runs the transport's pre-operation guard on submit_repo.
 	GitGuard func(cfg *config.Config, d scm.Driver, secret string) error
+	// Reach probes whether a turn of spec can reach addr, sandboxed or not.
+	// Nil uses the real runner with this binary's own _netprobe verb.
+	Reach func(ctx context.Context, spec config.RoleSpec, addr string, sandboxed bool) (bool, error)
 }
 
 // Run performs every check with the real dependencies.
@@ -114,6 +119,9 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 	}
 	if deps.GitGuard == nil {
 		deps.GitGuard = realGitGuard
+	}
+	if deps.Reach == nil {
+		deps.Reach = realReach
 	}
 	var r Report
 	add := func(name string, err error, detail string) {
@@ -158,6 +166,28 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 		// roles.producer.workdir may override paths.producer_workdir, and a
 		// green against the default says nothing about the override.
 		producerDir := cfg.TurnWorkdir("producer")
+		// The inbox is the producer's to write: it consumes its brief there
+		// and records progress there (§6.2, §6.3). Probed as the producer,
+		// because factoryd being able to write it says nothing -- found in
+		// the acceptance run, where a root-owned inbox made every producer
+		// turn read as "no progress" while the turn itself exited clean.
+		// Both handoff directories are the producer's to write: it consumes
+		// its brief and records progress in the inbox, and consumes the
+		// verdicts and answers that arrive in the outbox. Probed as the
+		// producer, because factoryd being able to write them says nothing.
+		// Found in the acceptance run twice: a root-owned inbox made every
+		// producer turn read as "no progress" while exiting clean, and a
+		// root-owned outbox left every verdict unconsumed.
+		for _, d := range []string{cfg.InboxDir(), cfg.OutboxDir()} {
+			name := "handoff " + filepath.Base(d) + " as producer"
+			if can, err := prober.CanWrite(ctx, d); err != nil {
+				add(name, fmt.Errorf("undecided: %v", err), d)
+			} else if !can {
+				add(name, fmt.Errorf("%s cannot write %s; it could not consume what arrives there, and a trigger that is never consumed re-runs the turn forever", prober.Describe(), d), d)
+			} else {
+				add(name, nil, prober.Describe()+" can write "+d)
+			}
+		}
 		canSubmit, err1 := prober.CanWrite(ctx, cfg.Paths.SubmitRepo)
 		canWork, err2 := prober.CanWrite(ctx, producerDir)
 		switch {
@@ -334,6 +364,15 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 	// --- role turns ---
 	for _, role := range []string{"producer", "reviewer"} {
 		spec, _ := cfg.RoleSpec(role)
+		if spec.Sandbox != nil && spec.Sandbox.NoNetwork {
+			// Proved from inside, against a listener doctor itself opens:
+			// sandboxed, the turn must NOT reach it; unsandboxed, the same
+			// probe MUST -- otherwise "cannot reach" is a broken probe, not a
+			// sandbox. A factoryd without the privilege to create the
+			// namespace fails here, because the turn would otherwise start
+			// connected and nothing would say so.
+			add("sandbox "+role, checkNoNetwork(ctx, deps.Reach, spec), "no_network: the turn cannot reach a listener on this host")
+		}
 		add("turn "+role, checkCommand(spec.Env["PATH"], spec.Command, "roles."+role+".command",
 			"the supervisor would have no turn to run"), strings.Join(spec.Command, " "))
 		add("workdir "+role, checkWritableDir(cfg.TurnWorkdir(role)), cfg.TurnWorkdir(role))
@@ -658,4 +697,45 @@ func checkCacheRoot(dir string) error {
 		return err
 	}
 	return cr.Close()
+}
+
+func checkNoNetwork(ctx context.Context, reach func(context.Context, config.RoleSpec, string, bool) (bool, error), spec config.RoleSpec) error {
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		return fmt.Errorf("could not open a probe listener: %w", err)
+	}
+	defer ln.Close()
+	go func() {
+		for {
+			c, err := ln.Accept()
+			if err != nil {
+				return
+			}
+			c.Close()
+		}
+	}()
+	addr := ln.Addr().String()
+	open, err := reach(ctx, spec, addr, false)
+	if err != nil {
+		return fmt.Errorf("control probe did not run: %w", err)
+	}
+	if !open {
+		return fmt.Errorf("the unsandboxed control probe could not reach %s; the probe is broken, so nothing here is proved", addr)
+	}
+	closed, err := reach(ctx, spec, addr, true)
+	if err != nil {
+		return fmt.Errorf("sandbox cannot be applied: %w", err)
+	}
+	if closed {
+		return fmt.Errorf("the sandboxed turn reached %s; no_network is not holding", addr)
+	}
+	return nil
+}
+
+func realReach(ctx context.Context, spec config.RoleSpec, addr string, sandboxed bool) (bool, error) {
+	exe, err := os.Executable()
+	if err != nil {
+		return false, err
+	}
+	return supervise.ProbeReach(ctx, spec, exe, addr, sandboxed)
 }

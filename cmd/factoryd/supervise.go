@@ -47,6 +47,12 @@ func runSupervise(args []string) int {
 		},
 		Log:      log,
 		MaxTurns: *maxTurns,
+		AfterTurn: func() func(context.Context, supervise.Turn, supervise.TurnResult) (string, error) {
+			if *role == "producer" {
+				return producerAfterTurn(cfg)
+			}
+			return nil
+		}(),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "factoryd supervise: %v\n", err)
