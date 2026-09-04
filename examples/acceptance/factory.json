@@ -34,7 +34,8 @@
     "env": {
       "PATH": "/usr/local/go/bin:/usr/bin:/bin",
       "HOME": "/var/lib/factoryd/widgets",
-      "GOCACHE": "/var/cache/factoryd/widgets/go"
+      "GOCACHE": "/var/cache/factoryd/widgets/go",
+      "GOFLAGS": "-count=1 -buildvcs=false"
     },
     "required_writable_paths": [
       "${GOCACHE}"
@@ -64,8 +65,7 @@
         "/usr/local/lib/factoryd/acceptance/reviewer-turn.sh"
       ],
       "env": {
-        "PATH": "/usr/bin:/bin",
-        "FACTORYD_CONFIG": "/etc/factoryd/widgets.json"
+        "PATH": "/usr/bin:/bin"
       },
       "timeout_seconds": 300
     }
