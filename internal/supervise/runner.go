@@ -66,6 +66,23 @@ func (r *ExecRunner) Run(ctx context.Context, t Turn, started func(proc.Ref)) (T
 	// takes its children too. A turn that spawns a build and times out would
 	// otherwise leave the build running and the next turn racing it.
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
+	// Containment. Privileged factoryd puts the turn in its own cgroup at
+	// clone; a process group cannot hold a child that calls setsid, a
+	// cgroup can, and cgroup.kill with a verified-empty read is the kill-all
+	// the crossing that follows the turn is entitled to. Privileged but
+	// unable to create one: refuse, never fall back silently.
+	var cg *turnCgroup
+	containment := "process-group"
+	if os.Geteuid() == 0 {
+		var err error
+		cg, err = newTurnCgroup(r.Config.Name, r.Role, t.ID)
+		if err != nil {
+			return TurnResult{ExitCode: -1}, fmt.Errorf("exec: %s turn: %w", r.Role, err)
+		}
+		defer cg.close()
+		cg.attr(cmd.SysProcAttr)
+		containment = "cgroup"
+	}
 	// The sandbox is applied by the supervisor at clone, before the identity
 	// switch: a new network namespace is root's to create, and the turn
 	// inherits an empty one it cannot leave. Without the privilege, the
@@ -121,7 +138,7 @@ func (r *ExecRunner) Run(ctx context.Context, t Turn, started func(proc.Ref)) (T
 	}
 
 	err := cmd.Wait()
-	res := TurnResult{ExitCode: cmd.ProcessState.ExitCode()}
+	res := TurnResult{ExitCode: cmd.ProcessState.ExitCode(), Containment: containment}
 	// The leader is gone; is the group? A clean exit with a child still
 	// running is not a quiescent producer. Children holding the leader's
 	// stdio past the wait delay are that same child seen from the pipes:
@@ -131,6 +148,19 @@ func (r *ExecRunner) Run(ctx context.Context, t Turn, started func(proc.Ref)) (T
 	}
 	if survivors := reapGroup(cmd.Process.Pid); survivors {
 		res.Leftover = true
+	}
+	if cg != nil {
+		// Whatever the group said, the cgroup is the authority: anything
+		// left in it, in any session, is killed and verified gone before
+		// this returns. A cgroup that will not empty is a runner error --
+		// nothing may follow a turn whose processes are still alive.
+		n, kerr := cg.killAll()
+		if kerr != nil {
+			return res, fmt.Errorf("exec: %s turn: containment: %w", r.Role, kerr)
+		}
+		if n > 0 {
+			res.Leftover = true
+		}
 	}
 	// A deadline that fired is not the same as an agent that failed, even
 	// though both surface as a non-zero exit.

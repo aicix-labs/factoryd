@@ -84,6 +84,7 @@ func healthyDeps(cfg *config.Config, listErr error) doctor.Deps {
 		// One fake serves both principals, keyed on the run_as user: the
 		// producer may write only its workdir; the gate may write the declared
 		// paths and nothing else, and may read no credential.
+		Contain: func() error { return nil },
 		NewProber: func(ra *config.RunAs) (doctor.Prober, error) {
 			if ra != nil && ra.User == "reads-reviewer-token" {
 				return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true, cfg.OutboxDir(): true},
@@ -247,6 +248,7 @@ func TestIndividualFailuresAreCaught(t *testing.T) {
 		name     string
 		mutate   func(t *testing.T, cfg *config.Config)
 		listErr  error
+		contain  error
 		wantName string
 	}{
 		{
@@ -345,6 +347,12 @@ func TestIndividualFailuresAreCaught(t *testing.T) {
 			wantName: "handoff outbox as producer",
 		},
 		{
+			name:     "turns cannot be contained",
+			mutate:   func(t *testing.T, c *config.Config) {},
+			contain:  errors.New("no cgroup v2"),
+			wantName: "containment",
+		},
+		{
 			name:     "no alert transport",
 			mutate:   func(t *testing.T, c *config.Config) { c.Alerts = nil },
 			wantName: "alert transports",
@@ -410,7 +418,11 @@ func TestIndividualFailuresAreCaught(t *testing.T) {
 		t.Run(c.name, func(t *testing.T) {
 			cfg := fixture(t)
 			c.mutate(t, cfg)
-			r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, c.listErr))
+			deps := healthyDeps(cfg, c.listErr)
+			if c.contain != nil {
+				deps.Contain = func() error { return c.contain }
+			}
+			r := doctor.RunWith(context.Background(), cfg, deps)
 			if r.OK() {
 				t.Fatalf("doctor passed:\n%s", r)
 			}

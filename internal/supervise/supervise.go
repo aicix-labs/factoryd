@@ -47,6 +47,11 @@ type TurnResult struct {
 	// mediated crossing does not rely on it (§4.4: every read is no-follow,
 	// judged on the opened descriptor).
 	Leftover bool
+	// Containment names what held the turn's processes: "cgroup" (every
+	// descendant, however it re-parented, killed and verified gone) or
+	// "process-group" (unprivileged fallback: a setsid'd child escapes it).
+	// It is said so that the weaker one is never mistaken for the stronger.
+	Containment string
 }
 
 // ExitLeftover is recorded for a turn whose leader exited zero but left
