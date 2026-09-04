@@ -461,41 +461,51 @@ func nearestExisting(p string) string {
 	}
 }
 
+// afterOpenCacheRoot is a test seam, nil in production.
+var afterOpenCacheRoot func()
+
 // reclaimCaches bounds each declared cache: while it exceeds max_bytes, its
-// oldest top-level entry (by mtime) is removed. What was removed is
-// reported, and a cache still over its bound after reclamation -- one
-// enormous entry -- is a finding.
+// oldest top-level entry (by newest file mtime) is removed. What was
+// removed is reported, and a cache still over its bound after reclamation
+// -- one enormous entry -- is a finding.
+//
+// Every operation goes through the opened, verified cache root (CacheRoot):
+// relative, refusing to follow a symlink out. No absolute path is used
+// after the open, so nothing an untrusted writer does to the path -- a
+// symlink at the cache, at the root, or at the root's renamed parent --
+// changes what is deleted. A root that cannot be opened and verified is a
+// finding under which nothing is reclaimed.
 func reclaimCaches(cfg *config.Config, at time.Time, log io.Writer) ([]CacheReport, []Finding) {
 	var reps []CacheReport
 	var findings []Finding
-	// The cache root is resolved physically once per tick. A cache path or
-	// an entry that resolves outside it -- a symlink planted since load, or
-	// a bind mount -- is a finding and nothing under it is touched. Lexical
-	// containment was checked at load; this is the check at the moment of
-	// use, which is the only moment that counts for a deletion.
-	root, rootErr := physical(cfg.Paths.CacheRoot)
+	if len(cfg.Health.Caches) == 0 {
+		return nil, nil
+	}
+	cr, rootErr := OpenCacheRoot(cfg.Paths.CacheRoot)
+	if rootErr == nil {
+		defer cr.Close()
+	}
+	if afterOpenCacheRoot != nil {
+		// Test seam: the world moves after the root is bound and before
+		// anything is deleted. What is deleted must follow the handle.
+		afterOpenCacheRoot()
+	}
 	for _, c := range cfg.Health.Caches {
 		r := CacheReport{Path: c.Path, MaxBytes: c.MaxBytes}
 		if rootErr != nil {
-			r.Err = "cache root: " + rootErr.Error()
+			r.Err = rootErr.Error()
 			reps = append(reps, r)
-			findings = append(findings, Finding{Key: "cache_unsafe/" + c.Path, Summary: "cache root " + cfg.Paths.CacheRoot + " cannot be resolved; nothing reclaimed", Detail: rootErr.Error()})
+			findings = append(findings, Finding{Key: "cache_unsafe/" + c.Path, Summary: "the cache root cannot be opened and verified; nothing reclaimed", Detail: rootErr.Error()})
 			continue
 		}
-		cp, err := physical(c.Path)
-		if err != nil && !errors.Is(err, os.ErrNotExist) {
+		rel, err := cr.Rel(c.Path)
+		if err != nil {
 			r.Err = err.Error()
 			reps = append(reps, r)
-			findings = append(findings, Finding{Key: "cache_unsafe/" + c.Path, Summary: "cache " + c.Path + " cannot be resolved; nothing reclaimed", Detail: err.Error()})
+			findings = append(findings, Finding{Key: "cache_unsafe/" + c.Path, Summary: "cache is not inside the cache root; nothing reclaimed", Detail: err.Error()})
 			continue
 		}
-		if err == nil && !config.PathWithin(cp, root) {
-			r.Err = fmt.Sprintf("resolves to %s, outside the cache root %s", cp, root)
-			reps = append(reps, r)
-			findings = append(findings, Finding{Key: "cache_unsafe/" + c.Path, Summary: "cache " + c.Path + " resolves outside the cache root; nothing reclaimed", Detail: r.Err})
-			continue
-		}
-		entries, err := cacheEntries(c.Path)
+		entries, err := cr.entries(rel)
 		if err != nil {
 			if errors.Is(err, os.ErrNotExist) {
 				reps = append(reps, r)
@@ -503,7 +513,7 @@ func reclaimCaches(cfg *config.Config, at time.Time, log io.Writer) ([]CacheRepo
 			}
 			r.Err = err.Error()
 			reps = append(reps, r)
-			findings = append(findings, Finding{Key: "cache_unreadable/" + c.Path, Summary: "cache " + c.Path + " could not be measured", Detail: err.Error()})
+			findings = append(findings, Finding{Key: "cache_unsafe/" + c.Path, Summary: "cache " + c.Path + " could not be read inside the root; nothing reclaimed", Detail: err.Error()})
 			continue
 		}
 		var total int64
@@ -520,29 +530,22 @@ func reclaimCaches(cfg *config.Config, at time.Time, log io.Writer) ([]CacheRepo
 			if r.Bytes <= c.MaxBytes || i == len(entries)-1 {
 				break
 			}
+			var err error
 			if e.link {
-				// A symlink entry is removed as a link. It is never followed:
-				// its target is not the cache's to reclaim.
-				if err := os.Remove(e.path); err != nil {
-					r.Err = fmt.Sprintf("removing link %s: %v", e.path, err)
-					break
-				}
+				// A symlink entry is removed as a link, never followed.
+				err = cr.root.Remove(e.rel)
 			} else {
-				ep, err := physical(e.path)
-				if err != nil || !config.PathWithin(ep, cp) {
-					r.Err = fmt.Sprintf("entry %s resolves outside the cache (%s); nothing further reclaimed", e.path, ep)
-					findings = append(findings, Finding{Key: "cache_unsafe/" + c.Path, Summary: "an entry of " + c.Path + " resolves outside it; reclamation stopped", Detail: r.Err})
-					break
-				}
-				if err := os.RemoveAll(e.path); err != nil {
-					r.Err = fmt.Sprintf("removing %s: %v", e.path, err)
-					break
-				}
+				err = cr.root.RemoveAll(e.rel)
+			}
+			if err != nil {
+				r.Err = fmt.Sprintf("removing %s: %v", e.rel, err)
+				findings = append(findings, Finding{Key: "cache_unsafe/" + c.Path, Summary: "reclamation of " + c.Path + " stopped", Detail: r.Err})
+				break
 			}
 			r.Bytes -= e.bytes
 			r.ReclaimedBytes += e.bytes
 			r.ReclaimedCount++
-			fmt.Fprintf(log, "cache %s: reclaimed %s (%s, last modified %s)\n", c.Path, e.path, human(uint64(e.bytes)), e.mtime.Format(time.RFC3339))
+			fmt.Fprintf(log, "cache %s: reclaimed %s (%s, last modified %s)\n", c.Path, e.rel, human(uint64(e.bytes)), e.mtime.Format(time.RFC3339))
 		}
 		if r.Bytes > c.MaxBytes {
 			findings = append(findings, Finding{Key: "cache_over_bound/" + c.Path,
@@ -554,66 +557,79 @@ func reclaimCaches(cfg *config.Config, at time.Time, log io.Writer) ([]CacheRepo
 }
 
 type cacheEntry struct {
-	path  string
+	rel   string // relative to the cache root
 	bytes int64
 	mtime time.Time
 	link  bool // the entry itself is a symlink
 }
 
-// physical resolves every symlink in p. It is what a deletion would act on.
-func physical(p string) (string, error) {
-	return filepath.EvalSymlinks(p)
-}
-
-func cacheEntries(dir string) ([]cacheEntry, error) {
-	des, err := os.ReadDir(dir)
+// entries lists the top-level entries of a cache, each sized by a walk that
+// never follows a symlink and never leaves the root.
+func (c *CacheRoot) entries(rel string) ([]cacheEntry, error) {
+	d, err := c.root.Open(rel)
+	if err != nil {
+		return nil, err
+	}
+	des, err := d.ReadDir(-1)
+	d.Close()
 	if err != nil {
 		return nil, err
 	}
 	var out []cacheEntry
 	for _, de := range des {
-		p := filepath.Join(dir, de.Name())
-		e := cacheEntry{path: p}
-		if de.Type()&os.ModeSymlink != 0 {
-			// Sized as the link itself; never followed.
-			info, err := os.Lstat(p)
-			if err != nil {
-				return nil, err
-			}
+		p := filepath.Join(rel, de.Name())
+		e := cacheEntry{rel: p}
+		info, err := c.root.Lstat(p)
+		if err != nil {
+			return nil, err
+		}
+		if info.Mode()&os.ModeSymlink != 0 {
 			e.link, e.bytes, e.mtime = true, info.Size(), info.ModTime()
 			out = append(out, e)
 			continue
 		}
-		err := filepath.WalkDir(p, func(path string, d os.DirEntry, err error) error {
-			if err != nil {
-				return err
-			}
-			info, err := d.Info()
-			if err != nil {
-				return err
-			}
-			if !info.IsDir() {
-				e.bytes += info.Size()
-				// Files, not directories: a directory's mtime is when an
-				// entry was added to it, which every walk of a build cache
-				// bumps; the newest file says when the entry was last used.
-				if info.ModTime().After(e.mtime) {
-					e.mtime = info.ModTime()
-				}
-			}
-			return nil
-		})
-		if err != nil {
+		if err := c.size(p, &e); err != nil {
 			return nil, err
 		}
 		if e.mtime.IsZero() { // an empty entry: fall back to the directory itself
-			if info, err := os.Lstat(p); err == nil {
-				e.mtime = info.ModTime()
-			}
+			e.mtime = info.ModTime()
 		}
 		out = append(out, e)
 	}
 	return out, nil
+}
+
+// size accumulates file sizes and the newest FILE mtime under rel. Files,
+// not directories: a directory's mtime is when an entry was added to it,
+// which every walk of a build cache bumps; the newest file says when the
+// entry was last used. Symlinks are counted as themselves.
+func (c *CacheRoot) size(rel string, e *cacheEntry) error {
+	info, err := c.root.Lstat(rel)
+	if err != nil {
+		return err
+	}
+	if !info.IsDir() {
+		e.bytes += info.Size()
+		if info.ModTime().After(e.mtime) {
+			e.mtime = info.ModTime()
+		}
+		return nil
+	}
+	d, err := c.root.Open(rel)
+	if err != nil {
+		return err
+	}
+	des, err := d.ReadDir(-1)
+	d.Close()
+	if err != nil {
+		return err
+	}
+	for _, de := range des {
+		if err := c.size(filepath.Join(rel, de.Name()), e); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 // checkUnreviewed reports open changes that have not been touched within the

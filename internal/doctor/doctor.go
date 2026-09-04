@@ -10,6 +10,7 @@ import (
 	"context"
 	"fmt"
 	"github.com/aicix-labs/factoryd/internal/alert"
+	"github.com/aicix-labs/factoryd/internal/health"
 	"os"
 	"path/filepath"
 	"strings"
@@ -646,36 +647,15 @@ func canonical(p string) (string, error) {
 	return filepath.Clean(filepath.Join(real, rest)), nil
 }
 
-// checkCacheRoot: the one directory reclamation may delete in must exist,
-// be a real directory (not a symlink to somewhere else), be owned by the
-// user factoryd runs as, and not be writable by anyone else -- a group- or
-// world-writable cache root lets any local user plant a symlink for the
-// next tick to follow, and the physical check at reclamation is the last
-// line, not the only one.
+// checkCacheRoot opens and verifies the cache root exactly as reclamation
+// will: no-follow, owned by this uid, writable by nobody else, bound to the
+// inode that was verified. It establishes the environment at doctor time
+// only; reclamation repeats it at every tick, because that is the moment a
+// deletion happens.
 func checkCacheRoot(dir string) error {
-	fi, err := os.Lstat(dir)
+	cr, err := health.OpenCacheRoot(dir)
 	if err != nil {
 		return err
 	}
-	if fi.Mode()&os.ModeSymlink != 0 {
-		return fmt.Errorf("is a symlink; the cache root must be a real directory")
-	}
-	if !fi.IsDir() {
-		return fmt.Errorf("is not a directory")
-	}
-	if fi.Mode().Perm()&0o022 != 0 {
-		return fmt.Errorf("is writable by group or others (%v); anyone could plant a symlink for reclamation to follow", fi.Mode().Perm())
-	}
-	if uid, ok := ownerUID(fi); ok && uid != os.Getuid() {
-		return fmt.Errorf("is owned by uid %d, not the uid factoryd runs as (%d)", uid, os.Getuid())
-	}
-	return nil
-}
-
-func ownerUID(fi os.FileInfo) (int, bool) {
-	st, ok := fi.Sys().(*syscall.Stat_t)
-	if !ok {
-		return 0, false
-	}
-	return int(st.Uid), true
+	return cr.Close()
 }

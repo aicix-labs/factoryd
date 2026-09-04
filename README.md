@@ -94,8 +94,9 @@ Exit 0 is healthy, 1 is findings, 3 is "could not look" — a tick that cannot
 stat a volume, reach the provider, or read the state document is a different
 failure from an unhealthy factory and says so. Reclamation deletes only inside
 `paths.cache_root`, a dedicated directory that may not overlap anything the
-factory depends on; the check is lexical at load and physical (symlinks
-resolved) at the moment of deletion. A corrupt state document does not silence
+factory depends on; the check is lexical at load, and at the moment of deletion every removal is
+bound to an opened, verified directory handle — never to a path, which anyone
+with write access to an ancestor can retarget between a check and a delete. A corrupt state document does not silence
 the tick: a fail-safe alert goes out through the transports regardless. `doctor` delivers
 a probe alert through every transport rather than inspecting them, because
 "the path looks writable" is not "the alert landed".

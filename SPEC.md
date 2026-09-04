@@ -875,12 +875,19 @@ journal nobody read.
   cache lies inside `paths.cache_root`, a dedicated factory-owned directory that
   may not be `/` and may not overlap the factory root, either repository, a
   credential, or an alert file — refused at load, lexically. At the moment of
-  use the check is physical: the cache root, the cache path and every entry are
-  resolved through their symlinks, and one that lands outside is a finding under
-  which nothing is deleted. A symlink entry is removed as a link, never followed.
-  `doctor` requires the cache root to be a real directory, owned by the factory
-  user, and not writable by anyone else — a world-writable cache root lets any
-  local user plant a symlink for the next tick.
+  use, **deletion is bound to an opened, verified directory handle, not to a
+  path.** The tick opens the cache root without following a final symlink,
+  verifies on the handle that it is a directory owned by the factory user and
+  writable by nobody else, binds an `os.Root` to it and checks that the bound
+  root is the same inode it verified; every listing, sizing and removal is then
+  relative to that handle and refuses to follow a symlink out of it. Nothing an
+  untrusted writer does to the path afterwards — a symlink at the cache, at the
+  root, or at the root's renamed parent — changes what is deleted, because the
+  path is not consulted again. A resolved-path comparison would not give this:
+  a root swapped for a symlink resolves *consistently* under the victim, and
+  containment against a moved root passes. A symlink entry is removed as a
+  link, never followed. `doctor` performs the same open-and-verify; it
+  establishes doctor's environment, and the tick repeats it at every deletion.
 - **"Could not look" is exit 3, not a finding.** `Tick` returns a typed
   observation error alongside the report it still wrote; the CLI maps it to 3.
   An unhealthy factory and a blind tick have different remedies.
@@ -996,6 +1003,8 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §7 delivery probe | `doctor` fails when the alert file cannot be appended, or the alert command exits non-zero — even when a second transport succeeds, which is named | a healthy run leaves the probe line **in the file** |
 | §7 fan-out | one transport failing does not suppress the next, and the failure is named | every transport failing is an error that names each |
 | §7 reclamation scope | a cache root of `/`, one overlapping the factory root, a repository, a credential or an alert file, or a cache outside the root → refused at load; a cache path or entry that **resolves** outside the root at reclamation time → nothing deleted, `cache_unsafe` | a sibling that merely shares a string prefix is accepted; a cache inside the root is reclaimed |
+| §7 deletion follows the handle | the cache root is replaced by a symlink to a victim **after** it was opened and verified, before anything is deleted → the real root is reclaimed and the victim is intact, links included; the root swapped **between** the no-follow open and the bind → refused | the same root untouched reclaims exactly the oldest entry |
+| §7 root replaced after doctor | the root itself, or its renamed parent, replaced by a symlink after `doctor` passed → `cache_unsafe`, nothing deleted | — |
 | §7 symlink entry | a symlink entry is removed as a link; its target is intact | the link itself is gone and counted |
 | §7 could not look | a volume that will not stat, a provider that will not answer, a corrupt state document → `factoryd health` exits **3** | findings alone exit 1; a live supervisor exits 0 |
 | §7 state unavailable | a corrupt `state.json` with a working transport → a `state_unavailable` alert on the first tick, none inside `repeat_seconds`, one after it, and one immediately when no previous `health.json` exists | a readable document alerts on the ordinary cadence |

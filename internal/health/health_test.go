@@ -578,3 +578,116 @@ func TestObservationErrorIsTyped(t *testing.T) {
 		t.Fatalf("err=%v", err)
 	}
 }
+
+// The reviewer's case: doctor verified the cache root; afterwards the root
+// ITSELF is replaced by a symlink to a victim. Containment by resolved path
+// would pass (root and cache both resolve under the victim). Reclamation
+// must refuse at the root and delete nothing.
+func TestCacheRootReplacedBySymlinkAfterVerificationDeletesNothing(t *testing.T) {
+	l := newLab(t)
+	cr := l.cfg.Paths.CacheRoot
+	if c, err := health.OpenCacheRoot(cr); err != nil { // doctor's verification, earlier
+		t.Fatal(err)
+	} else {
+		c.Close()
+	}
+	victim := filepath.Join(l.root, "victim")
+	fill(t, victim, "go/a/blob", 1000, l.now.Add(-3*time.Hour))
+	fill(t, victim, "go/b/blob", 1000, l.now)
+	if err := os.Rename(cr, cr+".real"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, cr); err != nil {
+		t.Fatal(err)
+	}
+	l.cfg.Health.Caches = []config.Cache{{Path: filepath.Join(cr, "go"), MaxBytes: 10}}
+	rep := l.tick(t)
+	if !hasKey(rep, "cache_unsafe/") || rep.Caches[0].ReclaimedCount != 0 {
+		t.Fatalf("findings=%v reclaimed=%d", keys(rep), rep.Caches[0].ReclaimedCount)
+	}
+	for _, keep := range []string{"go/a/blob", "go/b/blob"} {
+		if _, err := os.Stat(filepath.Join(victim, keep)); err != nil {
+			t.Fatalf("%s deleted through a replaced cache root", keep)
+		}
+	}
+}
+
+// The parent variant: the root's parent is renamed away and a new parent
+// carries a symlink at the root's old path. The path now means the victim;
+// the verified handle would not, but the tick opens fresh -- and must
+// refuse, because what it opens no-follow is a symlink.
+func TestCacheRootParentRenamedAndReplacedDeletesNothing(t *testing.T) {
+	parent := filepath.Join(t.TempDir(), "p")
+	cr := filepath.Join(parent, "cache")
+	if err := os.MkdirAll(cr, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if c, err := health.OpenCacheRoot(cr); err != nil {
+		t.Fatal(err)
+	} else {
+		c.Close()
+	}
+	victim := filepath.Join(filepath.Dir(parent), "victim")
+	now := time.Now()
+	fill(t, victim, "go/a/blob", 1000, now.Add(-3*time.Hour))
+	fill(t, victim, "go/b/blob", 1000, now)
+	if err := os.Rename(parent, parent+".moved"); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.MkdirAll(parent, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(victim, cr); err != nil {
+		t.Fatal(err)
+	}
+	l := newLab(t)
+	l.cfg.Paths.CacheRoot = cr
+	l.cfg.Health.Caches = []config.Cache{{Path: filepath.Join(cr, "go"), MaxBytes: 10}}
+	rep := l.tick(t)
+	if !hasKey(rep, "cache_unsafe/") || rep.Caches[0].ReclaimedCount != 0 {
+		t.Fatalf("findings=%v reclaimed=%d", keys(rep), rep.Caches[0].ReclaimedCount)
+	}
+	if _, err := os.Stat(filepath.Join(victim, "go/a/blob")); err != nil {
+		t.Fatal("deleted through a replaced parent")
+	}
+}
+
+// Positive control for the two above: the same root, untouched, reclaims.
+// Without it "nothing deleted" would also describe a reclaimer that never
+// deletes.
+func TestVerifiedCacheRootReclaims(t *testing.T) {
+	l := newLab(t)
+	cache := filepath.Join(l.cfg.Paths.CacheRoot, "go")
+	fill(t, cache, "a/blob", 1000, l.now.Add(-3*time.Hour))
+	fill(t, cache, "b/blob", 1000, l.now)
+	l.cfg.Health.Caches = []config.Cache{{Path: cache, MaxBytes: 1500}}
+	rep := l.tick(t)
+	if rep.Caches[0].ReclaimedCount != 1 || hasKey(rep, "cache_unsafe/") {
+		t.Fatalf("reclaimed=%d findings=%v", rep.Caches[0].ReclaimedCount, keys(rep))
+	}
+}
+
+func TestOpenCacheRootRefusals(t *testing.T) {
+	base := t.TempDir()
+	real := filepath.Join(base, "real")
+	os.MkdirAll(real, 0o755)
+	link := filepath.Join(base, "link")
+	os.Symlink(real, link)
+	if _, err := health.OpenCacheRoot(link); err == nil {
+		t.Fatal("a symlink root was opened")
+	}
+	open := filepath.Join(base, "open")
+	os.MkdirAll(open, 0o777)
+	os.Chmod(open, 0o777)
+	if _, err := health.OpenCacheRoot(open); err == nil {
+		t.Fatal("a world-writable root was opened")
+	}
+	file := filepath.Join(base, "file")
+	os.WriteFile(file, nil, 0o644)
+	if _, err := health.OpenCacheRoot(file); err == nil {
+		t.Fatal("a regular file was opened as a root")
+	}
+	if _, err := health.OpenCacheRoot("relative"); err == nil {
+		t.Fatal("a relative root was opened")
+	}
+}
