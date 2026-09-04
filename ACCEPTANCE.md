@@ -133,7 +133,8 @@ the branch family by prefix.
   ignoring its brief, with the cause in the prompt. `examples/producer-turn-
   agent.sh` composes it once: wire `codex exec` (or `claude -p`) as its
   arguments; the agent reads the composed prompt on stdin; a verdict turn is
-  told the family to re-declare verbatim.
+  told, per verdict kind, whether to declare at all (merged and operator-gated:
+  nothing) and for changes-requested the exact family to re-declare.
 
 - **Three tokens, three OS identities** (#36, #47). `credentials.operator` is
   the human's own provider token, 0600 root; `reviewer.token` is 0640

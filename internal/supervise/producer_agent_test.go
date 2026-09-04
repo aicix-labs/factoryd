@@ -71,18 +71,100 @@ func TestProducerAgentWrapperComposesTheProtocolAroundTheBrief(t *testing.T) {
 		t.Fatal("the brief was not consumed")
 	}
 
-	// A verdict turn: the family, verbatim, and the verdicts JSON.
+	// Verdict turns, by kind (#50 review). merged and operator-gated must
+	// produce NO declaration -- a re-declaration there resubmits a change
+	// that left the producer's hands (#40); only changes-requested
+	// re-declares, and then the exact family. Mixed verdicts are spelled
+	// out per change.
+	verdict := func(kind, fam string) string {
+		return `[{"path":"` + filepath.Join(outbox, "48.json") + `","change_id":"48","kind":"` + kind + `","declared_branch":"` + fam + `"}]`
+	}
 	vpath := filepath.Join(outbox, "48.json")
+	for _, c := range []struct {
+		kind       string
+		wantDecl   bool
+		wantPhrase string
+	}{
+		{"changes-requested", true, "fix it, then re-declare the SAME FAMILY"},
+		{"merged", false, "Declare NOTHING for it (write neither file)"},
+		{"operator-gated", false, "Declare NOTHING for it; wait"},
+	} {
+		os.WriteFile(vpath, []byte("{}"), 0o644)
+		fam := ""
+		if c.wantDecl {
+			fam = "fix/ci-prereqs-verify-reporting"
+		}
+		prompt, rc := run("verdict", vpath, fam, verdict(c.kind, "fix/ci-prereqs-verify-reporting"), "")
+		if rc != 0 {
+			t.Fatalf("%s: rc=%d", c.kind, rc)
+		}
+		if !strings.Contains(prompt, "THIS TURN IS A VERDICT") || !strings.Contains(prompt, "  - change 48: "+c.kind+" (declared_branch fix/ci-prereqs-verify-reporting)") {
+			t.Fatalf("%s: the verdict is not listed by change and kind:\n%s", c.kind, prompt)
+		}
+		if !strings.Contains(prompt, c.wantPhrase) {
+			t.Fatalf("%s: prompt lacks %q:\n%s", c.kind, c.wantPhrase, prompt)
+		}
+		named := strings.Contains(prompt, "verbatim:\n    fix/ci-prereqs-verify-reporting\n")
+		if c.wantDecl && !named {
+			t.Fatalf("%s: the family to re-declare is not stated verbatim:\n%s", c.kind, prompt)
+		}
+		if !c.wantDecl && (named || !strings.Contains(prompt, "No verdict this turn asks for a declaration")) {
+			t.Fatalf("%s: the producer was told to re-declare, or not told to declare nothing:\n%s", c.kind, prompt)
+		}
+		if _, err := os.Stat(vpath); !os.IsNotExist(err) {
+			t.Fatalf("%s: the verdict trigger was not consumed", c.kind)
+		}
+	}
+	// Mixed: one merged, one changes-requested. Both listed; only the
+	// changes-requested family is to be re-declared.
 	os.WriteFile(vpath, []byte("{}"), 0o644)
-	prompt, rc = run("verdict", vpath, "fix/ci-prereqs-verify-reporting", `[{"change_id":"48","kind":"changes-requested","declared_branch":"fix/ci-prereqs-verify-reporting"}]`, "")
+	mixed := `[{"path":"` + vpath + `","change_id":"48","kind":"merged","declared_branch":"fix/done"},{"path":"` + filepath.Join(outbox, "49.json") + `","change_id":"49","kind":"changes-requested","declared_branch":"fix/again"}]`
+	prompt, rc = run("verdict", vpath, "", mixed, "")
 	if rc != 0 {
-		t.Fatalf("rc=%d", rc)
+		t.Fatalf("mixed: rc=%d", rc)
 	}
-	if !strings.Contains(prompt, "THIS TURN IS A VERDICT") || !strings.Contains(prompt, "\n    fix/ci-prereqs-verify-reporting\n") || !strings.Contains(prompt, `"declared_branch":"fix/ci-prereqs-verify-reporting"`) {
-		t.Fatalf("verdict prompt does not name the family verbatim:\n%s", prompt)
+	for _, want := range []string{"  - change 48: merged (declared_branch fix/done)", "  - change 49: changes-requested (declared_branch fix/again)", "Re-declare the declared_branch of the changes-requested verdict, verbatim."} {
+		if !strings.Contains(prompt, want) {
+			t.Fatalf("mixed: prompt lacks %q:\n%s", want, prompt)
+		}
 	}
-	if _, err := os.Stat(vpath); !os.IsNotExist(err) {
-		t.Fatal("the verdict trigger was not consumed")
+	if strings.Contains(prompt, "No verdict this turn asks for a declaration") {
+		t.Fatal("mixed: told nothing to declare although one verdict is changes-requested")
+	}
+
+	// The supervisor's retry marker is not the turn's to remove (#50
+	// review): it survives the turn, whatever the agent did.
+	retry := filepath.Join(inbox, "producer-retry")
+	os.WriteFile(retry, []byte("retry 3 of 3\n"), 0o644)
+	os.WriteFile(briefPath, []byte("again\n"), 0o644)
+	if _, rc := run("retry,brief", retry+":"+briefPath, "", "[]", ""); rc != 0 {
+		t.Fatalf("retry turn rc=%d", rc)
+	}
+	if _, err := os.Stat(retry); err != nil {
+		t.Fatal("the wrapper removed the supervisor's retry marker")
+	}
+	if _, err := os.Stat(briefPath); !os.IsNotExist(err) {
+		t.Fatal("the brief beside the retry marker was not consumed")
+	}
+	// And on a failing agent the marker is still there for the supervisor.
+	agentFail := "cat > " + got + "; exit 7"
+	os.WriteFile(retry, []byte("retry 3 of 3\n"), 0o644)
+	failing := exec.Command("sh", script, "sh", "-c", agentFail)
+	failing.Env = []string{"PATH=" + os.Getenv("PATH"), "FACTORYD_WORKDIR=" + work, "FACTORYD_INBOX=" + inbox, "FACTORYD_OUTBOX=" + outbox, "FACTORYD_PROGRESS=" + progress, "FACTORYD_TRIGGERS=retry", "FACTORYD_TRIGGER_PATHS=" + retry, "FACTORYD_VERDICTS=[]"}
+	if err := failing.Run(); err == nil {
+		t.Fatal("a failing agent exited 0")
+	}
+	if _, err := os.Stat(retry); err != nil {
+		t.Fatal("the retry marker was removed by a failing turn; the halt's evidence is gone")
+	}
+
+	// The claim about the sandbox is the true one: no remote, no credential,
+	// no push or fetch -- not "no network", which a hosted model needs.
+	if strings.Contains(prompt, "no network") {
+		t.Fatal("the prompt claims no network; a hosted-model producer has network")
+	}
+	if !strings.Contains(prompt, "no git remote and no provider credential") {
+		t.Fatalf("the prompt does not state the real boundary:\n%s", prompt)
 	}
 
 	// The exit code is the wrapper's: an agent that touched nothing is 1.

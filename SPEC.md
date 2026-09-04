@@ -1035,12 +1035,18 @@ and the producer, never told how to declare intent, produced nothing five times
 and halted — indistinguishable from a model ignoring its brief.
 `examples/producer-turn-agent.sh` composes the protocol once, around every
 turn: the two files, that nothing is submitted without both, that a gate runs
-before any push, that there is no git, network or credential in the turn, the
-progress marker; on a verdict trigger it states `FACTORYD_CHANGE_BRANCH`
-*verbatim* as the family to re-declare (#29's payoff, the easy omission); then
-the brief; then it runs the agent through `turn-wrapper.sh` and consumes the
-trigger itself. It refuses to run an agent with a prompt that does not carry
-the protocol. A brief describes work.
+before any push, that the turn has no SCM remote and no provider credential and
+must not push or fetch (a hosted model still reaches its API; "no network" is
+`sandbox.no_network`, a separate choice), the progress marker; on a verdict
+trigger it lists every verdict by change and kind and instructs *by kind*:
+`merged` and `operator-gated` declare **nothing** — a re-declaration there
+resubmits a change that has left the producer's hands, the loop of #40 —
+and only `changes-requested` re-declares, with `FACTORYD_CHANGE_BRANCH` stated
+*verbatim* as the family (#29's payoff, the easy omission); then the brief; then
+it runs the agent through `turn-wrapper.sh` and consumes the trigger itself —
+never the supervisor's retry marker, which the supervisor owns and keeps on a
+halt as the record of what was retried. It refuses to run an agent with a
+prompt that does not carry the protocol. A brief describes work.
 
 ### 6.3 Progress, not consumption
 
