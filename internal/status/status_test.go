@@ -44,7 +44,7 @@ func newLab(t *testing.T) *lab {
 	}
 	l := &lab{root: root, now: time.Date(2026, 9, 4, 12, 0, 0, 0, time.UTC), alive: map[int]bool{100: true, 200: true}}
 	l.cfg = &config.Config{
-		SchemaVersion: config.SchemaVersion, Name: "widgets", Provider: "github",
+		SchemaVersion: config.SchemaVersion, Scope: config.EmptyScope(), Name: "widgets", Provider: "github",
 		GitHub: &config.GitHub{Owner: "acme", Repo: "widgets"}, TargetBranch: "main",
 		Paths:  config.Paths{Root: root, ProducerWorkdir: filepath.Join(root, "work"), SubmitRepo: filepath.Join(root, "submit")},
 		Health: config.DefaultHealth(),

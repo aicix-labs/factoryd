@@ -76,6 +76,15 @@ func (d *Driver) mrPath(id scm.ChangeID, suffix string) string {
 // ---------- wire types ----------
 
 type glMR struct {
+	// ChangesCount is GitLab's own count, as a string ("3", "1000+"). It is
+	// how "the diff is empty" is told apart from "the diff is not computed
+	// yet": right after an MR is opened, the diffs endpoint returns nothing
+	// while this says otherwise.
+	ChangesCount string `json:"changes_count"`
+	DiffRefs     *struct {
+		HeadSHA string `json:"head_sha"`
+		BaseSHA string `json:"base_sha"`
+	} `json:"diff_refs"`
 	IID          int       `json:"iid"`
 	Title        string    `json:"title"`
 	Author       glUser    `json:"author"`
@@ -110,6 +119,7 @@ func (m glMR) toChange() scm.Change {
 		ID:           scm.ChangeID(strconv.Itoa(m.IID)),
 		Title:        m.Title,
 		Author:       m.Author.Username,
+		AuthorID:     userID(m.Author.ID),
 		SourceBranch: m.SourceBranch,
 		TargetBranch: m.TargetBranch,
 		HeadSHA:      m.SHA,
@@ -188,6 +198,65 @@ func (d *Driver) Get(ctx context.Context, id scm.ChangeID) (scm.Change, error) {
 }
 
 func (d *Driver) Diff(ctx context.Context, id scm.ChangeID) ([]scm.FileDiff, error) {
+	// GitLab computes an MR's diff asynchronously. Observed live: the diffs
+	// endpoint returned an empty list seconds after the MR was opened, while
+	// the MR itself reported changes. An empty list is therefore accepted
+	// only when the MR says it has no changes; otherwise the read is retried
+	// for a bounded time and then fails. Reporting "no changes" for a diff
+	// that is not ready would let a merge gate classify against nothing.
+	// The MR itself is read lazily: only an empty list, or a renamed file
+	// with an empty diff, needs it (its change count judges the first, its
+	// diff refs prove the second). The common case makes no extra request.
+	var m *glMR
+	getMR := func() (glMR, error) {
+		if m != nil {
+			return *m, nil
+		}
+		got, err := d.get(ctx, id)
+		if err != nil {
+			return glMR{}, fmt.Errorf("gitlab diff %s: %w", id, err)
+		}
+		m = &got
+		return got, nil
+	}
+	for attempt := 0; ; attempt++ {
+		out, err := d.readDiffs(ctx, id, getMR)
+		if err != nil {
+			return nil, err
+		}
+		if len(out) > 0 {
+			return out, nil
+		}
+		m, err := getMR()
+		if err != nil {
+			return nil, err
+		}
+		if m.ChangesCount == "0" && m.DiffRefs != nil {
+			return out, nil // genuinely empty, and the diff is computed
+		}
+		if attempt >= diffSettleAttempts {
+			return nil, fmt.Errorf("gitlab diff %s: the diff is not available yet (changes_count %q); refusing to report it as empty", id, m.ChangesCount)
+		}
+		if err := diffSettleSleep(ctx, attempt); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// diffSettleAttempts and diffSettleSleep bound the wait; tests shorten it.
+var (
+	diffSettleAttempts = 8
+	diffSettleSleep    = func(ctx context.Context, attempt int) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(250*(attempt+1)) * time.Millisecond):
+			return nil
+		}
+	}
+)
+
+func (d *Driver) readDiffs(ctx context.Context, id scm.ChangeID, getMR func() (glMR, error)) ([]scm.FileDiff, error) {
 	type glDiff struct {
 		OldPath     string `json:"old_path"`
 		NewPath     string `json:"new_path"`
@@ -195,6 +264,10 @@ func (d *Driver) Diff(ctx context.Context, id scm.ChangeID) ([]scm.FileDiff, err
 		RenamedFile bool   `json:"renamed_file"`
 		DeletedFile bool   `json:"deleted_file"`
 		Diff        string `json:"diff"`
+		// GitLab documents two incomplete states: a collapsed diff (content
+		// withheld, fetch it separately) and one too large to render.
+		Collapsed bool `json:"collapsed"`
+		TooLarge  bool `json:"too_large"`
 	}
 	var out []scm.FileDiff
 	page := "1"
@@ -215,6 +288,28 @@ func (d *Driver) Diff(ctx context.Context, id scm.ChangeID) ([]scm.FileDiff, err
 				Deleted: f.DeletedFile,
 				Renamed: f.RenamedFile,
 				Patch:   f.Diff,
+			}
+			switch {
+			case f.TooLarge:
+				fd.Incomplete, fd.IncompleteReason = true, "too_large: GitLab did not deliver the content"
+			case f.Collapsed:
+				fd.Incomplete, fd.IncompleteReason = true, "collapsed: GitLab withheld the content"
+			case f.Diff == "" && f.DeletedFile:
+				// nothing to deliver
+			case f.Diff == "" && f.RenamedFile:
+				// A rename with an empty diff is either path-only or a
+				// rename whose content changes were not delivered. GitLab
+				// gives no per-file counts, so purity is PROVED: the blob at
+				// the old path on the base must be the blob at the new path
+				// on the head. Anything else -- or a lookup that fails -- is
+				// incomplete. A rename is where a blank patch hides the most.
+				if m, err := getMR(); err != nil {
+					fd.Incomplete, fd.IncompleteReason = true, "renamed with an empty diff; the merge request could not be read: "+err.Error()
+				} else if reason := d.renameNotPure(ctx, m, f.OldPath, f.NewPath); reason != "" {
+					fd.Incomplete, fd.IncompleteReason = true, reason
+				}
+			case f.Diff == "":
+				fd.Incomplete, fd.IncompleteReason = true, "empty patch for a changed file"
 			}
 			if f.RenamedFile {
 				fd.OldPath = f.OldPath
@@ -561,12 +656,50 @@ func (d *Driver) Audits(ctx context.Context, id scm.ChangeID, sha string) ([]scm
 			if !ok {
 				continue
 			}
-			if a.PostedBy == "" {
-				a.PostedBy = n.Author.Username
-			}
+			// The provider's authenticated author, overriding anything the
+			// body may claim.
+			a.PostedBy, a.PostedByID = n.Author.Username, userID(n.Author.ID)
 			all = append(all, a)
 		}
 		page = nextPage(resp.Header)
 	}
 	return scm.SelectAudits(all, sha), nil
+}
+
+// renameNotPure returns "" when the rename is proved path-only, otherwise
+// why it could not be.
+func (d *Driver) renameNotPure(ctx context.Context, m glMR, oldPath, newPath string) string {
+	if m.DiffRefs == nil || m.DiffRefs.BaseSHA == "" || m.DiffRefs.HeadSHA == "" {
+		return "renamed with an empty diff and no diff refs to prove it path-only"
+	}
+	oldBlob, err := d.blobID(ctx, oldPath, m.DiffRefs.BaseSHA)
+	if err != nil {
+		return fmt.Sprintf("renamed with an empty diff; the old blob could not be read: %v", err)
+	}
+	newBlob, err := d.blobID(ctx, newPath, m.DiffRefs.HeadSHA)
+	if err != nil {
+		return fmt.Sprintf("renamed with an empty diff; the new blob could not be read: %v", err)
+	}
+	if oldBlob == "" || newBlob == "" || oldBlob != newBlob {
+		return "renamed with content changes but no diff delivered"
+	}
+	return ""
+}
+
+func (d *Driver) blobID(ctx context.Context, path, ref string) (string, error) {
+	var f struct {
+		BlobID string `json:"blob_id"`
+	}
+	p := d.projPath("/repository/files/" + url.PathEscape(path) + "?ref=" + url.QueryEscape(ref))
+	if _, err := d.c.Do(ctx, http.MethodGet, p, nil, &f); err != nil {
+		return "", err
+	}
+	return f.BlobID, nil
+}
+
+func userID(id int64) string {
+	if id == 0 {
+		return ""
+	}
+	return strconv.FormatInt(id, 10)
 }

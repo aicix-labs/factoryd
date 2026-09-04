@@ -276,6 +276,8 @@ func scGet(ctx context.Context, d scm.Driver, f Factory) error {
 		return fmt.Errorf("Get.SourceBranch = %q, want %q", c.SourceBranch, SourceBranch)
 	case c.Author != ProducerName:
 		return fmt.Errorf("Get.Author = %q, want %q", c.Author, ProducerName)
+	case c.AuthorID == "":
+		return fmt.Errorf("Get.AuthorID is empty; two-party trust is decided on the provider's stable id at the merge gate, never on the login")
 	case c.State != scm.StateOpen:
 		return fmt.Errorf("Get.State = %v, want open", c.State)
 	case c.Draft:
@@ -307,6 +309,19 @@ func scDiff(ctx context.Context, d scm.Driver, f Factory) error {
 	}
 	if b.OldPath != "old/name.go" || b.Path != "new/name.go" {
 		return fmt.Errorf("Diff[1] rename = %q -> %q, want old/name.go -> new/name.go", b.OldPath, b.Path)
+	}
+	// The fixture's rename is path-only. A driver must say so by PROOF, not
+	// by assuming a blank patch on a rename means nothing changed: GitHub
+	// proves it by zero additions and deletions, GitLab by comparing the
+	// blob at the old path on the base with the new path on the head. A
+	// driver that skipped the proof would report this incomplete (fail
+	// closed, but wrongly); one that assumed would pass a rename that hid
+	// content -- the case the gate exists for.
+	if b.Incomplete {
+		return fmt.Errorf("Diff[1] is a pure rename reported incomplete (%s); the driver did not prove it path-only", b.IncompleteReason)
+	}
+	if a.Incomplete {
+		return fmt.Errorf("Diff[0] has a delivered patch and is reported incomplete (%s)", a.IncompleteReason)
 	}
 	return nil
 }
@@ -505,6 +520,9 @@ func scAudits(ctx context.Context, d scm.Driver, f Factory) error {
 	}
 	if a.PostedBy == "" {
 		return fmt.Errorf("Audits[0].PostedBy is empty; an unattributed audit is not evidence")
+	}
+	if a.PostedByID == "" {
+		return fmt.Errorf("Audits[0].PostedByID is empty; the merge gate decides authorship on the provider's stable id, and a driver that does not carry it cannot feed the gate")
 	}
 	return nil
 }

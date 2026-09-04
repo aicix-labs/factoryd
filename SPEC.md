@@ -827,6 +827,76 @@ by the merge gate, not by convention. An audit that records **no attempts** must
 rejected: *an audit that lists nothing tried is not a pass.* v1 enforced this and it
 caught a real omission; keep it.
 
+**The merge gate is `factoryd signal <id> merged`**, and the policy it enforces is
+the `scope` block of the config (§2 "scope policy as data"), in Go RE2 syntax,
+compiled at load — a pattern that does not compile refuses the config, because a
+policy with a silently dropped rule is a policy with a hole where the operator
+believes there is a rule. A config with no scope block is refused; an empty policy
+must be declared, not arrived at by omission.
+
+The gate, in order, on the diff of the head the verdict names:
+
+1. **Deny.** A changed path (both names of a rename; a deletion counts) matching a
+   `deny_regexes` pattern and no `allow_regexes` pattern is *operator-only*.
+2. **Hold.** An **added** diff line — not a removed one, not a `+++` header —
+   matching a `hold_diff_regexes` pattern is *operator-only*, whatever its path.
+3. **Escalate.** A changed path matching an `escalate_regexes` pattern requires a
+   recorded audit **on the exact head**: at least one `CLEARED` with attempts, and
+   no `BROKEN`. An audit on an earlier head is an audit of something else.
+
+The strictest class wins and every reason is kept and shown. **An operator-only
+result refuses the `merged` signal; it does not downgrade it.** The reviewer then
+signals `operator-gated` themselves, so the recorded verdict is always the one the
+reviewer chose, never one the gate substituted behind their back. The `sha` argument
+must be the change's current head (`auto` means "the head now"); a verdict on a
+commit that has since been replaced is a verdict on something the producer no
+longer has, and is refused as *head moved*.
+
+**Two-party trust is decided at the gate, on stable ids.** The reviewer signalling
+and the change's author are compared on the provider's stable id — never the
+login, never a `doctor` result that may be stale or a credential that may have
+been swapped since — and equality refuses every verdict, not only `merged`. An
+author the provider did not name is not known to be distinct, and refuses.
+
+**An audit's author is the provider's word.** The driver sets it from the
+authenticated author of the comment that carries the audit, overriding anything
+the body claims — a body is written by whoever posts it, and an audit that could
+name its own author could be forged by the producer for its own head. The gate
+counts an audit only when its author is the reviewer signalling now. Audits by
+anyone else — the change's author above all — are **ignored and named, never a
+veto**: a producer's comment must not decide a merge in either direction. (Found
+live: a first cut refused on a forged audit even with the reviewer's genuine one
+beside it, which let the producer block its own merge.) A `BROKEN` audit *by the
+reviewer* refuses; an unattributed audit is ignored with its own reason.
+
+**The gate does not mark a draft ready.** No provider offers a ready mutation
+conditional on the head, so a producer pushing between the check and the
+mutation would have its unreviewed head marked ready by the gate — the
+head-conditional merge would then refuse, but the ready state would stand.
+Marking ready is the reviewer's own explicit act after review
+(`factoryd scm set-draft <id> false`); a `merged` signal on a draft is refused
+and says so.
+
+**Content policy is evaluated on delivered content only.** GitLab collapses large
+diffs and withholds ones that are too large; GitHub omits the patch of a large or
+binary file. A file whose content was not delivered is marked *incomplete* by the
+driver, and when any `hold_diff_regexes` are configured the `merged` signal is
+refused rather than evaluated on an empty patch — which would pass exactly the
+file most worth looking at. A rename with a blank patch is where that hides most:
+it is incomplete unless the driver *proves* it path-only — GitHub by zero
+additions and deletions, GitLab (which gives no per-file counts) by equal blob
+ids at the old path on the base and the new path on the head. Then: merge with the expected head, verify by
+ancestry (§5.1).
+Every verdict is written to `outbox/<id>.json` first — that is the handoff — then
+recorded in the state document, then posted as a comment; a failed comment is
+said, not fatal. Exit **0** done · **3** config/identity · **5** refused (scope,
+audit, head moved, provider) · **6** the provider claimed a merge the repository
+does not show.
+
+`factoryd audit post <id> <sha> --lens <l> --verdict CLEARED|BROKEN --file <f>`
+records the pass, as the reviewer, pinned to the head that exists; the file lists
+the attempts, and no attempts is refused before any request is made.
+
 ---
 
 ## 7. Health, alerts, resources
@@ -1056,6 +1126,14 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §8 throttle after failure | a failed refresh followed by reloads inside the TTL → the provider is asked **no** further time; after the TTL, once | — the positive control is the refresh after the TTL |
 | §8 unreadable health | a health document that is not JSON, or cannot be read → named, an error, *not working*, and not "the tick never ran" | an absent document reads as absent |
 | §8 no process-supplied label | a secret planted in the supervisor's recorded argv, in a live process's arguments, in its **comm** (rewritten by the process) and in its **executable path** (a copy named after the secret) appears in none of HTML, JSON or text | the processes **are** shown, by pid, labelled `turn` and `child` from factoryd's own records |
+| §6.4 the gate refuses | a deny path (either name of a rename), held content on an added line, an escalate path with no audit / a `BROKEN` audit / an audit on another head / an audit that tried nothing, a moved head, a closed change, an empty diff, a provider refusal → `merged` is refused **before** any merge call (the provider's own refusal excepted), no verdict file is written | a mergeable change is readied, merged with the expected head, verified, and recorded in file, state and comment |
+| §6.4 refuse, not downgrade | an operator-only result refuses; the recorded verdict is never one the gate substituted | the reviewer's own `operator-gated` signal records without merging |
+| §6.4 hold is on additions | a removed key and a `+++` header do not hold; an added key does | — |
+| §6.4 policy compiles | a pattern that does not compile, or is empty, or a config with no scope block → refused at load | the example policy loads |
+| §6.4 no self-merge | the reviewer's stable id equals the author's, or the author's id is unknown → every verdict refused; compared on ids, so a login collision does not pass | distinct ids record and merge |
+| §6.4 audit authorship | an audit posted by the change's author, by a third party, or with no authenticated author → ignored and named, neither clearing nor vetoing; a body that claims `posted_by` yields no author at all, and both drivers set it from the provider's comment author | the reviewer's own audit on the exact head counts beside a producer's forged ones; the reviewer's own `BROKEN` refuses |
+| §6.4 no auto-ready | a `merged` signal on a draft is refused with the explicit step; the gate never calls `SetDraft` | a change already ready merges |
+| §6.4 incomplete diff | a collapsed / too-large / patch-less changed file with hold rules configured → refused, not read as "nothing added"; both drivers flag it. A **rename with a blank patch** is incomplete unless proved path-only: GitHub by zero additions and deletions, GitLab by equal blob ids at the old path on the base and the new path on the head — a differing blob, a failed lookup, or missing diff refs is content not delivered | with no hold rules, path policy still decides; the recorded pure rename on both providers is reported complete **by proof** |
 | §7 root replaced after doctor | the root itself, or its renamed parent, replaced by a symlink after `doctor` passed → `cache_unsafe`, nothing deleted | — |
 | §7 symlink entry | a symlink entry is removed as a link; its target is intact | the link itself is gone and counted |
 | §7 could not look | a volume that will not stat, a provider that will not answer, a corrupt state document → `factoryd health` exits **3** | findings alone exit 1; a live supervisor exits 0 |

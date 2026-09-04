@@ -24,7 +24,7 @@ func healthCfg(t *testing.T) *config.Config {
 		}
 	}
 	return &config.Config{
-		SchemaVersion: config.SchemaVersion, Name: "widgets", Provider: "github",
+		SchemaVersion: config.SchemaVersion, Scope: config.EmptyScope(), Name: "widgets", Provider: "github",
 		GitHub: &config.GitHub{Owner: "acme", Repo: "widgets"}, TargetBranch: "main",
 		Paths:  config.Paths{Root: root, ProducerWorkdir: filepath.Join(root, "work"), SubmitRepo: filepath.Join(root, "submit"), CacheRoot: filepath.Join(root, "cache")},
 		Roles:  config.Roles{Producer: config.RoleSpec{TimeoutSeconds: 600}, Reviewer: config.RoleSpec{TimeoutSeconds: 600}},

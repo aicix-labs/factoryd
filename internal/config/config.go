@@ -33,7 +33,12 @@ import (
 // and the health block names the volumes and caches the factory is bounded
 // by. A v3 config that listed a webhook it could not send would have passed
 // validation and alerted nobody.
-const SchemaVersion = 4
+//
+// Bumped to 5 for the merge gate (SPEC.md §2, §6.4): scope policy is data in
+// the config, not convention in a playbook. A v4 config has no scope block,
+// and a merge gate with no policy would merge anything; it is refused by
+// version rather than run permissive.
+const SchemaVersion = 5
 
 // Config is one factory.
 type Config struct {
@@ -63,6 +68,9 @@ type Config struct {
 	Alerts []Alert `json:"alerts"`
 	// Health configures the periodic, model-free tick (§4.5, §7).
 	Health Health `json:"health"`
+	// Scope is the path policy the merge gate enforces (§2 "scope policy as
+	// data", §6.4). Required: a gate with no policy is not a gate.
+	Scope Scope `json:"scope"`
 
 	// path is where this config was loaded from; used in diagnostics.
 	path string
@@ -376,6 +384,63 @@ func (h Health) withDefaults() Health {
 		h.DiskMinFreePercent = DefaultDiskMinFree
 	}
 	return h
+}
+
+// Scope is the merge gate's path policy, preserved from v1 as data. Go RE2
+// syntax; every pattern is compiled at load, and one that does not compile
+// refuses the whole config -- a policy with a silently dropped rule is a
+// policy with a hole where the operator believes there is a rule.
+type Scope struct {
+	// DenyRegexes: a changed path matching any of these makes the change
+	// operator-gated. CI config, container builds, deploy manifests.
+	DenyRegexes []string `json:"deny_regexes"`
+	// AllowRegexes: a narrow exemption under a broad deny (docs under a
+	// denied deploy tree). A path must match a deny AND no allow to be denied.
+	AllowRegexes []string `json:"allow_regexes,omitempty"`
+	// HoldDiffRegexes: an ADDED diff line matching any of these makes the
+	// change operator-gated, whatever path it is in. Secret-shaped content.
+	HoldDiffRegexes []string `json:"hold_diff_regexes,omitempty"`
+	// EscalateRegexes: a changed path matching any of these requires a
+	// recorded adversarial audit, with attempts, on the exact head, before
+	// the gate will merge. Auth, crypto, permissions.
+	EscalateRegexes []string `json:"escalate_regexes"`
+
+	deny, allow, hold, escalate []*regexp.Regexp
+}
+
+// EmptyScope is a declared policy with no rules: the merge gate merges
+// anything that passes CI. It is explicit so that a config cannot arrive at
+// it by omission.
+func EmptyScope() Scope { return Scope{DenyRegexes: []string{}, EscalateRegexes: []string{}} }
+
+// Compiled returns the compiled patterns, in config order.
+func (s *Scope) Compiled() (deny, allow, hold, escalate []*regexp.Regexp) {
+	return s.deny, s.allow, s.hold, s.escalate
+}
+
+func (s *Scope) compile() []string {
+	var problems []string
+	do := func(name string, pats []string) []*regexp.Regexp {
+		var out []*regexp.Regexp
+		for i, p := range pats {
+			if p == "" {
+				problems = append(problems, fmt.Sprintf("scope.%s[%d] is empty", name, i))
+				continue
+			}
+			re, err := regexp.Compile(p)
+			if err != nil {
+				problems = append(problems, fmt.Sprintf("scope.%s[%d] %q does not compile: %v", name, i, p, err))
+				continue
+			}
+			out = append(out, re)
+		}
+		return out
+	}
+	s.deny = do("deny_regexes", s.DenyRegexes)
+	s.allow = do("allow_regexes", s.AllowRegexes)
+	s.hold = do("hold_diff_regexes", s.HoldDiffRegexes)
+	s.escalate = do("escalate_regexes", s.EscalateRegexes)
+	return problems
 }
 
 // Cache is one bounded directory.
@@ -693,6 +758,11 @@ func (c *Config) Validate() error {
 		default:
 			add("alerts[%d]: kind %q is not one of file, command", i, a.Kind)
 		}
+	}
+
+	problems = append(problems, c.Scope.compile()...)
+	if c.Scope.DenyRegexes == nil && c.Scope.EscalateRegexes == nil {
+		add("scope is absent; the merge gate needs a policy, and an empty one must be declared (\"deny_regexes\": [], \"escalate_regexes\": []) rather than omitted")
 	}
 
 	h := c.Health

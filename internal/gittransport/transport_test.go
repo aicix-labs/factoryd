@@ -80,7 +80,7 @@ func newLab(t *testing.T) *lab {
 	}
 
 	l.cfg = &config.Config{
-		SchemaVersion: config.SchemaVersion, Health: config.DefaultHealth(), Name: "lab", Provider: "github",
+		SchemaVersion: config.SchemaVersion, Scope: config.EmptyScope(), Health: config.DefaultHealth(), Name: "lab", Provider: "github",
 		GitHub: &config.GitHub{Owner: "acme", Repo: "widgets"}, TargetBranch: "main",
 		Git:   config.Git{Remote: "file://" + l.bare, Transport: "https"},
 		Paths: config.Paths{Root: root, ProducerWorkdir: l.work, SubmitRepo: l.submit},
