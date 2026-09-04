@@ -60,7 +60,7 @@ type SupervisorView struct {
 type RoleView struct {
 	Supervisor *SupervisorView `json:"supervisor,omitempty"`
 	Alive      *bool           `json:"alive,omitempty"` // nil when there is no supervisor to ask about
-	Tree       *proc.Node      `json:"process_tree,omitempty"`
+	Tree       *TreeNode       `json:"process_tree,omitempty"`
 	WatchMode  string          `json:"watch_mode,omitempty"`
 	Halted     bool            `json:"halted"`
 	HaltReason string          `json:"halt_reason,omitempty"`
@@ -71,6 +71,18 @@ type RoleView struct {
 	Fails   int           `json:"fail_streak"`
 	// Stopped is the halt sentinel on disk, which outlives the process.
 	Stopped bool `json:"stop_sentinel"`
+}
+
+// TreeNode is the process tree as the page shows it: pid, structure, and a
+// label factoryd itself assigned from what IT recorded -- "supervisor" for
+// the pid in the state document, "turn" for the pid the supervisor recorded
+// for the running turn, "child" for anything else. Never a label the
+// process supplied: argv, comm and the exe path are all process-controlled
+// channels, and the page is unauthenticated.
+type TreeNode struct {
+	PID      int         `json:"pid"`
+	Label    string      `json:"label"`
+	Children []*TreeNode `json:"children,omitempty"`
 }
 
 // TurnView is the running turn, or the last one.
@@ -187,7 +199,11 @@ func (c *Collector) Collect(ctx context.Context) Snapshot {
 					if t, err := c.deps.Tree(rs.Supervisor.PID); err != nil {
 						s.Errors = append(s.Errors, role+" process tree: "+err.Error())
 					} else {
-						v.Tree = t
+						turnPID := 0
+						if rs.CurrentTurn != nil && rs.CurrentTurn.Process != nil {
+							turnPID = rs.CurrentTurn.Process.PID
+						}
+						v.Tree = label(t, rs.Supervisor.PID, turnPID)
 					}
 				}
 			}
@@ -215,6 +231,23 @@ func (c *Collector) Collect(ctx context.Context) Snapshot {
 	s.NeedsMe = needsMe(c.cfg, s, st)
 	s.Working = working(s)
 	return s
+}
+
+func label(n *proc.Node, supervisor, turn int) *TreeNode {
+	if n == nil {
+		return nil
+	}
+	out := &TreeNode{PID: n.PID, Label: "child"}
+	switch n.PID {
+	case supervisor:
+		out.Label = "supervisor"
+	case turn:
+		out.Label = "turn"
+	}
+	for _, c := range n.Children {
+		out.Children = append(out.Children, label(c, supervisor, turn))
+	}
+	return out
 }
 
 func turnView(t *state.Turn, now time.Time) *TurnView {

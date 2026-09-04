@@ -52,7 +52,7 @@ func newLab(t *testing.T) *lab {
 	l.deps = status.Deps{
 		Alive: func(r proc.Ref) (bool, error) { return l.alive[r.PID], nil },
 		Tree: func(pid int) (*proc.Node, error) {
-			return &proc.Node{PID: pid, Exe: "factoryd", Children: []*proc.Node{{PID: pid + 1, Exe: "claude"}}}, nil
+			return &proc.Node{PID: pid, Children: []*proc.Node{{PID: pid + 1}}}, nil
 		},
 		Now: func() time.Time { return l.now },
 		ListOpen: func(context.Context) ([]scm.Change, error) {
@@ -317,7 +317,7 @@ func TestJSONEndpointMatchesSnapshot(t *testing.T) {
 	page, _ := http.Get(ts.URL + "/")
 	body, _ := io.ReadAll(page.Body)
 	page.Body.Close()
-	for _, want := range []string{"NOT WORKING", "reviewer supervisor", "supervisor DEAD", "producer/fix-abc", "factoryd"} {
+	for _, want := range []string{"NOT WORKING", "reviewer supervisor", "supervisor DEAD", "producer/fix-abc", "supervisor", "child"} {
 		if !strings.Contains(string(body), want) {
 			t.Fatalf("page lacks %q:\n%s", want, body)
 		}
@@ -388,19 +388,65 @@ func TestUnreadableHealthIsNamedNotAbsent(t *testing.T) {
 // carry a command line. A secret planted in the supervisor's recorded argv
 // and in a live child's arguments must appear in none of HTML, JSON, or
 // text; the child is shown by executable name only.
-func TestNoCommandLineReachesAnyOutput(t *testing.T) {
+func TestNoProcessSuppliedLabelReachesAnyOutput(t *testing.T) {
 	l := newLab(t)
 	const secret = "SECRET-TOKEN-7f3a9c"
-	child := exec.Command("sh", "-c", "sleep 30 # "+secret)
+	// The child controls three channels: its arguments, its comm (writable
+	// via /proc/self/comm and prctl), and its executable path (a copy of a
+	// binary named after the secret). All three carry the secret here.
+	commSecret := "SECRETcomm7f3a" // comm is at most 15 bytes
+	bin := filepath.Join(t.TempDir(), secret)
+	sleep, err := exec.LookPath("sleep")
+	if err != nil {
+		t.Skip("no sleep")
+	}
+	b, err := os.ReadFile(sleep)
+	if err != nil {
+		t.Skip(err)
+	}
+	if err := os.WriteFile(bin, b, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	// The recorded turn process is a plain sh that stays alive; the
+	// secret-bearing process is ITS child, so it is labelled "child" -- the
+	// one label that nothing factoryd recorded could override. A label
+	// taken from comm or the exe path would surface exactly there.
+	pidFile := filepath.Join(t.TempDir(), "pid")
+	// An inner sh -c has its own $$; the argv secret rides as a trailing
+	// comment inside the inner script, where it cannot swallow the outer
+	// "& wait".
+	inner := "printf %s " + commSecret + " > /proc/self/comm; echo $$ > " + pidFile + "; exec " + bin + " 30 # " + secret
+	child := exec.Command("sh", "-c", "sh -c '"+inner+"' & wait")
 	if err := child.Start(); err != nil {
 		t.Skipf("no sh: %v", err)
 	}
 	defer func() { child.Process.Kill(); child.Wait() }()
+	var grandchild int
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if b, err := os.ReadFile(pidFile); err == nil {
+			fmt.Sscan(string(b), &grandchild)
+		}
+		if grandchild != 0 {
+			if c, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", grandchild)); strings.Contains(string(c), "SECRET") {
+				break
+			}
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+	if c, _ := os.ReadFile(fmt.Sprintf("/proc/%d/comm", grandchild)); grandchild == 0 || !strings.Contains(string(c), "SECRET") {
+		t.Skipf("could not make a process's comm carry a secret (pid %d, %q); the negative control cannot run here", grandchild, strings.TrimSpace(string(c)))
+	}
+	defer func() {
+		if p, err := os.FindProcess(grandchild); err == nil {
+			p.Kill()
+		}
+	}()
 	self, err := proc.Self("supervise")
 	if err != nil {
 		t.Fatal(err)
 	}
-	self.Command = "factoryd supervise --token=" + secret // as a real Self() would record argv
+	self.Command = "factoryd supervise --token=" + secret
 	l.state(t, func(s *state.State) {
 		s.Role(state.RoleProducer).Supervisor = &self
 		s.Role(state.RoleProducer).CurrentTurn = &state.Turn{ID: "p-1", StartedAt: l.now, Process: &proc.Ref{PID: child.Process.Pid, Command: "claude --key=" + secret}}
@@ -423,12 +469,18 @@ func TestNoCommandLineReachesAnyOutput(t *testing.T) {
 	}
 	outputs["text"] = status.Text(l.collect())
 	for name, out := range outputs {
-		if strings.Contains(out, secret) {
-			t.Fatalf("%s carries a command-line secret:\n%s", name, out)
+		for _, needle := range []string{secret, commSecret, "SECRET"} {
+			if strings.Contains(out, needle) {
+				t.Fatalf("%s carries a process-supplied secret %q:\n%s", name, needle, out)
+			}
 		}
 	}
-	// Positive control: the child IS shown, by executable name.
-	if !strings.Contains(outputs["/status.json"], fmt.Sprintf(`"pid": %d`, child.Process.Pid)) || !strings.Contains(outputs["/status.json"], `"exe": "sh"`) {
-		t.Fatalf("the live child is not shown by pid and executable name:\n%s", outputs["/status.json"])
+	// Positive control: both ARE shown -- by pid; the recorded turn process
+	// as "turn", its secret-bearing child as "child", never as anything the
+	// process said about itself.
+	j := outputs["/status.json"]
+	if !strings.Contains(j, fmt.Sprintf(`"pid": %d`, child.Process.Pid)) || !strings.Contains(j, `"label": "turn"`) ||
+		!strings.Contains(j, fmt.Sprintf(`"pid": %d`, grandchild)) || !strings.Contains(j, `"label": "child"`) {
+		t.Fatalf("the live processes are not shown by pid with factoryd's own labels:\n%s", j)
 	}
 }

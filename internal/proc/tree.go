@@ -4,18 +4,18 @@ package proc
 
 import (
 	"os"
-	"path/filepath"
 	"strconv"
-	"strings"
 )
 
-// Node is one process in a tree read from /proc. It carries the executable
-// name (/proc/<pid>/comm), never the command line: arguments routinely hold
-// tokens and sensitive input, and the status page that shows this tree is
-// unauthenticated by design.
+// Node is one process in a tree read from /proc: pid and structure, and
+// nothing the process supplied. argv, /proc/<pid>/comm (writable by the
+// process, and via prctl(PR_SET_NAME)) and even the executable path (a
+// process can exec a copy of itself named anything) are all channels a
+// child holding a credential could encode it through, and the status page
+// that shows this tree is unauthenticated by design. Labels, if any, come
+// from what the caller itself recorded about a pid.
 type Node struct {
 	PID      int     `json:"pid"`
-	Exe      string  `json:"exe"`
 	Children []*Node `json:"children,omitempty"`
 }
 
@@ -23,7 +23,7 @@ type Node struct {
 // pid that does not exist yields nil. It reads; it never signals.
 func Tree(pid int) (*Node, error) {
 	byParent := map[int][]int{}
-	cmd := map[int]string{}
+	seen := map[int]bool{}
 	des, err := os.ReadDir("/proc")
 	if err != nil {
 		return nil, err
@@ -38,14 +38,14 @@ func Tree(pid int) (*Node, error) {
 			continue
 		}
 		byParent[ppid] = append(byParent[ppid], p)
-		cmd[p] = exeOf(p)
+		seen[p] = true
 	}
-	if _, ok := cmd[pid]; !ok {
+	if !seen[pid] {
 		return nil, nil
 	}
 	var build func(int, int) *Node
 	build = func(p, depth int) *Node {
-		n := &Node{PID: p, Exe: cmd[p]}
+		n := &Node{PID: p}
 		if depth > 32 {
 			return n
 		}
@@ -55,14 +55,4 @@ func Tree(pid int) (*Node, error) {
 		return n
 	}
 	return build(pid, 0), nil
-}
-
-// exeOf is the kernel's short executable name. It is what a process is,
-// not what it was told; the latter is never read here.
-func exeOf(pid int) string {
-	c, err := os.ReadFile(filepath.Join("/proc", strconv.Itoa(pid), "comm"))
-	if err != nil {
-		return ""
-	}
-	return strings.TrimSpace(string(c))
 }

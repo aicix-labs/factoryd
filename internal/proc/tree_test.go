@@ -29,9 +29,6 @@ func TestTreeShowsLiveChildren(t *testing.T) {
 	for _, c := range n.Children {
 		if c.PID == cmd.Process.Pid {
 			found = true
-			if c.Exe == "" {
-				t.Fatal("child has no command line")
-			}
 		}
 	}
 	if !found {

@@ -218,6 +218,6 @@ small{color:#666}
 {{if or $v.Spin $v.Fails}}<br><small>spin {{$v.Spin}}, fail streak {{$v.Fails}}</small>{{end}}
 {{if $v.Tree}}<div class="tree">{{template "tree" $v.Tree}}</div>{{end}}
 </td></tr>{{end}}</table>{{end}}
-{{define "tree"}}{{.PID}} {{.Exe}}{{range .Children}}
+{{define "tree"}}{{.PID}} {{.Label}}{{range .Children}}
   └ {{template "tree" .}}{{end}}{{end}}
 `))

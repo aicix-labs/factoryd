@@ -105,9 +105,10 @@ the status page — is it working, what is it doing right now, what is it waitin
 on, what needs me — as one-shot text, JSON, or a served page with a JSON
 endpoint. Read-only by contract and by test: nothing under the factory root
 changes when it is read, and the provider is asked once per health interval,
-not per reload. The page is unauthenticated, so it shows processes by
-executable name only — never a command line, which routinely carries tokens —
-and `--serve` warns when bound to anything but loopback:
+not per reload. The page is unauthenticated, so the process tree shows
+pids and structure only, labelled from what factoryd itself recorded — never
+argv, `comm` or an executable path, all of which a process controls — and
+`--serve` warns when the address it actually bound is not loopback:
 
 ```console
 $ factoryd status --config f.json
