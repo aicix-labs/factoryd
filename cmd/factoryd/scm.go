@@ -197,14 +197,27 @@ func scmVerb(ctx context.Context, d scm.Driver, verb string, rest []string, out 
 		return exitOK
 
 	case "close":
-		// The reviewer retires a draft it has determined is superseded
-		// (#36). Submit never closes: a read is stale by the time a write
-		// lands. The reviewer, who has read both, does -- and only an open
-		// change: the provider would refuse a closed or merged one, but a
-		// refusal here says what was found rather than what the provider
-		// felt like saying.
-		if !need(1, "close <id> [reason]") {
+		// Closing is not conditional at either provider: between the read
+		// and the close another party can mark the change ready, or merge
+		// it, and the close still lands or reports success. Submit avoids
+		// that race by never closing; the automated reviewer protocol does
+		// too (#47 review). So this is an OPERATOR's act, acknowledged with
+		// --operator after reading the change, never a reviewer-safe verb.
+		// The window is narrowed, not removed: the change must be an open
+		// draft at the last read, and afterwards it must be closed --
+		// merged is reported as what it is, not as success.
+		if !need(1, "close --operator <id> [reason]") {
 			return exitError
+		}
+		operator := false
+		if rest[0] == "--operator" {
+			operator, rest = true, rest[1:]
+			if !need(1, "close --operator <id> [reason]") {
+				return exitError
+			}
+		}
+		if !operator {
+			return out.fail(fmt.Errorf("close is an operator's act, not part of the automated reviewer protocol: neither provider offers a conditional close, so between the read and the close another party can mark the change ready or merge it. Read the change, then run: factoryd scm close --operator %s [reason]", rest[0]))
 		}
 		id := scm.ChangeID(rest[0])
 		c, err := d.Get(ctx, id)
@@ -214,6 +227,9 @@ func scmVerb(ctx context.Context, d scm.Driver, verb string, rest []string, out 
 		if c.State != scm.StateOpen {
 			return out.fail(fmt.Errorf("change %s is %s, not open; nothing to close", id, c.State))
 		}
+		if !c.Draft {
+			return out.fail(fmt.Errorf("change %s is ready, not a draft; it has left the producer's hands and is not a superseded draft to retire", id))
+		}
 		reason := "superseded by a newer submission"
 		if len(rest) > 1 {
 			reason = strings.Join(rest[1:], " ")
@@ -221,15 +237,19 @@ func scmVerb(ctx context.Context, d scm.Driver, verb string, rest []string, out 
 		if err := d.Close(ctx, id, reason); err != nil {
 			return out.fail(err)
 		}
-		// Verified, not believed: the change is re-read and must be closed.
+		// Verified, not believed: re-read, and only closed is success.
 		after, err := d.Get(ctx, id)
 		if err != nil {
 			return out.fail(fmt.Errorf("close reported success but the change could not be re-read: %w", err))
 		}
-		if after.State == scm.StateOpen {
-			return out.fail(fmt.Errorf("close reported success but change %s is still open", id))
+		switch after.State {
+		case scm.StateClosed:
+			return exitOK
+		case scm.StateMerged:
+			return out.fail(fmt.Errorf("change %s is MERGED after the close: another party merged it in the window the close cannot exclude; nothing was retired", id))
+		default:
+			return out.fail(fmt.Errorf("close reported success but change %s is %s", id, after.State))
 		}
-		return exitOK
 
 	case "merge":
 		if !need(2, "merge <id> <expected-head>") {

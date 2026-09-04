@@ -1036,11 +1036,18 @@ through unchanged. Wire agent CLIs through it, or an equivalent, never bare.
 **Superseded drafts are retired by the reviewer** (#36). `submit` leaves what
 it supersedes open — a read is stale by the time a write lands, and no provider
 offers a close conditional on the state that was read — and names it in the
-new draft's body. The reviewer, who has read both, closes it: `factoryd scm
-close <id> [reason]` refuses a change that is not open, closes with the reason
-(default "superseded by a newer submission"), and re-reads the change rather
-than believing the provider. An open family that only grows makes "which one
-do I review" load-bearing; the close is how the family stays one draft wide.
+new draft's body. **The automated reviewer protocol does not close either**:
+neither provider offers a conditional close, so between a read and a close
+another party can mark the change ready or merge it, and the close still
+lands or reports success — the race submit avoids by never closing. Retiring
+a superseded draft is an *operator's* act, acknowledged: `factoryd scm close
+--operator <id> [reason]` refuses without the flag and says why, refuses a
+change that is not an open draft at the last read, closes with the reason
+(default "superseded by a newer submission"), and believes only a re-read that
+says *closed* — merged in the window is reported as merged, never as success.
+The window is narrowed, not removed; the flag is the acknowledgement of that.
+An open family that only grows makes "which one do I review" load-bearing;
+the operator's close is how the family stays one draft wide.
 
 ### 6.4 Audits
 
