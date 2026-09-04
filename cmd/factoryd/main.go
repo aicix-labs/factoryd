@@ -62,9 +62,6 @@ global flags:
   --config <f>     factory config (required except for version)
   --role <r>       producer or reviewer; selects the credential (default reviewer)
   --json           machine-readable output where supported
-
-not yet implemented in this build: signal, audit, status.
-They exit ` + fmt.Sprint(exitConfig) + ` rather than pretending to work.
 `
 
 func main() {
