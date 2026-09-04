@@ -127,6 +127,14 @@ the branch family by prefix.
 
 ### Operating notes from the runs
 
+- **The protocol belongs in the wrapper** (#38). The second brief of the
+  real-model run described the work but not the handshake, and the producer
+  declared nothing five times and halted — the same signature as a model
+  ignoring its brief, with the cause in the prompt. `examples/producer-turn-
+  agent.sh` composes it once: wire `codex exec` (or `claude -p`) as its
+  arguments; the agent reads the composed prompt on stdin; a verdict turn is
+  told the family to re-declare verbatim.
+
 - **Three tokens, three OS identities** (#36, #47). `credentials.operator` is
   the human's own provider token, 0600 root; `reviewer.token` is 0640
   root:factoryd-reviewer and the reviewer role runs as `factoryd-reviewer`;

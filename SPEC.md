@@ -1026,6 +1026,22 @@ so — the removal of *that* sentinel is the acknowledgement, once (#37). A halt
 the role had recovered and done work (#30) — a red that never goes green is as
 uninformative as a green that never goes red.
 
+**The intent protocol is composed by the wrapper, not written into briefs**
+(#38). A scripted producer writes the two control files itself and never has
+to explain them; a model-driven producer is the party writing those files, and
+nothing else tells it they exist. A brief that happened to end with the two
+`printf` lines worked; the next brief described the work and not the handshake,
+and the producer, never told how to declare intent, produced nothing five times
+and halted — indistinguishable from a model ignoring its brief.
+`examples/producer-turn-agent.sh` composes the protocol once, around every
+turn: the two files, that nothing is submitted without both, that a gate runs
+before any push, that there is no git, network or credential in the turn, the
+progress marker; on a verdict trigger it states `FACTORYD_CHANGE_BRANCH`
+*verbatim* as the family to re-declare (#29's payoff, the easy omission); then
+the brief; then it runs the agent through `turn-wrapper.sh` and consumes the
+trigger itself. It refuses to run an agent with a prompt that does not carry
+the protocol. A brief describes work.
+
 ### 6.3 Progress, not consumption
 
 `inbox/producer-progress` exists so the supervisor can distinguish *"working, not
