@@ -96,6 +96,9 @@ func Text(s Snapshot) string {
 				fmt.Fprintf(&sb, "; idle, last turn %s exit %s after %s", v.Turn.ID, exitText(v.Turn.Exit), v.Turn.AgeText)
 			}
 		}
+		if v.LastHalt != nil && !v.Halted {
+			fmt.Fprintf(&sb, "; recovered from a halt (%s) at %s", v.LastHalt.Reason, v.LastHalt.ClearedAt.Format(time.RFC3339))
+		}
 		if len(v.Pending) > 0 {
 			sb.WriteString("; waiting on")
 			for _, p := range v.Pending {

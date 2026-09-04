@@ -505,3 +505,19 @@ func TestHaltRemedyFollowsTheSentinel(t *testing.T) {
 		t.Fatalf("needs=%v; with the sentinel gone the remedy must not tell the operator to remove it", s.NeedsMe)
 	}
 }
+
+// A cleared halt is information, not a need: the factory reads as working
+// and the recovery is shown (#30).
+func TestClearedHaltIsInformationNotANeed(t *testing.T) {
+	l := newLab(t)
+	l.state(t, func(s *state.State) {
+		s.Role(state.RoleProducer).LastHalt = &state.Halt{Reason: "fail_abort", At: l.now.Add(-time.Hour), ClearedAt: l.now.Add(-30 * time.Minute)}
+	})
+	s := l.collect()
+	if !s.Working || len(s.NeedsMe) != 0 {
+		t.Fatalf("working=%v needs=%v; a cleared halt must not read as a halt", s.Working, s.NeedsMe)
+	}
+	if !strings.Contains(status.Text(s), "recovered from a halt (fail_abort)") {
+		t.Fatalf("text:\n%s", status.Text(s))
+	}
+}

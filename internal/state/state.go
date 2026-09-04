@@ -110,6 +110,24 @@ type RoleState struct {
 	Halted     bool      `json:"halted"`
 	HaltReason string    `json:"halt_reason,omitempty"`
 	HaltedAt   time.Time `json:"halted_at,omitempty"`
+	// SentinelWritten records that the halt's stop sentinel was persisted.
+	// The reset is the removal of a sentinel that was written; a halt whose
+	// sentinel write failed has nothing an operator could have removed, so
+	// a restart re-persists it and refuses rather than reading the missing
+	// file as an acknowledgement (#32 review).
+	SentinelWritten bool `json:"sentinel_written,omitempty"`
+	// LastHalt is the most recent halt after it was cleared: the audit
+	// trail of a circuit breaker that tripped and was reset. The reset is
+	// the operator's restart after removing the sentinel (#30); a halt that
+	// nothing cleared kept health and status red after the role recovered.
+	LastHalt *Halt `json:"last_halt,omitempty"`
+}
+
+// Halt is a cleared halt, kept for the record.
+type Halt struct {
+	Reason    string    `json:"reason"`
+	At        time.Time `json:"at"`
+	ClearedAt time.Time `json:"cleared_at"`
 }
 
 // SetPending replaces the pending set with what was just observed, keeping the
