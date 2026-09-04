@@ -922,7 +922,10 @@ cannot fetch the PR comment the summary references. Put the substance in the sum
 records a halt and writes the sentinel; the operator removes the sentinel and
 restarts; a restart proceeds only past the sentinel check, so at that point the
 recorded halt is cleared and kept as `last_halt` (reason, when, when cleared)
-for the record. A halt that nothing cleared kept health and status red after
+for the record. The reset is the removal of a sentinel that was *written*
+(`sentinel_written` in state): a halt whose sentinel write failed left nothing
+for an operator to remove, so a restart re-persists the sentinel and refuses
+rather than reading the missing file as an acknowledgement. A halt that nothing cleared kept health and status red after
 the role had recovered and done work (#30) — a red that never goes green is as
 uninformative as a green that never goes red.
 

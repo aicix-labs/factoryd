@@ -2,6 +2,7 @@ package supervise
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"os"
 	"strings"
@@ -59,16 +60,61 @@ func (s *Supervisor) claim() error {
 		// the recorded halt is cleared and kept as last_halt for the record
 		// (#30). Left in place, the first halt a factory ever took kept its
 		// health red for good -- a red that never goes green.
+		if rs.Halted && !rs.SentinelWritten {
+			return errHaltUnacknowledged
+		}
 		if rs.Halted {
 			rs.LastHalt = &state.Halt{Reason: rs.HaltReason, At: rs.HaltedAt, ClearedAt: s.now()}
-			rs.Halted, rs.HaltReason, rs.HaltedAt = false, "", time.Time{}
+			rs.Halted, rs.HaltReason, rs.HaltedAt, rs.SentinelWritten = false, "", time.Time{}, false
 			s.log.Info("halt cleared by restart", "reason", rs.LastHalt.Reason, "halted_at", rs.LastHalt.At)
 		}
 		rs.Supervisor = &self
 		rs.WatchMode = string(s.watcher.Mode())
 		return nil
 	})
+	if errors.Is(err, errHaltUnacknowledged) {
+		return s.persistUnacknowledgedHalt()
+	}
 	return err
+}
+
+// errHaltUnacknowledged: state says halted, but the sentinel write failed at
+// the time, so no sentinel was ever there for an operator to remove.
+var errHaltUnacknowledged = errors.New("halt recorded but its sentinel was never persisted")
+
+// persistUnacknowledgedHalt writes the sentinel the halt could not, and
+// refuses to start. Only the removal of a written sentinel is the reset:
+// reading a sentinel that was never written as "the operator removed it"
+// would let the breaker close itself after precisely the control-plane
+// failure that kept it from persisting its stop signal.
+func (s *Supervisor) persistUnacknowledgedHalt() error {
+	var reason string
+	var at time.Time
+	if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		rs := st.Role(state.Role(s.role))
+		reason, at = rs.HaltReason, rs.HaltedAt
+		if err := s.writeStopSentinel(reason, at); err != nil {
+			return fmt.Errorf("%w; writing it now failed too: %v", errHaltUnacknowledged, err)
+		}
+		rs.SentinelWritten = true
+		return nil
+	}); err != nil {
+		return err
+	}
+	s.log.Error("halt sentinel written on restart; the halt stands", "reason", reason, "halted_at", at)
+	return fmt.Errorf("%w: the halt at %s (%s) was recorded but its sentinel was never written; written now at %s -- remove it to resume",
+		ErrStopSentinel, at.Format(time.RFC3339), reason, s.cfg.StopPath(s.role))
+}
+
+// markSentinelWritten records that the halt's sentinel is on disk, so the
+// next start can tell a removed sentinel from one that never existed.
+func (s *Supervisor) markSentinelWritten() {
+	if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		st.Role(state.Role(s.role)).SentinelWritten = true
+		return nil
+	}); err != nil {
+		s.log.Error("could not record that the stop sentinel was written", "err", err)
+	}
 }
 
 // progressMTime reads the role's progress marker.
@@ -354,6 +400,8 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 		// nobody sees until they go looking.
 		if err := s.writeStopSentinel(haltReason, ended); err != nil {
 			s.log.Error("could not write the stop sentinel", "err", err)
+		} else {
+			s.markSentinelWritten()
 		}
 		s.log.Error("supervisor halting", "reason", haltReason,
 			"sentinel", s.cfg.StopPath(s.role),
@@ -465,6 +513,8 @@ func (s *Supervisor) haltNow(at time.Time, reason string) error {
 	}
 	if err := s.writeStopSentinel(reason, at); err != nil {
 		s.log.Error("could not write the stop sentinel", "err", err)
+	} else {
+		s.markSentinelWritten()
 	}
 	s.log.Error("supervisor halting", "reason", reason, "sentinel", s.cfg.StopPath(s.role))
 	return ErrHalted

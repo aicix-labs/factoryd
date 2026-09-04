@@ -1232,3 +1232,59 @@ func TestRestartAfterTheSentinelIsRemovedClearsTheHalt(t *testing.T) {
 		t.Fatalf("the cleared halt was not kept for the record: %+v", rs.LastHalt)
 	}
 }
+
+// The reset is the removal of a sentinel that was written. A halt whose
+// sentinel write failed has nothing an operator could have removed: the
+// restart must not read the missing file as an acknowledgement (#32 review).
+func TestAHaltWhoseSentinelWasNeverWrittenIsNotResetByARestart(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	stop := fx.cfg.StopPath("reviewer")
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		// The sentinel path is occupied by a directory: the write fails.
+		_ = os.Mkdir(stop, 0o755)
+		return supervise.TurnResult{ExitCode: 1}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted", err)
+	}
+	if rs := fx.roleState(t); !rs.Halted || rs.SentinelWritten {
+		t.Fatalf("halt state: %+v", rs)
+	}
+	s.Close()
+	if err := os.Remove(stop); err != nil { // now absent, exactly as after a failed write
+		t.Fatal(err)
+	}
+
+	clean := func() *fakeRunner {
+		return &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult { fx.progress(t); return supervise.TurnResult{} }}
+	}
+	s2 := fx.newSupervisor(t, clean(), 1)
+	if err := s2.Run(ctx); !errors.Is(err, supervise.ErrStopSentinel) {
+		t.Fatalf("a restart after a failed sentinel write returned %v, want ErrStopSentinel: the missing file was read as the operator's reset", err)
+	}
+	s2.Close()
+	rs := fx.roleState(t)
+	if !rs.Halted || rs.LastHalt != nil || !rs.SentinelWritten {
+		t.Fatalf("the refused restart did not keep the halt and persist the sentinel: %+v", rs)
+	}
+	if body, err := os.ReadFile(stop); err != nil || !strings.Contains(string(body), rs.HaltReason) {
+		t.Fatalf("sentinel after the refused restart: %q %v", body, err)
+	}
+
+	// Removing the sentinel that was written is the reset.
+	if err := os.Remove(stop); err != nil {
+		t.Fatal(err)
+	}
+	fx.wake(t)
+	s3 := fx.newSupervisor(t, clean(), 1)
+	if err := s3.Run(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run after the reset: %v", err)
+	}
+	if rs := fx.roleState(t); rs.Halted || rs.SentinelWritten || rs.LastHalt == nil {
+		t.Fatalf("the reset did not clear the halt: %+v", rs)
+	}
+}
