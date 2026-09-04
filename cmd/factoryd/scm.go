@@ -61,11 +61,12 @@ func runSCM(args []string) int {
 		fmt.Fprintf(os.Stderr, "factoryd scm: %v\n", err)
 		return exitConfig
 	}
+	return scmVerb(context.Background(), d, rest[0], rest[1:], &printer{json: *asJSON})
+}
 
-	ctx := context.Background()
-	out := &printer{json: *asJSON}
-
-	verb, rest := rest[0], rest[1:]
+// scmVerb dispatches one verb against a driver. Separate from the credential
+// and driver construction so a verb's guards can be tested against a fake.
+func scmVerb(ctx context.Context, d scm.Driver, verb string, rest []string, out *printer) int {
 	need := func(n int, form string) bool {
 		if len(rest) < n {
 			fmt.Fprintf(os.Stderr, "factoryd scm %s: usage: %s\n", verb, form)
@@ -192,6 +193,41 @@ func runSCM(args []string) int {
 		}
 		if err := d.SetDraft(ctx, scm.ChangeID(rest[0]), draft); err != nil {
 			return out.fail(err)
+		}
+		return exitOK
+
+	case "close":
+		// The reviewer retires a draft it has determined is superseded
+		// (#36). Submit never closes: a read is stale by the time a write
+		// lands. The reviewer, who has read both, does -- and only an open
+		// change: the provider would refuse a closed or merged one, but a
+		// refusal here says what was found rather than what the provider
+		// felt like saying.
+		if !need(1, "close <id> [reason]") {
+			return exitError
+		}
+		id := scm.ChangeID(rest[0])
+		c, err := d.Get(ctx, id)
+		if err != nil {
+			return out.fail(err)
+		}
+		if c.State != scm.StateOpen {
+			return out.fail(fmt.Errorf("change %s is %s, not open; nothing to close", id, c.State))
+		}
+		reason := "superseded by a newer submission"
+		if len(rest) > 1 {
+			reason = strings.Join(rest[1:], " ")
+		}
+		if err := d.Close(ctx, id, reason); err != nil {
+			return out.fail(err)
+		}
+		// Verified, not believed: the change is re-read and must be closed.
+		after, err := d.Get(ctx, id)
+		if err != nil {
+			return out.fail(fmt.Errorf("close reported success but the change could not be re-read: %w", err))
+		}
+		if after.State == scm.StateOpen {
+			return out.fail(fmt.Errorf("close reported success but change %s is still open", id))
 		}
 		return exitOK
 

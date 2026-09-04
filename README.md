@@ -55,6 +55,9 @@ and the gate never marks a draft ready.
 
 ## What works today
 
+`factoryd scm close <id> [reason]` retires a superseded draft: the reviewer's
+verb, refused for anything not open, verified by re-reading the change.
+
 A submission submit refuses for a reason that cannot change is not retried:
 the block is recorded, the declaration quarantined, and `status` and `health`
 say so until a submission succeeds; a transient failure resumes submit without

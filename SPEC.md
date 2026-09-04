@@ -1033,6 +1033,15 @@ observable effect: `examples/turn-wrapper.sh` runs the agent, and exits non-zero
 when `$FACTORYD_PROGRESS` did not move, passing the agent's own non-zero exit
 through unchanged. Wire agent CLIs through it, or an equivalent, never bare.
 
+**Superseded drafts are retired by the reviewer** (#36). `submit` leaves what
+it supersedes open — a read is stale by the time a write lands, and no provider
+offers a close conditional on the state that was read — and names it in the
+new draft's body. The reviewer, who has read both, closes it: `factoryd scm
+close <id> [reason]` refuses a change that is not open, closes with the reason
+(default "superseded by a newer submission"), and re-reads the change rather
+than believing the provider. An open family that only grows makes "which one
+do I review" load-bearing; the close is how the family stays one draft wide.
+
 ### 6.4 Audits
 
 An escalate-class change requires a recorded adversarial pass before merge, enforced
