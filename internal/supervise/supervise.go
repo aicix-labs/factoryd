@@ -38,7 +38,20 @@ type TurnResult struct {
 	// distinct from a non-zero exit: an agent that failed and an agent that
 	// never finished need different responses from an operator.
 	TimedOut bool
+	// Leftover records that the turn's leader exited but other processes in
+	// its group were still running -- a background child the agent left
+	// behind. They were killed. A turn that is still running is not a clean
+	// turn: nothing may follow it (no submit) while something the producer
+	// started can still rewrite the tree, and it counts as a failure. A
+	// child that detached from the group escapes this check; the root-
+	// mediated crossing does not rely on it (§4.4: every read is no-follow,
+	// judged on the opened descriptor).
+	Leftover bool
 }
+
+// ExitLeftover is recorded for a turn whose leader exited zero but left
+// processes running in its group.
+const ExitLeftover = 1001
 
 // ExitAfterTurnFailed is the exit code recorded for a turn whose agent
 // exited zero but whose after-turn step failed. It is outside any code a

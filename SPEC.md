@@ -299,6 +299,23 @@ incomplete response it should refuse.
 Exit codes are part of the contract: `0` submitted · `4` nothing to submit ·
 `5` gate failed · `3` configuration/identity failure.
 
+**The crossing is root-mediated, so nothing on it is judged by path.** Submit
+runs as factoryd and reads a tree the producer can rewrite at any moment —
+including after a clean exit, by a child it left behind. Every read on the
+crossing is therefore `openat` on the directory in hand with `O_NOFOLLOW`, judged
+on the descriptor actually opened: a control file must be a regular file (a
+symlink to a credential, inside or outside the tree, is refused unread; a fifo is
+refused); every file copied is opened the same way, copied from that descriptor,
+and a directory is listed through its own descriptor. A file swapped for a link
+between listing and open fails the open and refuses the submit. `os.Root` is not
+used for this: it resolves an in-tree symlink itself before the final open, so
+`O_NOFOLLOW` never sees the link. A turn whose leader exited while processes in
+its group still ran is **not clean**: they are killed, nothing follows the turn,
+and it counts as a failure — and because a detached child escapes the group,
+the crossing does not rely on that check. **The producer receives no credential**
+is proved by `doctor` as the producer: neither credential file may be readable
+by it, with the control that its own workdir is.
+
 **The producer's sandbox is the supervisor's, not the agent's.**
 `roles.producer.sandbox.no_network` starts the turn in a new, empty network
 namespace, created by factoryd as root at clone before the identity switch; a
@@ -1151,6 +1168,9 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §8 throttle after failure | a failed refresh followed by reloads inside the TTL → the provider is asked **no** further time; after the TTL, once | — the positive control is the refresh after the TTL |
 | §8 unreadable health | a health document that is not JSON, or cannot be read → named, an error, *not working*, and not "the tick never ran" | an absent document reads as absent |
 | §8 no process-supplied label | a secret planted in the supervisor's recorded argv, in a live process's arguments, in its **comm** (rewritten by the process) and in its **executable path** (a copy named after the secret) appears in none of HTML, JSON or text | the processes **are** shown, by pid, labelled `turn` and `child` from factoryd's own records |
+| §4.4 no-follow crossing | a control file symlinked to a credential, outside or **inside** the tree → refused unread: no commit, no draft, no push, no secret in any log or error; a fifo control file → refused; a detached child that swaps a source file for a credential link after a clean exit → submit refuses, nothing committed or pushed, nothing copied | an ordinary tree copies and submits |
+| §4.4 leftover turn | a leader exits 0 with a child still running — holding its stdio, or silent — → the child is killed, the turn is reported leftover, nothing follows it, it counts as a failure | a quiescent turn is not leftover |
+| §4.4 producer holds no credential | the producer identity can read either credential file → `doctor` fails; a probe that cannot read even the producer's own workdir → `doctor` fails as an unproved boundary | the producer can read its workdir and neither token |
 | §6.4 the gate refuses | a deny path (either name of a rename), held content on an added line, an escalate path with no audit / a `BROKEN` audit / an audit on another head / an audit that tried nothing, a moved head, a closed change, an empty diff, a provider refusal → `merged` is refused **before** any merge call (the provider's own refusal excepted), no verdict file is written | a mergeable change is readied, merged with the expected head, verified, and recorded in file, state and comment |
 | §6.4 refuse, not downgrade | an operator-only result refuses; the recorded verdict is never one the gate substituted | the reviewer's own `operator-gated` signal records without merging |
 | §6.4 hold is on additions | a removed key and a `+++` header do not hold; an added key does | — |

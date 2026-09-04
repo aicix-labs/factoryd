@@ -1,12 +1,14 @@
 package gittransport
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"io/fs"
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 )
 
 // CopyTree copies the producer's source tree into the submit repository's
@@ -54,69 +56,109 @@ func CopyTree(src, dst string) error {
 		}
 	}
 
-	return filepath.WalkDir(src, func(path string, d fs.DirEntry, walkErr error) error {
-		if walkErr != nil {
-			return walkErr
-		}
-		rel, err := filepath.Rel(src, path)
-		if err != nil {
-			return err
-		}
-		if rel == "." {
-			return nil
-		}
-		base := d.Name()
+	// The crossing is root-mediated: this runs as factoryd, reading a tree the
+	// producer can rewrite at any moment, including while a clean turn's
+	// detached child keeps running. So nothing here is judged by path and
+	// then used by path. Every entry is opened through a handle on the
+	// source root with O_NOFOLLOW on the final component, and what it IS is
+	// decided on the descriptor that was actually opened: a regular file is
+	// copied from that descriptor; a directory is listed through it; a
+	// symlink is read as a link and recreated only if its target passes; and
+	// anything else -- a fifo that would block root, a device -- is refused.
+	// A file swapped for a link between listing and open fails the no-follow
+	// open and refuses the whole copy, which refuses the submit.
+	top, err := os.OpenFile(src, os.O_RDONLY|syscall.O_DIRECTORY|syscall.O_NOFOLLOW, 0)
+	if err != nil {
+		return fmt.Errorf("copytree: %s: %w", src, err)
+	}
+	defer top.Close()
+	return copyDir(top, src, ".", dst)
+}
 
-		// Git control data never crosses.
+// copyDir copies the directory open as d (at path dirPath, relative rel).
+// Children are opened by openat on d with O_NOFOLLOW: the directory in hand
+// is the one being read, whatever the path now names.
+func copyDir(d *os.File, dirPath, rel, dst string) error {
+	entries, err := d.ReadDir(-1)
+	if err != nil {
+		return fmt.Errorf("copytree: %s: %w", rel, err)
+	}
+	for _, e := range entries {
+		base := e.Name()
+		erel := base
+		if rel != "." {
+			erel = filepath.Join(rel, base)
+		}
+		// Git control data never crosses; handoff files are not content.
 		if base == ".git" {
-			if d.IsDir() {
-				return filepath.SkipDir
+			continue
+		}
+		if rel == "." && (base == ".producer-branch" || base == ".producer-commit-msg") {
+			continue
+		}
+		target := filepath.Join(dst, erel)
+
+		f, err := OpenNoFollow(d, base, os.O_RDONLY)
+		if err != nil {
+			if errors.Is(err, syscall.ELOOP) {
+				// A symlink. Judged by where it will point AFTER it is
+				// recreated in the destination, not by where it points in
+				// the source. A link such as hooks -> .git/hooks is "inside"
+				// the producer tree -- the producer's .git is skipped, so it
+				// may not even resolve there -- yet recreated verbatim it
+				// points at the factory-owned submit_repo/.git/hooks. Once
+				// the gate runs producer-authored code it can write through
+				// that link, and the hook then runs during git push with the
+				// credential helper active.
+				// The value checked is the value recreated: one readlink.
+				link, lerr := os.Readlink(filepath.Join(dirPath, base))
+				if lerr != nil {
+					return fmt.Errorf("copytree: %s: %w", erel, lerr)
+				}
+				if err := checkLinkTarget(erel, link); err != nil {
+					return err
+				}
+				if err := os.MkdirAll(filepath.Dir(target), 0o755); err != nil {
+					return err
+				}
+				if err := os.Symlink(link, target); err != nil {
+					return err
+				}
+				continue
 			}
-			return nil
+			return fmt.Errorf("copytree: %s: %w", erel, err)
 		}
-		// Handoff files are not content.
-		if rel == ".producer-branch" || rel == ".producer-commit-msg" {
-			return nil
+		fi, err := f.Stat()
+		if err != nil {
+			f.Close()
+			return fmt.Errorf("copytree: %s: %w", erel, err)
 		}
-
-		target := filepath.Join(dst, rel)
-
-		if d.Type()&os.ModeSymlink != 0 {
-			link, err := os.Readlink(path)
+		switch {
+		case fi.IsDir():
+			if err := os.MkdirAll(target, 0o755); err != nil {
+				f.Close()
+				return err
+			}
+			err := copyDir(f, filepath.Join(dirPath, base), erel, dst)
+			f.Close()
 			if err != nil {
 				return err
 			}
-			// Judged by where the link will point AFTER it is recreated in the
-			// destination, not by where it points in the source. A link such
-			// as hooks -> .git/hooks is "inside" the producer tree -- the
-			// producer's .git is skipped, so it may not even resolve there --
-			// yet recreated verbatim it points at the factory-owned
-			// submit_repo/.git/hooks. Once the gate runs producer-authored code
-			// it can write through that link, and the hook then runs during
-			// git push with the credential helper active.
-			if err := checkLinkTarget(rel, link); err != nil {
-				return err
+		case fi.Mode().IsRegular():
+			err := copyFrom(f, target, fi.Mode().Perm())
+			f.Close()
+			if err != nil {
+				return fmt.Errorf("copytree: %s: %w", erel, err)
 			}
-			return os.Symlink(link, target)
+		default:
+			f.Close()
+			return fmt.Errorf("copytree: %s is a %v, not a file, directory or symlink; refusing to copy it", erel, fi.Mode().Type())
 		}
-
-		if d.IsDir() {
-			return os.MkdirAll(target, 0o755)
-		}
-		info, err := d.Info()
-		if err != nil {
-			return err
-		}
-		return copyFile(path, target, info.Mode().Perm())
-	})
+	}
+	return nil
 }
 
-func copyFile(src, dst string, mode fs.FileMode) error {
-	in, err := os.Open(src)
-	if err != nil {
-		return err
-	}
-	defer func() { _ = in.Close() }()
+func copyFrom(in *os.File, dst string, mode fs.FileMode) error {
 	if err := os.MkdirAll(filepath.Dir(dst), 0o755); err != nil {
 		return err
 	}

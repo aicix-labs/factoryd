@@ -326,3 +326,32 @@ func TestNoNetworkRefusesToStartConnectedWithoutRoot(t *testing.T) {
 		t.Fatalf("err=%v; the turn must not start without the sandbox it was promised", err)
 	}
 }
+
+// A leader that exits clean while a child it started is still running is
+// not a clean turn: the child is killed and the result says so. Two ways a
+// child can linger, each detected by its own path: holding the leader's
+// stdio (the wait delay expires) and running silently with stdio closed
+// (only the process-group reaper sees it).
+func TestLeftoverChildIsKilledAndReported(t *testing.T) {
+	for name, script := range map[string]string{
+		"child holds stdio":  "sleep 30 & exit 0",
+		"child closes stdio": "sleep 30 >/dev/null 2>&1 </dev/null & exit 0",
+	} {
+		t.Run(name, func(t *testing.T) {
+			_, r, _ := execFixture(t, []string{"sh", "-c", script}, 10)
+			start := time.Now()
+			res, err := r.Run(context.Background(), supervise.Turn{ID: "t", Role: "reviewer"}, nil)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if res.ExitCode != 0 || !res.Leftover {
+				t.Fatalf("res=%+v after %s; the leader exited 0 and left a child, which must be reported", res, time.Since(start))
+			}
+		})
+	}
+	_, r2, _ := execFixture(t, []string{"true"}, 10)
+	res, err := r2.Run(context.Background(), supervise.Turn{ID: "t2", Role: "reviewer"}, nil)
+	if err != nil || res.Leftover {
+		t.Fatalf("res=%+v err=%v; a quiescent turn is not leftover", res, err)
+	}
+}

@@ -188,6 +188,28 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 				add(name, nil, prober.Describe()+" can write "+d)
 			}
 		}
+		// The producer receives no credential (§4.4). Probed as the producer:
+		// a reviewer token it can read is a token a networkless producer can
+		// copy into ordinary source and have submit push for it. The control
+		// is a file in its own workdir, which it must be able to read --
+		// otherwise "cannot read" is a broken probe.
+		for _, cr := range []struct{ name, file string }{{"producer credential", cfg.Credentials.Producer.File}, {"reviewer credential", cfg.Credentials.Reviewer.File}} {
+			if cr.file == "" {
+				continue
+			}
+			can, err := prober.CanRead(ctx, cr.file)
+			switch {
+			case err != nil:
+				add("producer cannot read "+cr.name, fmt.Errorf("undecided: %v", err), cr.file)
+			case can:
+				add("producer cannot read "+cr.name, fmt.Errorf("%s CAN read %s; a producer that can read a credential can push it out through its own submit", prober.Describe(), cr.file), cr.file)
+			default:
+				add("producer cannot read "+cr.name, nil, prober.Describe()+" cannot read "+cr.file)
+			}
+		}
+		if canOwn, err := prober.CanRead(ctx, producerDir); err != nil || !canOwn {
+			add("producer read probe control", fmt.Errorf("%s cannot read its own workdir %s (%v); the credential probes above prove nothing", prober.Describe(), producerDir, err), producerDir)
+		}
 		canSubmit, err1 := prober.CanWrite(ctx, cfg.Paths.SubmitRepo)
 		canWork, err2 := prober.CanWrite(ctx, producerDir)
 		switch {

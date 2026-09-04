@@ -197,6 +197,13 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 		s.log.Error("turn could not run", "turn", turn.ID, "err", runErr)
 	}
 
+	if runErr == nil && res.Leftover {
+		// A turn that left processes running is not finished. Nothing follows
+		// it, and it counts as a failure: a producer that keeps a child alive
+		// past its exit is either broken or trying something.
+		s.log.Error("turn left processes running after its leader exited; killed, and counting the turn as failed", "turn", turn.ID)
+		res.ExitCode = ExitLeftover
+	}
 	// After a clean turn, the supervisor's own follow-up (submit, for the
 	// producer). Its failure is the turn's failure.
 	if runErr == nil && res.ExitCode == 0 && !res.TimedOut && s.afterTurn != nil {

@@ -2,6 +2,7 @@ package supervise
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -98,7 +99,9 @@ func (r *ExecRunner) Run(ctx context.Context, t Turn, started func(proc.Ref)) (T
 		}
 		return syscall.Kill(-cmd.Process.Pid, syscall.SIGTERM)
 	}
-	cmd.WaitDelay = 10 * time.Second
+	// A leader that has exited while children hold its stdio is a leftover
+	// turn; a short delay bounds how long that can look like a running one.
+	cmd.WaitDelay = 3 * time.Second
 
 	if err := cmd.Start(); err != nil {
 		if spec.RunAs != nil && spec.RunAs.User != "" {
@@ -119,6 +122,16 @@ func (r *ExecRunner) Run(ctx context.Context, t Turn, started func(proc.Ref)) (T
 
 	err := cmd.Wait()
 	res := TurnResult{ExitCode: cmd.ProcessState.ExitCode()}
+	// The leader is gone; is the group? A clean exit with a child still
+	// running is not a quiescent producer. Children holding the leader's
+	// stdio past the wait delay are that same child seen from the pipes:
+	// not a runner fault, and the reaper below is what reports it.
+	if errors.Is(err, exec.ErrWaitDelay) {
+		err = nil
+	}
+	if survivors := reapGroup(cmd.Process.Pid); survivors {
+		res.Leftover = true
+	}
 	// A deadline that fired is not the same as an agent that failed, even
 	// though both surface as a non-zero exit.
 	if turnCtx.Err() != nil && ctx.Err() == nil {
@@ -134,6 +147,24 @@ func (r *ExecRunner) Run(ctx context.Context, t Turn, started func(proc.Ref)) (T
 		return res, err
 	}
 	return res, nil
+}
+
+// reapGroup reports whether any process remained in the group led by pid
+// after the leader exited, and kills the group if so: TERM, a grace, KILL.
+func reapGroup(pid int) bool {
+	if syscall.Kill(-pid, 0) != nil {
+		return false // nobody left
+	}
+	_ = syscall.Kill(-pid, syscall.SIGTERM)
+	deadline := time.Now().Add(2 * time.Second)
+	for time.Now().Before(deadline) {
+		if syscall.Kill(-pid, 0) != nil {
+			return true
+		}
+		time.Sleep(50 * time.Millisecond)
+	}
+	_ = syscall.Kill(-pid, syscall.SIGKILL)
+	return true
 }
 
 func asExitError(err error, target **exec.ExitError) bool {

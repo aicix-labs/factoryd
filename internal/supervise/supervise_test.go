@@ -1153,3 +1153,32 @@ func TestAfterTurnFailureCountsOnTheFailStreak(t *testing.T) {
 		t.Fatalf("state=%+v; the after-turn failure must be recorded as the turn's exit", rs)
 	}
 }
+
+// A turn that left processes running is not clean: nothing follows it and
+// it counts on the fail streak.
+func TestLeftoverTurnIsNotCleanAndNothingFollowsIt(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	ran := 0
+	fx.afterTurn = func(context.Context, supervise.Turn, supervise.TurnResult) (string, error) { ran++; return "", nil }
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		return supervise.TurnResult{ExitCode: 0, Leftover: true}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	err := s.Run(ctx)
+	if !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted after fail_abort leftover turns", err)
+	}
+	if ran != 0 {
+		t.Fatalf("after-turn ran %d times after turns that left processes running", ran)
+	}
+	if got := r.count(); got != 3 {
+		t.Fatalf("ran %d turns before halting, want 3", got)
+	}
+	rs := fx.roleState(t)
+	if rs.LastTurn == nil || rs.LastTurn.ExitCode == nil || *rs.LastTurn.ExitCode != supervise.ExitLeftover {
+		t.Fatalf("state=%+v", rs.LastTurn)
+	}
+}

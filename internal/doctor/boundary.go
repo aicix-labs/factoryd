@@ -111,7 +111,9 @@ func (p *setuidProber) CanRead(ctx context.Context, path string) (bool, error) {
 	}
 	ctx, cancel := context.WithTimeout(ctx, 10*time.Second)
 	defer cancel()
-	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", `head -c 1 "$1" >/dev/null`, "probe", path)
+	// access(2) under the principal's real uid, for a file or a directory
+	// alike: what the kernel would answer an open, without opening.
+	cmd := exec.CommandContext(ctx, "/bin/sh", "-c", `test -r "$1"`, "probe", path)
 	cmd.Env = []string{"PATH=/usr/bin:/bin"}
 	cmd.SysProcAttr = &syscall.SysProcAttr{Credential: &syscall.Credential{Uid: p.uid, Gid: p.gid, Groups: []uint32{}}}
 	err := cmd.Run()
