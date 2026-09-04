@@ -1328,13 +1328,17 @@ func TestLeftoverTurnThatRecordedProgressStandsAndIsNotRetried(t *testing.T) {
 }
 
 // A halt recorded by a binary that predates sentinel_written has the field
-// absent. Absent is unknown, not "never written": the operator removed a
-// sentinel that was on disk, and the documented resume must work the first
-// time, not the second (#37).
-func TestHaltRecordedBeforeSentinelWrittenExistedResumesOnTheFirstRestart(t *testing.T) {
+// absent. That binary also recorded the halt before writing the sentinel and
+// only logged a failure, so absent and no file is exactly the #32 shape
+// seen through the upgrade: unknown cannot authorize a reset (#37 review).
+// The first restart persists the sentinel and refuses, saying why; the
+// removal of that sentinel is the acknowledgement, and the next restart
+// resumes.
+func TestLegacyHaltWithNoFieldRequiresAnExplicitAcknowledgement(t *testing.T) {
 	fx := newFixture(t)
 	fx.wake(t)
-	// The state a pre-#32 binary left: halted, reason, time, no field.
+	// The state a pre-#32 binary left after a halt whose sentinel write
+	// failed: halted, reason, time, no field, no file.
 	_, err := state.Update(fx.cfg.StatePath(), fx.cfg.Name, func(st *state.State) error {
 		rs := st.Role(state.RoleReviewer)
 		rs.Halted, rs.HaltReason, rs.HaltedAt, rs.SentinelWritten = true, "fail_abort before the upgrade", time.Now().Add(-time.Hour), nil
@@ -1346,19 +1350,41 @@ func TestHaltRecordedBeforeSentinelWrittenExistedResumesOnTheFirstRestart(t *tes
 	if b, _ := os.ReadFile(fx.cfg.StatePath()); strings.Contains(string(b), "sentinel_written") {
 		t.Fatalf("the pre-upgrade state must not carry the field:\n%s", b)
 	}
-	// The operator followed the printed instruction: the sentinel is gone.
-	s := fx.newSupervisor(t, &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult { fx.progress(t); return supervise.TurnResult{} }}, 1)
+	stop := fx.cfg.StopPath("reviewer")
+	clean := func() *fakeRunner {
+		return &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult { fx.progress(t); return supervise.TurnResult{} }}
+	}
 	ctx, cancel := ctxWithTimeout(t)
 	defer cancel()
-	if err := s.Run(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
-		t.Fatalf("the first restart after the upgrade did not resume: %v", err)
+
+	s := fx.newSupervisor(t, clean(), 1)
+	err = s.Run(ctx)
+	if !errors.Is(err, supervise.ErrStopSentinel) {
+		t.Fatalf("the first restart after the upgrade returned %v, want ErrStopSentinel: an unknown sentinel state authorized a reset", err)
 	}
+	if !strings.Contains(err.Error(), "predates sentinel_written") || !strings.Contains(err.Error(), "remove it and restart") {
+		t.Fatalf("the refusal does not say what happened or what to do: %v", err)
+	}
+	s.Close()
 	rs := fx.roleState(t)
-	if rs.Halted || rs.LastHalt == nil || rs.LastHalt.Reason != "fail_abort before the upgrade" {
-		t.Fatalf("the halt was not cleared on the first restart: %+v", rs)
+	if !rs.Halted || rs.LastHalt != nil || rs.SentinelWritten == nil || !*rs.SentinelWritten {
+		t.Fatalf("the refused restart did not keep the halt and record the written sentinel: %+v", rs)
 	}
-	if _, err := os.Stat(fx.cfg.StopPath("reviewer")); !os.IsNotExist(err) {
-		t.Fatalf("a sentinel was written for a halt the operator had already resumed (err=%v)", err)
+	if body, err := os.ReadFile(stop); err != nil || !strings.Contains(string(body), "fail_abort before the upgrade") {
+		t.Fatalf("sentinel after the refused restart: %q %v", body, err)
+	}
+
+	// The operator removes the sentinel this binary wrote: that is the reset.
+	if err := os.Remove(stop); err != nil {
+		t.Fatal(err)
+	}
+	fx.wake(t)
+	s2 := fx.newSupervisor(t, clean(), 1)
+	if err := s2.Run(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the restart after the acknowledgement did not resume: %v", err)
+	}
+	if rs := fx.roleState(t); rs.Halted || rs.LastHalt == nil || rs.LastHalt.Reason != "fail_abort before the upgrade" {
+		t.Fatalf("the halt was not cleared after the acknowledgement: %+v", rs)
 	}
 }
 

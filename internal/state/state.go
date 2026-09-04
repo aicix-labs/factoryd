@@ -117,8 +117,10 @@ type RoleState struct {
 	// the missing file as an acknowledgement (#32 review). Three states,
 	// deliberately: false is recorded with the halt and true after the
 	// write, so nil means the halt was recorded by a binary that predates
-	// the field. Nil is unknown, not "never written": a removed sentinel
-	// is honoured as the reset (#37).
+	// the field. Nil is unknown, and unknown cannot authorize a reset: a
+	// pre-field binary also recorded the halt before the write and only
+	// logged a failure, so the restart persists the sentinel and refuses
+	// once, and the removal of that sentinel is the acknowledgement (#37).
 	SentinelWritten *bool `json:"sentinel_written,omitempty"`
 	// LeftoverTurns counts turns that recorded progress but left processes
 	// behind after the leader exited. The strays are killed and verified
