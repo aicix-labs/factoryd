@@ -61,6 +61,39 @@ type TurnResult struct {
 // and the leak is counted as hygiene, not failure (#33).
 const ExitLeftover = 1001
 
+// Disposition classifies an after-turn failure for the supervisor (#42).
+// It decides what follows: a transient failure re-arms a retry that
+// resumes the after-turn step alone, without rerunning the producer; a
+// blocked one and an unknown one arm nothing -- blocked because retrying
+// cannot change the answer, unknown because retrying might repeat an
+// external effect whose outcome was not observed. Unknown is the default
+// for any failure that does not say otherwise.
+type Disposition string
+
+const (
+	DispositionTransient Disposition = "transient"
+	DispositionBlocked   Disposition = "blocked"
+	DispositionUnknown   Disposition = "unknown"
+)
+
+// Disposer is implemented by an after-turn error that knows its
+// disposition. An error that does not implement it is unknown.
+type Disposer interface {
+	Disposition() Disposition
+}
+
+// DispositionOf reads an error's disposition, unknown by default.
+func DispositionOf(err error) Disposition {
+	var d Disposer
+	if errors.As(err, &d) {
+		switch v := d.Disposition(); v {
+		case DispositionTransient, DispositionBlocked:
+			return v
+		}
+	}
+	return DispositionUnknown
+}
+
 // ExitBeforeTurnFailed is recorded for a turn whose before-turn step failed;
 // the agent never ran.
 const ExitBeforeTurnFailed = 1002

@@ -25,7 +25,8 @@ import (
 // ---------- fakes ----------
 
 type fakeTransport struct {
-	onPush   func() // runs during the push; the world moves while a push is in flight
+	onPush   func()  // runs during the push; the world moves while a push is in flight
+	pushErrs []error // consumed one per push: a transient failure, then success
 	login    string
 	guardErr error
 	pushed   []string
@@ -45,6 +46,13 @@ func (f *fakeTransport) Fetch(_ context.Context, r string) error {
 }
 func (f *fakeTransport) Push(_ context.Context, r string) error {
 	f.calls = append(f.calls, "push")
+	if len(f.pushErrs) > 0 {
+		err := f.pushErrs[0]
+		f.pushErrs = f.pushErrs[1:]
+		if err != nil {
+			return err
+		}
+	}
 	f.pushed = append(f.pushed, r)
 	if f.onPush != nil {
 		f.onPush()
@@ -127,6 +135,7 @@ func (p *fakeProvisioner) Provision(_ context.Context, path string) error {
 type fakeDriver struct {
 	scm.Driver
 	family    []scm.Change // what ListOpen returns; tests mutate it, even mid-gate
+	openWrong bool         // OpenDraft answers with a foreign change
 	after     *scm.Change  // what Get returns after the push; nil means the family entry
 	afterList func()       // runs after every ListOpen: state that changes the instant after it was read
 	opened    *scm.DraftSpec
@@ -178,6 +187,10 @@ func (d *fakeDriver) OpenDraft(_ context.Context, spec scm.DraftSpec) (scm.Chang
 		*d.calls = append(*d.calls, "open")
 	}
 	d.opened = &spec
+	if d.openWrong {
+		// The provider answered with a change that is not the one asked for.
+		return scm.Change{ID: "99", SourceBranch: "someone/else", TargetBranch: spec.TargetBranch, Draft: false, State: scm.StateOpen, Author: "stranger"}, nil
+	}
 	return scm.Change{ID: "42", SourceBranch: spec.SourceBranch, TargetBranch: spec.TargetBranch, Draft: true, State: scm.StateOpen, Author: "producer-bot"}, nil
 }
 

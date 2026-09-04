@@ -206,7 +206,16 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 	var res TurnResult
 	var runErr error
 	skipped := false
-	if s.beforeTurn != nil {
+	// A retry marker that names the after-turn step resumes that step
+	// alone: the producer's turn already succeeded and its intent is still
+	// declared; rerunning the model is new work, not a retry (#42).
+	resumeAfterTurn := false
+	if _, onRetry := withoutRetry(triggers); onRetry && s.afterTurn != nil && readRetryStep(s.cfg.RetryPath(s.role)) == RetryStepAfterTurn {
+		resumeAfterTurn = true
+		skipped = true
+		s.log.Info("retry resumes the after-turn step; the agent does not rerun", "turn", turn.ID)
+	}
+	if s.beforeTurn != nil && !resumeAfterTurn {
 		msg, err := s.beforeTurn(ctx, turn)
 		if err != nil && ctx.Err() == nil {
 			// The agent does not run over a tree the step could not prepare.
@@ -302,10 +311,12 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 	}
 	// After a clean turn, the supervisor's own follow-up (submit, for the
 	// producer). Its failure is the turn's failure.
+	afterTurnDisposition := DispositionTransient
 	if runErr == nil && res.ExitCode == 0 && !res.TimedOut && s.afterTurn != nil {
 		msg, err := s.afterTurn(ctx, turn, res)
 		if err != nil {
-			s.log.Error("after-turn step failed; counting the turn as failed", "turn", turn.ID, "err", err)
+			afterTurnDisposition = DispositionOf(err)
+			s.log.Error("after-turn step failed; counting the turn as failed", "turn", turn.ID, "disposition", string(afterTurnDisposition), "err", err)
 			res.ExitCode = ExitAfterTurnFailed
 		} else if msg != "" {
 			s.log.Info("after-turn step", "turn", turn.ID, "result", msg)
@@ -401,6 +412,22 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 		"turn", turn.ID, "exit", res.ExitCode, "timed_out", res.TimedOut,
 		"consumed", didConsume, "progressed", progressed, "spin", spin, "fail_streak", fails)
 
+	if failed && didConsume && !halted && res.ExitCode == ExitAfterTurnFailed && afterTurnDisposition != DispositionTransient {
+		// A blocked or unknown after-turn failure arms nothing: blocked
+		// because no retry can change the answer (the change left the
+		// producer's hands; the declaration is invalid), unknown because a
+		// retry might repeat an external effect whose outcome was not seen.
+		// The step has recorded the block where status and health read it;
+		// the factory idles, visibly, until the operator acts (#42, #40).
+		s.log.Error("after-turn failure is not retried", "turn", turn.ID, "disposition", string(afterTurnDisposition))
+		if onRetry {
+			if err := os.Remove(s.cfg.RetryPath(s.role)); err != nil && !os.IsNotExist(err) {
+				return true, s.haltNow(ended, fmt.Sprintf("could not remove the retry marker after a %s after-turn failure (%v)", afterTurnDisposition, err))
+			}
+		}
+		return false, nil
+	}
+
 	if failed && didConsume && !halted {
 		// The quiet case: the trigger is gone, so nothing external will re-arm,
 		// and to every other signal this now looks like an idle factory. The
@@ -408,7 +435,11 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 		// climb to fail_abort and halt with a reason -- rather than a factory
 		// that sits idle for hours with work stranded (issue #12). A file, not
 		// memory: a retry lost on restart recreates the stall it exists to fix.
-		if err := s.writeRetry(turn, res, fails, ended); err != nil {
+		step := RetryStepTurn
+		if res.ExitCode == ExitAfterTurnFailed {
+			step = RetryStepAfterTurn
+		}
+		if err := s.writeRetry(turn, res, fails, ended, step); err != nil {
 			// Without the marker there is nothing to re-arm on and the factory
 			// would sit idle -- the exact stall, reached through an I/O error.
 			// This is a control-plane failure, and it halts with its reason
@@ -512,32 +543,49 @@ func removeRetry(ts []watch.Trigger) []watch.Trigger {
 // forward from the previous marker rather than recomputed, so that after N
 // retries the file still says what the factory was originally woken for. A
 // marker that only named "retry" would be the record of a record.
-func (s *Supervisor) writeRetry(turn Turn, res TurnResult, fails int, at time.Time) error {
+func (s *Supervisor) writeRetry(turn Turn, res TurnResult, fails int, at time.Time, step string) error {
 	path := s.cfg.RetryPath(s.role)
 	real, onRetry := withoutRetry(turn.Triggers)
 	origin := labels(real)
 	if onRetry && origin == "" {
-		origin = readRetryOrigin(path)
+		origin = readRetryLine(path, "origin: ")
 	}
 	if origin == "" {
 		origin = "unknown"
 	}
 	body := fmt.Sprintf(
-		"retry %d of %d\norigin: %s\nafter turn: %s\nexit: %d\ntimed out: %v\nat: %s\n\n"+
+		"retry %d of %d\norigin: %s\nstep: %s\nafter turn: %s\nexit: %d\ntimed out: %v\nat: %s\n\n"+
 			"The previous turn consumed its trigger and then failed. Nothing else is pending.\n",
-		fails, s.cfg.Supervisor.FailAbort, origin, turn.ID, res.ExitCode, res.TimedOut, at.Format(time.RFC3339))
+		fails, s.cfg.Supervisor.FailAbort, origin, step, turn.ID, res.ExitCode, res.TimedOut, at.Format(time.RFC3339))
 	return os.WriteFile(path, []byte(body), 0o644)
 }
 
-// readRetryOrigin recovers the "origin:" line from an existing marker.
-func readRetryOrigin(path string) string {
+// Retry steps: what the retry marker re-arms. RetryStepTurn reruns the
+// agent; RetryStepAfterTurn resumes the supervisor's own after-turn step
+// over the intent the agent already declared (#42).
+const (
+	RetryStepTurn      = "turn"
+	RetryStepAfterTurn = "after-turn"
+)
+
+// readRetryStep recovers the "step:" line from an existing marker. A marker
+// without one (written by an earlier build) reruns the turn.
+func readRetryStep(path string) string {
+	if v := readRetryLine(path, "step: "); v != "" {
+		return v
+	}
+	return RetryStepTurn
+}
+
+// readRetryLine recovers one prefixed line from an existing marker.
+func readRetryLine(path, prefix string) string {
 	raw, err := os.ReadFile(path)
 	if err != nil {
 		return ""
 	}
 	for _, line := range strings.Split(string(raw), "\n") {
-		if strings.HasPrefix(line, "origin: ") {
-			return strings.TrimPrefix(line, "origin: ")
+		if strings.HasPrefix(line, prefix) {
+			return strings.TrimPrefix(line, prefix)
 		}
 	}
 	return ""

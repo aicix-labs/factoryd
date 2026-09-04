@@ -66,6 +66,8 @@ type RoleView struct {
 	HaltReason string          `json:"halt_reason,omitempty"`
 	// LastHalt is a cleared halt: information, not a need.
 	LastHalt *state.Halt `json:"last_halt,omitempty"`
+	// Blocked is a submission that will not be retried: a need (#42).
+	Blocked *state.Block `json:"blocked,omitempty"`
 
 	Turn    *TurnView     `json:"turn,omitempty"`
 	Pending []PendingView `json:"pending,omitempty"`
@@ -189,7 +191,7 @@ func (c *Collector) Collect(ctx context.Context) Snapshot {
 	for _, r := range state.Roles {
 		rs := st.Role(r)
 		role := string(r)
-		v := RoleView{WatchMode: rs.WatchMode, Halted: rs.Halted, HaltReason: rs.HaltReason, LastHalt: rs.LastHalt, Spin: rs.SpinCount, Fails: rs.FailStreak, LeftoverTurns: rs.LeftoverTurns}
+		v := RoleView{WatchMode: rs.WatchMode, Halted: rs.Halted, HaltReason: rs.HaltReason, LastHalt: rs.LastHalt, Blocked: rs.Blocked, Spin: rs.SpinCount, Fails: rs.FailStreak, LeftoverTurns: rs.LeftoverTurns}
 		if rs.Supervisor != nil {
 			v.Supervisor = &SupervisorView{PID: rs.Supervisor.PID, StartedAt: rs.Supervisor.StartedAt}
 			alive, err := c.deps.Alive(*rs.Supervisor)
@@ -315,6 +317,9 @@ func needsMe(cfg *config.Config, s Snapshot, st *state.State) []string {
 	}
 	for _, r := range state.Roles {
 		v := s.Roles[string(r)]
+		if b := v.Blocked; b != nil {
+			out = append(out, fmt.Sprintf("%s submission %s and not retried: %s -- fix the cause and run factoryd submit; a successful submission clears this", r, b.Disposition, b.Reason))
+		}
 		switch {
 		case v.Halted:
 			// The remedy is phrased from the sentinel's CURRENT existence, not
@@ -365,7 +370,7 @@ func working(s Snapshot) bool {
 	}
 	for _, r := range state.Roles {
 		v := s.Roles[string(r)]
-		if v.Halted || v.Stopped || v.Supervisor == nil || v.Alive == nil || !*v.Alive {
+		if v.Halted || v.Stopped || v.Blocked != nil || v.Supervisor == nil || v.Alive == nil || !*v.Alive {
 			return false
 		}
 	}

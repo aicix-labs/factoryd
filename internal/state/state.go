@@ -122,6 +122,13 @@ type RoleState struct {
 	// logged a failure, so the restart persists the sentinel and refuses
 	// once, and the removal of that sentinel is the acknowledgement (#37).
 	SentinelWritten *bool `json:"sentinel_written,omitempty"`
+	// Blocked is a submission the producer's after-turn step could not
+	// complete and must not retry: blocked (no retry can change the answer)
+	// or unknown (a retry might repeat an external effect). It is durable,
+	// operator-visible in status and health, cleared only by a later
+	// submission that succeeds -- never by progress, a restart, or a new
+	// turn (#42).
+	Blocked *Block `json:"blocked,omitempty"`
 	// LeftoverTurns counts turns that recorded progress but left processes
 	// behind after the leader exited. The strays are killed and verified
 	// gone; the turn stands (#33). The count is the hygiene signal an
@@ -132,6 +139,19 @@ type RoleState struct {
 	// the operator's restart after removing the sentinel (#30); a halt that
 	// nothing cleared kept health and status red after the role recovered.
 	LastHalt *Halt `json:"last_halt,omitempty"`
+}
+
+// Block is a submission that will not be retried automatically.
+type Block struct {
+	Disposition string    `json:"disposition"` // blocked or unknown
+	Reason      string    `json:"reason"`
+	Turn        string    `json:"turn,omitempty"`
+	Family      string    `json:"family,omitempty"`
+	Digest      string    `json:"digest,omitempty"`
+	At          time.Time `json:"at"`
+	// Quarantined lists the declaration files moved aside, so the intent
+	// is not resubmitted by the next turn and is not lost either.
+	Quarantined []string `json:"quarantined,omitempty"`
 }
 
 // Bool is a pointer to b, for the tri-state fields.

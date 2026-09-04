@@ -3,6 +3,7 @@ package supervise_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -1465,5 +1466,113 @@ func TestBeforeTurnRunsFirstAndItsFailureIsAFailedTurnWithoutRunningTheAgent(t *
 	}
 	if _, err := os.Stat(filepath.Join(fx2.inbox, "wake")); err != nil {
 		t.Fatalf("the trigger was consumed by a turn that never ran: %v", err)
+	}
+}
+
+type disposedErr struct {
+	d supervise.Disposition
+}
+
+func (e disposedErr) Error() string                      { return "after-turn: " + string(e.d) }
+func (e disposedErr) Disposition() supervise.Disposition { return e.d }
+
+// The disposition of an after-turn failure decides what follows (#42): a
+// transient one re-arms a retry of the after-turn step alone, resumed
+// without rerunning the agent; a blocked one and an unknown one arm
+// nothing. An error with no disposition is unknown.
+func TestAfterTurnDispositionDecidesWhatIsRetried(t *testing.T) {
+	if d := supervise.DispositionOf(errors.New("plain")); d != supervise.DispositionUnknown {
+		t.Fatalf("an unclassified error is %s, want unknown", d)
+	}
+	if d := supervise.DispositionOf(fmt.Errorf("wrapped: %w", disposedErr{supervise.DispositionBlocked})); d != supervise.DispositionBlocked {
+		t.Fatalf("a wrapped disposition was lost: %s", d)
+	}
+
+	// Transient: the retry resumes the after-turn step; the agent ran once.
+	fx := newFixture(t)
+	fx.wake(t)
+	afterCalls := 0
+	fx.afterTurn = func(context.Context, supervise.Turn, supervise.TurnResult) (string, error) {
+		afterCalls++
+		if afterCalls == 1 {
+			return "", disposedErr{supervise.DispositionTransient}
+		}
+		return "submitted", nil
+	}
+	r := &fakeRunner{act: func(_ int, tr supervise.Turn) supervise.TurnResult {
+		for _, trig := range tr.Triggers {
+			os.Remove(trig.Path)
+		}
+		fx.progress(t)
+		return supervise.TurnResult{}
+	}}
+	s := fx.newSupervisor(t, r, 2)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal(err)
+	}
+	if r.count() != 1 || afterCalls != 2 {
+		t.Fatalf("agent ran %d times, after-turn %d times; want 1 and 2: the retry resumes submit, it does not rerun the agent", r.count(), afterCalls)
+	}
+	if _, err := os.Stat(fx.cfg.RetryPath("reviewer")); !os.IsNotExist(err) {
+		t.Fatalf("the retry marker survived the resumed step (err=%v)", err)
+	}
+	s.Close()
+
+	// Blocked and unknown: nothing armed, the agent ran once, the factory idles.
+	for _, d := range []supervise.Disposition{supervise.DispositionBlocked, supervise.DispositionUnknown} {
+		fx := newFixture(t)
+		fx.wake(t)
+		calls := 0
+		fx.afterTurn = func(context.Context, supervise.Turn, supervise.TurnResult) (string, error) {
+			calls++
+			return "", disposedErr{d}
+		}
+		r := &fakeRunner{act: func(_ int, tr supervise.Turn) supervise.TurnResult {
+			for _, trig := range tr.Triggers {
+				os.Remove(trig.Path)
+			}
+			fx.progress(t)
+			return supervise.TurnResult{}
+		}}
+		s := fx.newSupervisor(t, r, 50)
+		ctx, cancel := context.WithTimeout(context.Background(), 3*time.Second)
+		err := s.Run(ctx)
+		cancel()
+		if err != nil && !errors.Is(err, context.DeadlineExceeded) {
+			t.Fatalf("%s: %v", d, err)
+		}
+		if r.count() != 1 || calls != 1 {
+			t.Fatalf("%s: agent ran %d times, after-turn %d times; want 1 and 1", d, r.count(), calls)
+		}
+		if _, err := os.Stat(fx.cfg.RetryPath("reviewer")); !os.IsNotExist(err) {
+			t.Fatalf("%s: a retry was armed", d)
+		}
+		if rs := fx.roleState(t); rs.Halted || rs.LastTurn == nil || *rs.LastTurn.ExitCode != supervise.ExitAfterTurnFailed {
+			t.Fatalf("%s: state %+v", d, rs.LastTurn)
+		}
+		s.Close()
+	}
+}
+
+// A retry marker from an earlier build has no step line: it reruns the
+// turn, as it always did.
+func TestRetryMarkerWithoutAStepRerunsTheTurn(t *testing.T) {
+	fx := newFixture(t)
+	if err := os.WriteFile(fx.cfg.RetryPath("reviewer"), []byte("retry 1 of 3\norigin: wake\nat: now\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	after := 0
+	fx.afterTurn = func(context.Context, supervise.Turn, supervise.TurnResult) (string, error) { after++; return "", nil }
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult { fx.progress(t); return supervise.TurnResult{} }}
+	s := fx.newSupervisor(t, r, 1)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal(err)
+	}
+	if r.count() != 1 || after != 1 {
+		t.Fatalf("agent %d, after-turn %d; want 1 and 1", r.count(), after)
 	}
 }

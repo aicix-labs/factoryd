@@ -55,6 +55,11 @@ and the gate never marks a draft ready.
 
 ## What works today
 
+A submission submit refuses for a reason that cannot change is not retried:
+the block is recorded, the declaration quarantined, and `status` and `health`
+say so until a submission succeeds; a transient failure resumes submit without
+rerunning the producer (SPEC §3).
+
 The producer's workdir is refreshed to the target branch at the start of a
 cycle — after a refresh, after the draft it produced merged, or after a turn
 that produced no change — by a helper

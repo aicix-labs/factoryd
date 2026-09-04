@@ -707,3 +707,22 @@ func TestOpenCacheRootRefusals(t *testing.T) {
 		t.Fatal("a relative root was opened")
 	}
 }
+
+// A blocked submission is a standing condition until a submission succeeds
+// (#42): a factory idling on a refusal that cannot change must not read
+// as healthy.
+func TestBlockedSubmissionIsACondition(t *testing.T) {
+	l := newLab(t)
+	l.withState(t, func(s *state.State) {
+		s.Role(state.RoleProducer).Blocked = &state.Block{Disposition: "blocked", Reason: "change 53 is no longer a draft\nmore", Turn: "producer-1", Family: "fix/x", At: l.now}
+	})
+	rep := l.tick(t)
+	if !hasKey(rep, "blocked/producer") {
+		t.Fatalf("findings=%v", keys(rep))
+	}
+	for _, f := range rep.Findings {
+		if f.Key == "blocked/producer" && (!strings.Contains(f.Summary, "change 53 is no longer a draft") || strings.Contains(f.Summary, "more") || !strings.Contains(f.Detail, "factoryd submit")) {
+			t.Fatalf("finding %+v", f)
+		}
+	}
+}

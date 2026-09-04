@@ -362,6 +362,10 @@ func checkRoles(cfg *config.Config, st *state.State, p Probes, at time.Time) []F
 				Detail: fmt.Sprintf("halted at %s; %s", rs.HaltedAt.Format(time.RFC3339), remedy)})
 			continue
 		}
+		if b := rs.Blocked; b != nil {
+			out = append(out, Finding{Key: "blocked/" + role, Summary: fmt.Sprintf("%s submission %s: %s", role, b.Disposition, firstLine(b.Reason)),
+				Detail: fmt.Sprintf("turn %s at %s; family %s; not retried automatically -- fix the cause and submit again (factoryd submit), which clears this", b.Turn, b.At.Format(time.RFC3339), b.Family)})
+		}
 		if rs.Supervisor != nil {
 			alive, err := p.Alive(*rs)
 			switch {
@@ -711,4 +715,11 @@ func (r Report) Summary() string {
 		fmt.Fprintf(&sb, "  recovered %s\n", k)
 	}
 	return sb.String()
+}
+
+func firstLine(s string) string {
+	if i := strings.IndexByte(s, '\n'); i >= 0 {
+		return s[:i]
+	}
+	return s
 }

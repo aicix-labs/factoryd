@@ -534,3 +534,27 @@ func TestLeftoverTurnsAreShownAsHygiene(t *testing.T) {
 		t.Fatalf("text:\n%s", status.Text(s))
 	}
 }
+
+// A blocked submission is a need, not information (#42).
+func TestBlockedSubmissionIsANeed(t *testing.T) {
+	l := newLab(t)
+	l.state(t, func(s *state.State) {
+		s.Role(state.RoleProducer).Blocked = &state.Block{Disposition: "blocked", Reason: "change 53 is no longer a draft", At: l.now}
+	})
+	s := l.collect()
+	if s.Working {
+		t.Fatal("a factory with a blocked submission reads as working")
+	}
+	found := false
+	for _, n := range s.NeedsMe {
+		if strings.Contains(n, "not retried") && strings.Contains(n, "change 53") {
+			found = true
+		}
+	}
+	if !found {
+		t.Fatalf("needs=%v", s.NeedsMe)
+	}
+	if !strings.Contains(status.Text(s), "submission blocked (change 53 is no longer a draft)") {
+		t.Fatalf("text:\n%s", status.Text(s))
+	}
+}
