@@ -43,9 +43,11 @@ pretending.
 | 6 | Health tick, alert transports (`file`, `command`), resource guards, bounded caches | **done** |
 | 7 | Status page: `factoryd status`, HTML + JSON, read-only | **done** |
 
-`factoryd signal` and `audit` exit non-zero with "not implemented in
-this build". A subcommand that silently did nothing would be
-indistinguishable from one that ran and found nothing to do.
+Every verb in the SPEC's surface is built. `signal merged` is the merge gate:
+the `scope` policy in the config (deny / allow / hold-diff / escalate regexes,
+preserved from v1 as data) decides what may merge, what needs a recorded
+adversarial audit on the exact head, and what a human must approve — and a
+gate result never substitutes a verdict the reviewer did not choose.
 
 ## What works today
 
@@ -124,6 +126,20 @@ changes   1 open as of 2026-09-04T14:01:40Z
   61     draft producer/fix-3f9a1c2b7d -> main  gate: match command position
 verdict   operator-gated on 61 at 2026-09-04T13:58:02Z: touches deploy/ (escalate-class path)
 $ factoryd status --config f.json --config g.json --serve 127.0.0.1:8080
+```
+
+the reviewer's verdict, where `merged` is the merge gate:
+
+```console
+$ factoryd signal --config f.json 61 merged auto --summary "cleared: authz bypass attempts recorded"
+factoryd signal: scope policy requires an adversarial audit of 61 at 3f9a1c2b7d: no CLEARED audit is recorded on this head
+  internal/auth/session.go matches escalate "(^|/)(auth|authn|authz|login|session|oauth|jwt|token)"
+$ echo $?
+5
+$ factoryd audit --config f.json post 61 3f9a1c2b7d --lens authz-bypass --verdict CLEARED --file attempts.json
+audit authz-bypass CLEARED posted on 61 at 3f9a1c2b7d by factory-reviewer (3 attempts)
+$ factoryd signal --config f.json 61 merged auto --summary "cleared: authz bypass attempts recorded"
+merged 61 at 3f9a1c2b7d merged as 8c2e41d0aa (verified); wrote /var/lib/factoryd/widgets/outbox/61.json
 ```
 
 a supervised role loop, where the agent turn is any command you configure:

@@ -827,6 +827,41 @@ by the merge gate, not by convention. An audit that records **no attempts** must
 rejected: *an audit that lists nothing tried is not a pass.* v1 enforced this and it
 caught a real omission; keep it.
 
+**The merge gate is `factoryd signal <id> merged`**, and the policy it enforces is
+the `scope` block of the config (§2 "scope policy as data"), in Go RE2 syntax,
+compiled at load — a pattern that does not compile refuses the config, because a
+policy with a silently dropped rule is a policy with a hole where the operator
+believes there is a rule. A config with no scope block is refused; an empty policy
+must be declared, not arrived at by omission.
+
+The gate, in order, on the diff of the head the verdict names:
+
+1. **Deny.** A changed path (both names of a rename; a deletion counts) matching a
+   `deny_regexes` pattern and no `allow_regexes` pattern is *operator-only*.
+2. **Hold.** An **added** diff line — not a removed one, not a `+++` header —
+   matching a `hold_diff_regexes` pattern is *operator-only*, whatever its path.
+3. **Escalate.** A changed path matching an `escalate_regexes` pattern requires a
+   recorded audit **on the exact head**: at least one `CLEARED` with attempts, and
+   no `BROKEN`. An audit on an earlier head is an audit of something else.
+
+The strictest class wins and every reason is kept and shown. **An operator-only
+result refuses the `merged` signal; it does not downgrade it.** The reviewer then
+signals `operator-gated` themselves, so the recorded verdict is always the one the
+reviewer chose, never one the gate substituted behind their back. The `sha` argument
+must be the change's current head (`auto` means "the head now"); a verdict on a
+commit that has since been replaced is a verdict on something the producer no
+longer has, and is refused as *head moved*. Then: mark ready (the reviewer's act,
+never the producer's), merge with the expected head, verify by ancestry (§5.1).
+Every verdict is written to `outbox/<id>.json` first — that is the handoff — then
+recorded in the state document, then posted as a comment; a failed comment is
+said, not fatal. Exit **0** done · **3** config/identity · **5** refused (scope,
+audit, head moved, provider) · **6** the provider claimed a merge the repository
+does not show.
+
+`factoryd audit post <id> <sha> --lens <l> --verdict CLEARED|BROKEN --file <f>`
+records the pass, as the reviewer, pinned to the head that exists; the file lists
+the attempts, and no attempts is refused before any request is made.
+
 ---
 
 ## 7. Health, alerts, resources
@@ -1056,6 +1091,10 @@ red when it does. Nothing here is satisfied by a passing suite alone.
 | §8 throttle after failure | a failed refresh followed by reloads inside the TTL → the provider is asked **no** further time; after the TTL, once | — the positive control is the refresh after the TTL |
 | §8 unreadable health | a health document that is not JSON, or cannot be read → named, an error, *not working*, and not "the tick never ran" | an absent document reads as absent |
 | §8 no process-supplied label | a secret planted in the supervisor's recorded argv, in a live process's arguments, in its **comm** (rewritten by the process) and in its **executable path** (a copy named after the secret) appears in none of HTML, JSON or text | the processes **are** shown, by pid, labelled `turn` and `child` from factoryd's own records |
+| §6.4 the gate refuses | a deny path (either name of a rename), held content on an added line, an escalate path with no audit / a `BROKEN` audit / an audit on another head / an audit that tried nothing, a moved head, a closed change, an empty diff, a provider refusal → `merged` is refused **before** any merge call (the provider's own refusal excepted), no verdict file is written | a mergeable change is readied, merged with the expected head, verified, and recorded in file, state and comment |
+| §6.4 refuse, not downgrade | an operator-only result refuses; the recorded verdict is never one the gate substituted | the reviewer's own `operator-gated` signal records without merging |
+| §6.4 hold is on additions | a removed key and a `+++` header do not hold; an added key does | — |
+| §6.4 policy compiles | a pattern that does not compile, or is empty, or a config with no scope block → refused at load | the example policy loads |
 | §7 root replaced after doctor | the root itself, or its renamed parent, replaced by a symlink after `doctor` passed → `cache_unsafe`, nothing deleted | — |
 | §7 symlink entry | a symlink entry is removed as a link; its target is intact | the link itself is gone and counted |
 | §7 could not look | a volume that will not stat, a provider that will not answer, a corrupt state document → `factoryd health` exits **3** | findings alone exit 1; a live supervisor exits 0 |

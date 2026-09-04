@@ -34,6 +34,11 @@ usage:
                                                      exits 0 healthy, 1 findings, 3 could not look
   factoryd status    --config <f> [--config <g>] [--serve :8080] [--json] [--provider=false]
                                                      read-only: is it working, what is it doing, what is it waiting on, what needs me
+  factoryd signal    --config <f> <id> <verdict> <sha|auto> --summary <s>
+                                                     record the reviewer's verdict; "merged" IS the merge gate
+                                                     exits 0 done, 3 config, 5 refused (scope/audit/head/provider), 6 merge unknown
+  factoryd audit     --config <f> post <id> <sha> --lens <l> --verdict CLEARED|BROKEN --file <f>
+                                                     record an adversarial pass on the head; no attempts is not a pass
   factoryd scm       --config <f> <verb>...         drive the provider directly
   factoryd version
 
@@ -82,6 +87,10 @@ func main() {
 		os.Exit(runHealth(args))
 	case "status":
 		os.Exit(runStatus(args))
+	case "signal":
+		os.Exit(runSignal(args))
+	case "audit":
+		os.Exit(runAudit(args))
 	case "scm":
 		os.Exit(runSCM(args))
 	case "version":
@@ -90,13 +99,6 @@ func main() {
 	case "-h", "--help", "help":
 		fmt.Print(usage)
 		os.Exit(exitOK)
-	case "signal", "audit":
-		// Named explicitly so the failure says what is missing. A subcommand
-		// that silently did nothing would be indistinguishable from one that
-		// ran and found nothing to do.
-		fmt.Fprintf(os.Stderr,
-			"factoryd %s: not implemented in this build (see SPEC.md §11 delivery sequence)\n", cmd)
-		os.Exit(exitConfig)
 	default:
 		fmt.Fprintf(os.Stderr, "factoryd: unknown command %q\n\n%s", cmd, usage)
 		os.Exit(exitError)

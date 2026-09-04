@@ -76,6 +76,14 @@ func (d *Driver) mrPath(id scm.ChangeID, suffix string) string {
 // ---------- wire types ----------
 
 type glMR struct {
+	// ChangesCount is GitLab's own count, as a string ("3", "1000+"). It is
+	// how "the diff is empty" is told apart from "the diff is not computed
+	// yet": right after an MR is opened, the diffs endpoint returns nothing
+	// while this says otherwise.
+	ChangesCount string `json:"changes_count"`
+	DiffRefs     *struct {
+		HeadSHA string `json:"head_sha"`
+	} `json:"diff_refs"`
 	IID          int       `json:"iid"`
 	Title        string    `json:"title"`
 	Author       glUser    `json:"author"`
@@ -188,6 +196,50 @@ func (d *Driver) Get(ctx context.Context, id scm.ChangeID) (scm.Change, error) {
 }
 
 func (d *Driver) Diff(ctx context.Context, id scm.ChangeID) ([]scm.FileDiff, error) {
+	// GitLab computes an MR's diff asynchronously. Observed live: the diffs
+	// endpoint returned an empty list seconds after the MR was opened, while
+	// the MR itself reported changes. An empty list is therefore accepted
+	// only when the MR says it has no changes; otherwise the read is retried
+	// for a bounded time and then fails. Reporting "no changes" for a diff
+	// that is not ready would let a merge gate classify against nothing.
+	for attempt := 0; ; attempt++ {
+		out, err := d.readDiffs(ctx, id)
+		if err != nil {
+			return nil, err
+		}
+		if len(out) > 0 {
+			return out, nil
+		}
+		m, err := d.get(ctx, id)
+		if err != nil {
+			return nil, fmt.Errorf("gitlab diff %s: %w", id, err)
+		}
+		if m.ChangesCount == "0" && m.DiffRefs != nil {
+			return out, nil // genuinely empty, and the diff is computed
+		}
+		if attempt >= diffSettleAttempts {
+			return nil, fmt.Errorf("gitlab diff %s: the diff is not available yet (changes_count %q); refusing to report it as empty", id, m.ChangesCount)
+		}
+		if err := diffSettleSleep(ctx, attempt); err != nil {
+			return nil, err
+		}
+	}
+}
+
+// diffSettleAttempts and diffSettleSleep bound the wait; tests shorten it.
+var (
+	diffSettleAttempts = 8
+	diffSettleSleep    = func(ctx context.Context, attempt int) error {
+		select {
+		case <-ctx.Done():
+			return ctx.Err()
+		case <-time.After(time.Duration(250*(attempt+1)) * time.Millisecond):
+			return nil
+		}
+	}
+)
+
+func (d *Driver) readDiffs(ctx context.Context, id scm.ChangeID) ([]scm.FileDiff, error) {
 	type glDiff struct {
 		OldPath     string `json:"old_path"`
 		NewPath     string `json:"new_path"`
