@@ -114,11 +114,19 @@ once a turn has started on the tree, `submitting` from the moment submit has
 validated an intent and *before* it pushes (so a crash between the draft's
 creation and the record of it leaves a phase that forbids a refresh), `open`
 with the draft's `change_id` (supersession moves the id to the newest member of
-the family), and `finished` when the verdict `merged` names *that* id — a merge
-of an older member or an unrelated draft changes nothing. Refresh runs only at
-`new` and `finished`; `working` keeps a first turn's edits through the retry
-that follows its failure; a document written before the record existed loads
-as `unknown`, and unknown authorizes nothing. A refresh that fails is a failed
+the family), `finished` when the verdict `merged` names *that* id — a merge of
+an older member or an unrelated draft changes nothing — and `clean` when a turn
+consumed its trigger and declared nothing, or declared a tree identical to the
+target: the cycle produced no change, and the next brief starts a new one
+(undeclared edits do not survive it; an edit the producer wanted would have
+been declared, §6.2). The open draft is recorded *before* the reviewer is
+woken, and both orderings converge: a `merged` verdict already on file for the
+change finishes the cycle at record time, and a `merged` verdict naming the
+immutable branch of a cycle still `submitting` finishes it from the signal
+side. Refresh runs only at `new`, `finished` and `clean`; `working` keeps a
+first turn's edits through the retry that follows its failure; a document
+written before the record existed loads as `unknown`, and unknown authorizes
+nothing. A refresh that fails is a failed
 turn on the streak (exit 1002), and the agent does not run over a tree the step
 could not prepare. `factoryd refresh --config <f>` is the same step by hand,
 refused outside `new`/`finished` unless `--force`d, which is the operator's

@@ -107,7 +107,8 @@ func short(s string) string {
 
 // Decide says whether a refresh may run now, from the cycle record alone.
 // Only the start of a cycle qualifies: CycleNew (nothing has touched the
-// tree) and CycleFinished (its draft merged). Working, submitting and open
+// tree), CycleFinished (its draft merged) and CycleClean (it produced no
+// change). Working, submitting and open
 // name the producer's work; unknown is unknown. Absence is never "no
 // draft": a nil cycle is unknown too.
 func Decide(st *state.State) (run bool, reason string) {
@@ -116,7 +117,7 @@ func Decide(st *state.State) (run bool, reason string) {
 		return false, "no cycle record; unknown authorizes nothing (`factoryd refresh --force` starts a new cycle)"
 	}
 	switch c.Phase {
-	case state.CycleNew, state.CycleFinished:
+	case state.CycleNew, state.CycleFinished, state.CycleClean:
 		return true, ""
 	case state.CycleWorking:
 		return false, "cycle is working: a turn has edited this tree and no draft has merged"

@@ -27,6 +27,7 @@ import (
 	"github.com/aicix-labs/factoryd/internal/gittransport"
 	"github.com/aicix-labs/factoryd/internal/scm"
 	"github.com/aicix-labs/factoryd/internal/state"
+	"github.com/aicix-labs/factoryd/internal/supervise"
 )
 
 // Exit codes are the CLI contract.
@@ -149,6 +150,9 @@ type Deps struct {
 	Producer scm.Identity
 	// Now is injectable for deterministic timestamps.
 	Now func() time.Time
+	// Wake signals the reviewer. Nil touches inbox/wake. Injectable so a
+	// test can interleave the reviewer's merge with the wake itself.
+	Wake func() error
 	// Log receives progress. Nil discards.
 	Log io.Writer
 }
@@ -208,6 +212,9 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 				fmt.Fprintf(log, "  %s\n", p)
 			}
 		}
+		if err := RecordNoWork(cfg, deps.Now()); err != nil {
+			return Result{}, wrap(ExitConfig, err, "recording the clean cycle")
+		}
 		return r, nil
 	}
 	if branch == cfg.TargetBranch {
@@ -243,6 +250,9 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		return Result{}, wrap(ExitConfig, err, "committing")
 	}
 	if !committed {
+		if err := RecordNoWork(cfg, deps.Now()); err != nil {
+			return Result{}, wrap(ExitConfig, err, "recording the clean cycle")
+		}
 		return Result{Exit: ExitNothing, Reason: "the producer's tree is identical to " + cfg.TargetBranch + "; nothing to submit"}, nil
 	}
 	tree, err := deps.Git.Tree(ctx)
@@ -270,6 +280,11 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		}
 		if c.SourceBranch == branch {
 			existing := c
+			// The cycle names the draft this tree already is, so its
+			// merge finishes the cycle even if the record was lost.
+			if err := recordOpen(cfg, deps.Now(), declared, branch, string(existing.ID)); err != nil {
+				return Result{}, wrap(ExitConfig, err, "recording the open draft in state")
+			}
 			return Result{Exit: ExitNothing, Change: &existing, Branch: branch,
 				Reason: fmt.Sprintf("this tree is already submitted as %s on %s; nothing new to submit", existing.ID, branch)}, nil
 		}
@@ -446,24 +461,101 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		fmt.Fprintf(log, "draft: supersedes %s (left open for the reviewer)\n", id)
 	}
 
-	// 9. Signal the reviewer and retire the control files.
-	if err := touch(filepath.Join(cfg.InboxDir(), "wake")); err != nil {
+	// 9. Record the open draft, THEN signal the reviewer, then retire the
+	// control files. The order matters: a reviewer woken before the record
+	// could merge and signal while the cycle still said submitting, and the
+	// record written afterwards would bury that verdict under "open" with
+	// no later signal to finish it (#41 review). recordOpen also converges
+	// the other way round: a merged verdict already on file for this
+	// change finishes the cycle instead of opening it.
+	if err := recordOpen(cfg, deps.Now(), declared, branch, string(change.ID)); err != nil {
+		return Result{}, wrap(ExitConfig, err, "recording the open draft in state")
+	}
+	wake := deps.Wake
+	if wake == nil {
+		wake = func() error { return touch(filepath.Join(cfg.InboxDir(), "wake")) }
+	}
+	if err := wake(); err != nil {
 		return Result{}, wrap(ExitConfig, err, "signalling the reviewer")
 	}
 	for _, f := range []string{BranchFile, CommitMsgFile} {
 		_ = os.Remove(filepath.Join(work, f))
 	}
-	// The draft is open: the cycle names it. Supersession moves the id to
-	// the newest member of the family; the merge of THAT id finishes the
-	// cycle (#35).
-	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
-		c := st.SetCycle(state.CycleOpen, deps.Now())
-		c.Family, c.Digest, c.ChangeID = declared, branch, string(change.ID)
-		return nil
-	}); err != nil {
-		return Result{}, wrap(ExitConfig, err, "recording the open draft in state")
-	}
 	return Result{Exit: ExitSubmitted, Reason: "submitted", Change: &change, Branch: branch, Supersedes: supersedes}, nil
+}
+
+// AfterTurn is the SUBMIT step of the §3 loop as the producer supervisor
+// runs it: after a producer turn that declared intent, submit runs outside
+// the sandbox, as factoryd. A turn that declared nothing is a clean cycle
+// (exit 4 is not a failure) -- recorded here, without building submit's
+// dependencies, because the ordinary no-op turn must not leave the cycle
+// "working" for good (#41 review); a red gate has already written its
+// question and woken the reviewer (exit 5, not a failure either); only a
+// configuration or identity failure (3) is the supervisor's to count.
+func AfterTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, error)) func(ctx context.Context, t supervise.Turn, res supervise.TurnResult) (string, error) {
+	return func(ctx context.Context, t supervise.Turn, res supervise.TurnResult) (string, error) {
+		// The same reader submit uses, so a declaration submit would refuse --
+		// one file without the other, a link, a fifo -- is a failed after-turn
+		// here too, not "no intent" and a consumed trigger over stranded work.
+		if _, err := ReadIntent(cfg.TurnWorkdir("producer")); err != nil {
+			if errors.Is(err, ErrNoIntent) {
+				if err := RecordNoWork(cfg, time.Now()); err != nil {
+					return "", fmt.Errorf("submit: recording the clean cycle: %w", err)
+				}
+				return "no intent declared; nothing to submit", nil
+			}
+			return "", fmt.Errorf("submit: the producer's intent is not a valid declaration: %w", err)
+		}
+		deps, err := mkDeps(ctx)
+		if err != nil {
+			return "", fmt.Errorf("submit: %w", err)
+		}
+		r, err := Run(ctx, cfg, deps)
+		if err != nil {
+			return "", fmt.Errorf("submit: %w", err)
+		}
+		switch r.Exit {
+		case ExitSubmitted:
+			return fmt.Sprintf("submitted %s as draft %s", r.Branch, r.Change.ID), nil
+		case ExitGateRed:
+			return "gate red: " + r.Reason, nil
+		default:
+			return r.Reason, nil
+		}
+	}
+}
+
+// recordOpen names the open draft in the cycle. Supersession moves the id
+// to the newest member of the family; the merge of THAT id finishes the
+// cycle (#35). If the merged verdict for this very change is already on
+// file -- the reviewer was faster than the record -- the cycle is finished
+// here, so either ordering converges.
+func recordOpen(cfg *config.Config, now time.Time, declared, branch, changeID string) error {
+	_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		phase := state.CycleOpen
+		if v := st.LastVerdict; v != nil && v.Kind == state.VerdictMerged && v.ChangeID == changeID {
+			phase = state.CycleFinished
+		}
+		c := st.SetCycle(phase, now)
+		c.Family, c.Digest, c.ChangeID = declared, branch, changeID
+		return nil
+	})
+	return err
+}
+
+// RecordNoWork marks the cycle clean: the turn declared nothing, or a tree
+// identical to the target. Shared by submit and the supervisor's after-turn
+// step, which short-circuits the no-intent case without building submit's
+// dependencies. A cycle that is already open, finished or unknown is left
+// as it is: "nothing new this turn" says nothing about a draft in flight.
+func RecordNoWork(cfg *config.Config, now time.Time) error {
+	_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		if c := st.Cycle; c != nil && (c.Phase == state.CycleNew || c.Phase == state.CycleWorking) {
+			st.SetCycle(state.CycleClean, now)
+		}
+		return nil
+	})
+	return err
 }
 
 // readControl reads a control file. Absent or blank means "not declared".

@@ -102,38 +102,8 @@ func submitDeps(ctx context.Context, cfg *config.Config) (submit.Deps, error) {
 	}, nil
 }
 
-// producerAfterTurn is the SUBMIT step of the §3 loop: after a producer turn
-// that declared intent, submit runs outside the sandbox, as factoryd. A
-// turn that declared nothing is left alone (exit 4 is not a failure); a
-// red gate has already written its question and woken the reviewer (exit
-// 5, not a failure either); only a configuration or identity failure (3)
-// is the supervisor's to count.
+// producerAfterTurn is the SUBMIT step of the §3 loop: submit.AfterTurn with
+// the real dependencies.
 func producerAfterTurn(cfg *config.Config) func(ctx context.Context, t supervise.Turn, res supervise.TurnResult) (string, error) {
-	return func(ctx context.Context, t supervise.Turn, res supervise.TurnResult) (string, error) {
-		// The same reader submit uses, so a declaration submit would refuse --
-		// one file without the other, a link, a fifo -- is a failed after-turn
-		// here too, not "no intent" and a consumed trigger over stranded work.
-		if _, err := submit.ReadIntent(cfg.TurnWorkdir("producer")); err != nil {
-			if errors.Is(err, submit.ErrNoIntent) {
-				return "no intent declared; nothing to submit", nil
-			}
-			return "", fmt.Errorf("submit: the producer's intent is not a valid declaration: %w", err)
-		}
-		deps, err := submitDeps(ctx, cfg)
-		if err != nil {
-			return "", fmt.Errorf("submit: %w", err)
-		}
-		r, err := submit.Run(ctx, cfg, deps)
-		if err != nil {
-			return "", fmt.Errorf("submit: %w", err)
-		}
-		switch r.Exit {
-		case submit.ExitSubmitted:
-			return fmt.Sprintf("submitted %s as draft %s", r.Branch, r.Change.ID), nil
-		case submit.ExitGateRed:
-			return "gate red: " + r.Reason, nil
-		default:
-			return r.Reason, nil
-		}
-	}
+	return submit.AfterTurn(cfg, func(ctx context.Context) (submit.Deps, error) { return submitDeps(ctx, cfg) })
 }

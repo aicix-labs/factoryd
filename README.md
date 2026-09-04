@@ -56,7 +56,8 @@ and the gate never marks a draft ready.
 ## What works today
 
 The producer's workdir is refreshed to the target branch at the start of a
-cycle — after a refresh, or after the draft it produced merged — by a helper
+cycle — after a refresh, after the draft it produced merged, or after a turn
+that produced no change — by a helper
 running as the producer, under the producer's sandbox, from a bundle factoryd
 wrote; the cycle is a write-ahead record in state, and a partial edit, an open
 draft, or a document from before the record is never reset away (`factoryd

@@ -155,6 +155,13 @@ const (
 	CycleOpen = "open"
 	// CycleFinished: the draft named by ChangeID merged.
 	CycleFinished = "finished"
+	// CycleClean: a turn consumed its trigger and declared nothing, or
+	// declared a tree identical to the target. The cycle produced no
+	// change; the next brief starts a new one. Without this a no-op turn
+	// left "working" behind for good, and the stale workdir returned (#41
+	// review). Undeclared edits do not survive it: an edit the producer
+	// wanted would have been declared (#12).
+	CycleClean = "clean"
 	// CycleUnknown: the document predates the record, or the record was
 	// unreadable. Unknown authorizes nothing; the operator's forced refresh
 	// starts the next cycle.
@@ -416,7 +423,7 @@ func (s *State) Validate() error {
 	}
 	if c := s.Cycle; c != nil {
 		switch c.Phase {
-		case CycleNew, CycleWorking, CycleSubmitting, CycleOpen, CycleFinished, CycleUnknown:
+		case CycleNew, CycleWorking, CycleSubmitting, CycleOpen, CycleFinished, CycleClean, CycleUnknown:
 		default:
 			return fmt.Errorf("state: cycle phase %q is not one this build knows", c.Phase)
 		}

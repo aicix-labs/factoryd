@@ -206,8 +206,14 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 		// The cycle finishes on the merge of ITS change, by id. A verdict on
 		// any other change -- an older member of the family, an unrelated
 		// draft -- says nothing about the producer's workdir (#35 review).
-		if c := s.Cycle; c != nil && v.Kind == state.VerdictMerged && c.Phase == state.CycleOpen && c.ChangeID == v.ChangeID {
+		// A cycle still "submitting" whose immutable branch this verdict
+		// names is the same draft seen before submit recorded it: finish
+		// it too, so either ordering converges (#41 review).
+		if c := s.Cycle; c != nil && v.Kind == state.VerdictMerged &&
+			((c.Phase == state.CycleOpen && c.ChangeID == v.ChangeID) ||
+				(c.Phase == state.CycleSubmitting && v.Branch != "" && c.Digest == v.Branch)) {
 			s.SetCycle(state.CycleFinished, now())
+			s.Cycle.ChangeID = v.ChangeID
 		}
 		return nil
 	}); err != nil {

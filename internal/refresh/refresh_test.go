@@ -18,6 +18,7 @@ import (
 	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/refresh"
 	"github.com/aicix-labs/factoryd/internal/state"
+	"github.com/aicix-labs/factoryd/internal/submit"
 	"github.com/aicix-labs/factoryd/internal/supervise"
 )
 
@@ -85,7 +86,7 @@ func TestDecideRunsOnlyAtTheStartOfACycle(t *testing.T) {
 		return st
 	}
 	for phase, want := range map[string]bool{
-		state.CycleNew: true, state.CycleFinished: true,
+		state.CycleNew: true, state.CycleFinished: true, state.CycleClean: true,
 		state.CycleWorking: false, state.CycleSubmitting: false, state.CycleOpen: false, state.CycleUnknown: false,
 	} {
 		if run, why := refresh.Decide(at(phase)); run != want {
@@ -378,12 +379,18 @@ func (e *e2e) progress(t *testing.T) {
 
 func (e *e2e) run(t *testing.T, r supervise.Runner, maxTurns int) error {
 	t.Helper()
+	return e.runWith(t, r, maxTurns, nil)
+}
+
+func (e *e2e) runWith(t *testing.T, r supervise.Runner, maxTurns int, after func(context.Context, supervise.Turn, supervise.TurnResult) (string, error)) error {
+	t.Helper()
 	s, err := supervise.New(supervise.Options{
 		Config: e.cfg, Role: "producer", Runner: r,
 		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
 		Sleep:      func(ctx context.Context, d time.Duration) error { return ctx.Err() },
 		MaxTurns:   maxTurns,
 		BeforeTurn: refresh.BeforeTurn(e.cfg, e.deps(t)),
+		AfterTurn:  after,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -538,5 +545,49 @@ func TestUnrelatedVerdictDoesNotFinishTheCycle(t *testing.T) {
 	}
 	if c := e.cycle(t); c == nil || c.Phase != state.CycleWorking || c.Base != want || c.ChangeID != "" {
 		t.Fatalf("new cycle %+v, want working at %s with no change", c, want)
+	}
+}
+
+// The ordinary no-op turn: a brief the producer consumes without
+// declaring anything. The cycle ends clean, the target advances, and the
+// next brief refreshes (#41 review). The after-turn step is the shipped
+// submit.AfterTurn.
+func TestNoOpBriefThenTargetAdvancesThenTheNextBriefRefreshes(t *testing.T) {
+	e := newE2E(t)
+	e.wake(t)
+	r := &scriptedRunner{act: func(n int, _ supervise.Turn) supervise.TurnResult {
+		e.progress(t)
+		return supervise.TurnResult{} // consumes the brief, declares nothing
+	}}
+	after := submit.AfterTurn(e.cfg, func(context.Context) (submit.Deps, error) {
+		t.Error("submit deps built for a no-intent turn")
+		return submit.Deps{}, nil
+	})
+	if err := e.runWith(t, r, 1, after); err != nil {
+		t.Fatal(err)
+	}
+	if c := e.cycle(t); c == nil || c.Phase != state.CycleClean {
+		t.Fatalf("after a no-op brief the cycle is %+v, want clean", c)
+	}
+	if e.refreshes != 1 {
+		t.Fatalf("refreshes=%d after the first brief, want 1", e.refreshes)
+	}
+
+	os.WriteFile(filepath.Join(e.upstream, "README"), []byte("v2\n"), 0o644)
+	git(t, e.upstream, "add", ".")
+	git(t, e.upstream, "commit", "-qm", "v2")
+	want := git(t, e.upstream, "rev-parse", "HEAD")
+	e.wake(t)
+	if err := e.runWith(t, r, 1, after); err != nil {
+		t.Fatal(err)
+	}
+	if e.refreshes != 2 {
+		t.Fatalf("refreshes=%d after the second brief, want 2: a clean cycle did not start a new one", e.refreshes)
+	}
+	if b, _ := os.ReadFile(filepath.Join(e.work, "README")); string(b) != "v2\n" {
+		t.Fatalf("README = %q: the workdir is stale behind the target", b)
+	}
+	if c := e.cycle(t); c == nil || c.Base != want {
+		t.Fatalf("cycle %+v, want base %s", c, want)
 	}
 }
