@@ -1182,3 +1182,53 @@ func TestLeftoverTurnIsNotCleanAndNothingFollowsIt(t *testing.T) {
 		t.Fatalf("state=%+v", rs.LastTurn)
 	}
 }
+
+// A halt is a circuit breaker; the operator's restart after removing the
+// sentinel is the reset (#30). Left uncleared, the first halt a factory
+// ever took kept its health red for good. The recorded halt is cleared on
+// that restart and kept as last_halt for the record; a restart with the
+// sentinel still present is refused and clears nothing.
+func TestRestartAfterTheSentinelIsRemovedClearsTheHalt(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		return supervise.TurnResult{ExitCode: 1} // fails, consuming nothing
+	}}
+	s := fx.newSupervisor(t, r, 50)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted", err)
+	}
+	if rs := fx.roleState(t); !rs.Halted || rs.HaltReason == "" {
+		t.Fatalf("not halted: %+v", rs)
+	}
+	s.Close()
+
+	// A restart with the sentinel still there is refused, and the halt stays.
+	s2 := fx.newSupervisor(t, &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult { return supervise.TurnResult{} }}, 1)
+	if err := s2.Run(ctx); err == nil {
+		t.Fatal("a restart with the sentinel present was not refused")
+	}
+	if rs := fx.roleState(t); !rs.Halted || rs.LastHalt != nil {
+		t.Fatalf("a refused restart changed the halt record: %+v", rs)
+	}
+	s2.Close()
+
+	// The operator removes the sentinel and restarts: the breaker resets.
+	if err := os.Remove(fx.cfg.StopPath("reviewer")); err != nil {
+		t.Fatal(err)
+	}
+	fx.wake(t)
+	s3 := fx.newSupervisor(t, &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult { fx.progress(t); return supervise.TurnResult{} }}, 1)
+	if err := s3.Run(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("Run after the reset: %v", err)
+	}
+	rs := fx.roleState(t)
+	if rs.Halted || rs.HaltReason != "" || !rs.HaltedAt.IsZero() {
+		t.Fatalf("the halt was not cleared by the restart: %+v", rs)
+	}
+	if rs.LastHalt == nil || rs.LastHalt.Reason == "" || rs.LastHalt.ClearedAt.IsZero() {
+		t.Fatalf("the cleared halt was not kept for the record: %+v", rs.LastHalt)
+	}
+}

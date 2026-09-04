@@ -64,6 +64,8 @@ type RoleView struct {
 	WatchMode  string          `json:"watch_mode,omitempty"`
 	Halted     bool            `json:"halted"`
 	HaltReason string          `json:"halt_reason,omitempty"`
+	// LastHalt is a cleared halt: information, not a need.
+	LastHalt *state.Halt `json:"last_halt,omitempty"`
 
 	Turn    *TurnView     `json:"turn,omitempty"`
 	Pending []PendingView `json:"pending,omitempty"`
@@ -184,7 +186,7 @@ func (c *Collector) Collect(ctx context.Context) Snapshot {
 	for _, r := range state.Roles {
 		rs := st.Role(r)
 		role := string(r)
-		v := RoleView{WatchMode: rs.WatchMode, Halted: rs.Halted, HaltReason: rs.HaltReason, Spin: rs.SpinCount, Fails: rs.FailStreak}
+		v := RoleView{WatchMode: rs.WatchMode, Halted: rs.Halted, HaltReason: rs.HaltReason, LastHalt: rs.LastHalt, Spin: rs.SpinCount, Fails: rs.FailStreak}
 		if rs.Supervisor != nil {
 			v.Supervisor = &SupervisorView{PID: rs.Supervisor.PID, StartedAt: rs.Supervisor.StartedAt}
 			alive, err := c.deps.Alive(*rs.Supervisor)

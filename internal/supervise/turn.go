@@ -54,6 +54,16 @@ func (s *Supervisor) claim() error {
 			}
 			s.log.Info("replacing a dead supervisor record", "previous", prev.String())
 		}
+		// A restart is the reset of the circuit breaker. This runs only after
+		// checkStopSentinel passed, so the operator has removed the sentinel:
+		// the recorded halt is cleared and kept as last_halt for the record
+		// (#30). Left in place, the first halt a factory ever took kept its
+		// health red for good -- a red that never goes green.
+		if rs.Halted {
+			rs.LastHalt = &state.Halt{Reason: rs.HaltReason, At: rs.HaltedAt, ClearedAt: s.now()}
+			rs.Halted, rs.HaltReason, rs.HaltedAt = false, "", time.Time{}
+			s.log.Info("halt cleared by restart", "reason", rs.LastHalt.Reason, "halted_at", rs.LastHalt.At)
+		}
 		rs.Supervisor = &self
 		rs.WatchMode = string(s.watcher.Mode())
 		return nil
