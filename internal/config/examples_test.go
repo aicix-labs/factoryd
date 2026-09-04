@@ -1,6 +1,8 @@
 package config_test
 
 import (
+	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
 	"testing"
@@ -9,11 +11,9 @@ import (
 )
 
 // Every shipped example must load, and its gate must be a gate: one that
-// can go red. `true` cannot fail, so it cannot fail the way a real gate
-// does -- by walking the 0700 .git it may not read (canary issue #21) --
-// and an operator who copies it ships a check that is not a check. The
-// gate must also prune .git itself, because that is the one directory the
-// gate identity cannot enter by design.
+// can go red, that prunes the .git it may not read, and that does not let
+// Go's VCS stamping walk it either. And no example sets a FACTORYD_* value
+// by hand; the supervisor generates those.
 func TestShippedExampleGatesAreRealAndPruneDotGit(t *testing.T) {
 	examples, err := filepath.Glob(filepath.Join("..", "..", "examples", "*", "factory.json"))
 	if err != nil {
@@ -42,5 +42,49 @@ func TestShippedExampleGatesAreRealAndPruneDotGit(t *testing.T) {
 		if walksUnpruned {
 			t.Errorf("%s: gate walks the tree without pruning .git, which the gate identity may not read: %q", p, cmd)
 		}
+		// Go's default VCS stamping runs git status for a main package, and
+		// that dies on the 0700 .git the gate may not read (#21, second
+		// round). The gate's environment must switch it off.
+		if !strings.Contains(cfg.Gate.Env["GOFLAGS"], "-buildvcs=false") {
+			t.Errorf("%s: gate GOFLAGS %q lacks -buildvcs=false; a main package would fail VCS stamping on an unreadable .git", p, cfg.Gate.Env["GOFLAGS"])
+		}
+	}
+}
+
+// The condition itself, not a string check: a module with a main package,
+// its .git unreadable, built with and without -buildvcs=false. Unprivileged
+// this uses a 0000 .git the test cannot enter either; the same run under
+// the gate identity against a root-owned 0700 .git is the live evidence.
+func TestBuildVCSFalseIsWhatSurvivesAnUnreadableDotGit(t *testing.T) {
+	goBin, err := exec.LookPath("go")
+	if err != nil {
+		t.Skip("no go on PATH")
+	}
+	if os.Geteuid() == 0 {
+		t.Skip("root can read a 0000 directory; run the gate-identity check on the harness instead")
+	}
+	dir := t.TempDir()
+	os.WriteFile(filepath.Join(dir, "go.mod"), []byte("module example.com/m\n\ngo 1.22\n"), 0o644)
+	os.WriteFile(filepath.Join(dir, "main.go"), []byte("package main\n\nfunc main() {}\n"), 0o644)
+	if err := os.MkdirAll(filepath.Join(dir, ".git", "objects"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	os.WriteFile(filepath.Join(dir, ".git", "HEAD"), []byte("ref: refs/heads/main\n"), 0o644)
+	if err := os.Chmod(filepath.Join(dir, ".git"), 0); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { os.Chmod(filepath.Join(dir, ".git"), 0o755) })
+	run := func(goflags string) (string, error) {
+		cmd := exec.Command(goBin, "build", "./...")
+		cmd.Dir = dir
+		cmd.Env = []string{"PATH=" + os.Getenv("PATH"), "HOME=" + dir, "GOCACHE=" + filepath.Join(dir, "cache"), "GOFLAGS=" + goflags, "GOPATH=" + filepath.Join(dir, "gopath"), "GOTOOLCHAIN=local"}
+		out, err := cmd.CombinedOutput()
+		return string(out), err
+	}
+	if out, err := run("-count=1"); err == nil || !strings.Contains(out, "VCS") {
+		t.Fatalf("without -buildvcs=false the build must fail on VCS status; err=%v out=%s", err, out)
+	}
+	if out, err := run("-count=1 -buildvcs=false"); err != nil {
+		t.Fatalf("with -buildvcs=false the build must pass: %v\n%s", err, out)
 	}
 }

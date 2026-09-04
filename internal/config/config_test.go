@@ -121,6 +121,9 @@ func TestValidationFailures(t *testing.T) {
   }`, ``, "scope is absent"},
 		"scope regex does not compile":    {`"(^|/)Dockerfile$"`, `"(^|/Dockerfile$"`, "does not compile"},
 		"scope empty pattern":             {`"^deploy/.*\\.md$"`, `""`, "is empty"},
+		"producer env declares FACTORYD_": {`"env": {"PATH": "/usr/local/bin:/usr/bin:/bin"}, "run_as": {"user": "factoryd-producer"}`, `"env": {"PATH": "/usr/local/bin:/usr/bin:/bin", "FACTORYD_CONFIG": "/stale.json"}, "run_as": {"user": "factoryd-producer"}`, "reserved"},
+		"reviewer env declares FACTORYD_": {`"reviewer": {"command": ["claude", "-p", "reviewer-playbook"], "env": {"PATH": "/usr/local/bin:/usr/bin:/bin"}}`, `"reviewer": {"command": ["claude", "-p", "reviewer-playbook"], "env": {"PATH": "/usr/local/bin:/usr/bin:/bin", "FACTORYD_ROOT": "/elsewhere"}}`, "reserved"},
+		"gate env declares FACTORYD_":     {`"GOCACHE": "/var/cache/factoryd/go"}`, `"GOCACHE": "/var/cache/factoryd/go", "FACTORYD_TURN": "x"}`, "reserved"},
 		"alert missing path":              {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "file"}`, "no path"},
 		"webhook is not deliverable here": {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "webhook"}`, "not implemented"},
 		"syslog is not deliverable here":  {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "syslog"}`, "not implemented"},
@@ -374,5 +377,22 @@ func TestSharedPrefixSiblingIsNotAnOverlap(t *testing.T) {
 	}
 	if config.PathWithin("/a/bc", "/a/b") || !config.PathWithin("/a/b/c", "/a/b") || !config.PathWithin("/a/b", "/a/b") || !config.PathWithin("/x", "/") {
 		t.Fatal("PathWithin")
+	}
+}
+
+// Generated FACTORYD_* values win over a role's declared env even when a
+// config reached the runner without Validate: the order of the two loops in
+// TurnEnv is the rule, not an accident. A reviewer told a stale config path
+// by its own env is the case that was found.
+func TestGeneratedTurnEnvWinsOverRoleEnv(t *testing.T) {
+	cfg := &config.Config{Roles: config.Roles{Reviewer: config.RoleSpec{Env: map[string]string{"PATH": "/usr/bin", "FACTORYD_CONFIG": "/stale/factory.json", "FACTORYD_ROOT": "/stale"}}}}
+	env := cfg.TurnEnv("reviewer", map[string]string{"FACTORYD_CONFIG": "/etc/factoryd/real.json", "FACTORYD_ROOT": "/var/lib/factoryd/real"}, nil)
+	got := map[string]string{}
+	for _, kv := range env {
+		k, v, _ := strings.Cut(kv, "=")
+		got[k] = v
+	}
+	if got["FACTORYD_CONFIG"] != "/etc/factoryd/real.json" || got["FACTORYD_ROOT"] != "/var/lib/factoryd/real" || got["PATH"] != "/usr/bin" {
+		t.Fatalf("env=%v; the generated values must win and the rest must survive", env)
 	}
 }
