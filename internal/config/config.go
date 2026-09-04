@@ -468,6 +468,10 @@ type Cache struct {
 // Path is where the config was loaded from.
 func (c *Config) Path() string { return c.path }
 
+// SetPath records where a config built without Load lives -- embedders and
+// tests. Turns are told this path (FACTORYD_CONFIG), so it must be real.
+func (c *Config) SetPath(p string) { c.path = p }
+
 // Load reads and validates a config file.
 func Load(path string) (*Config, error) {
 	raw, err := os.ReadFile(path)

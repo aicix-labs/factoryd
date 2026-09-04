@@ -147,12 +147,16 @@ func TestExecRunnerReportsItsProcess(t *testing.T) {
 // factory's layout -- or worse, guess at it.
 func TestExecRunnerEnvironment(t *testing.T) {
 	fx, r, out := execFixture(t, []string{"sh", "-c", "env | grep '^FACTORYD_'"}, 30)
+	fx.cfg.SetPath(filepath.Join(fx.root, "factory.json"))
 
 	if _, err := r.Run(context.Background(), turn(fx, 0), nil); err != nil {
 		t.Fatal(err)
 	}
 	env := out.String()
 	for _, want := range []string{
+		// The config the turn was started from: a reviewer turn drives
+		// factoryd's own verbs and must not be told this by hand (#22).
+		"FACTORYD_CONFIG=" + filepath.Join(fx.root, "factory.json"),
 		"FACTORYD_FACTORY=widgets",
 		"FACTORYD_ROLE=reviewer",
 		"FACTORYD_TURN=t1",

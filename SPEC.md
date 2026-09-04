@@ -369,6 +369,17 @@ credential supplied explicitly, and never through argv.
 }
 ```
 
+**The gate cannot read `.git`, by design, so the gate must not walk it.** The
+submit repository's `.git` is `0700` factoryd-owned precisely so that
+producer-authored build code cannot plant a hook; a gate that walks the whole
+tree (`gofmt -l .`) therefore dies on it, and submit reports that as a red gate
+(canary issue #21). A gate prunes it — `find . -path ./.git -prune -o -name
+'*.go' -print0 | xargs -0 gofmt -l` — and the shipped examples do; the Go tools
+themselves skip dot-directories. A gate must also be **able to go red**: a gate
+that is already red before the producer touches anything gates nothing, and a
+gate of `true` gates nothing either. Prove a new gate three ways: green at
+baseline, red on a planted defect, green again.
+
 Declared, because a gate command is an opaque argv — often a shell string — and
 the paths a build writes to are set by environment variables, tool defaults and
 the build system itself. Trying to recover them by parsing the command would be a
