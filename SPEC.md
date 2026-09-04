@@ -129,8 +129,15 @@ written before the record existed loads as `unknown`, and unknown authorizes
 nothing. A refresh that fails is a failed
 turn on the streak (exit 1002), and the agent does not run over a tree the step
 could not prepare. `factoryd refresh --config <f>` is the same step by hand,
-refused outside `new`/`finished` unless `--force`d, which is the operator's
-acknowledgement that the tree is not wanted and starts the next cycle. Anything
+refused outside `new`/`finished`/`clean` unless `--force`d, which is the
+operator's acknowledgement that the tree is not wanted and starts the next
+cycle. Decision, apply and record happen inside one state update, under the
+document's exclusive lock, and the producer's turn start decides, refreshes
+and marks the cycle `working` under that same lock — so an operator's
+non-forced refresh and a turn that starts between its decision and its apply
+cannot interleave: whichever holds the lock first wins, the other sees its
+record, and a decision is never acted on for a tree someone else may be
+editing by then. Anything
 the producer wants to keep across cycles belongs under the cache root.
 
 Both agent roles are **one-shot turns**. Neither polls, waits, or loops. The

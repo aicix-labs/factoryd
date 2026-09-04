@@ -591,3 +591,136 @@ func TestNoOpBriefThenTargetAdvancesThenTheNextBriefRefreshes(t *testing.T) {
 		t.Fatalf("cycle %+v, want base %s", c, want)
 	}
 }
+
+// ---------- the operator's refresh against a starting turn ----------
+
+// deps whose Fetch hands control to the test while the caller holds the
+// state lock: the point at which the other party is made to start.
+func (e *e2e) depsWithHook(t *testing.T, onFetch func()) refresh.Deps {
+	d, _ := e.deps(t)(context.Background())
+	inner := d.Fetch
+	d.Fetch = func(ctx context.Context, spec string) error {
+		if onFetch != nil {
+			onFetch()
+		}
+		return inner(ctx, spec)
+	}
+	return d
+}
+
+// A producer turn starts after the operator's non-forced refresh has
+// decided but before it has applied. The decision was taken under the
+// lock the turn start needs, so the turn cannot run -- and edit -- until
+// the operator has applied and recorded. Sensitivity: the turn edits a
+// file and fails before declaring; had the turn slipped in between the
+// operator's decision and apply, the apply would have wiped that edit. The
+// hook waits for the edit up to a bound: under the lock it never comes
+// during the hook (the turn is blocked), and the edit is made afterwards
+// and survives; without the lock it comes during the hook and is wiped.
+func TestOperatorRefreshHoldsTheTurnStartUntilItHasApplied(t *testing.T) {
+	e := newE2E(t)
+	e.setCycle(t, func(st *state.State) { st.SetCycle(state.CycleClean, time.Now()) })
+	e.wake(t)
+	turnDone := make(chan error, 1)
+	edited := make(chan struct{}, 1)
+	r := &scriptedRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		e.edit(t, "in-progress.go", "the turn's work")
+		e.progress(t)
+		edited <- struct{}{}
+		return supervise.TurnResult{ExitCode: 1} // fails before declaring: cycle stays working
+	}}
+	hookRan := false
+	editedDuringHook := false
+	ops := e.depsWithHook(t, func() {
+		hookRan = true
+		// The operator has decided and holds the lock. The producer
+		// supervisor starts a turn now.
+		go func() { turnDone <- e.run(t, r, 1) }()
+		select {
+		case <-edited:
+			editedDuringHook = true // the turn ran between decision and apply
+		case <-time.After(2 * time.Second):
+		}
+	})
+	if _, _, err := refresh.Guarded(context.Background(), e.cfg, ops, false); err != nil {
+		t.Fatalf("operator refresh: %v", err)
+	}
+	if !hookRan {
+		t.Fatal("the hook did not run; the test proved nothing")
+	}
+	if err := <-turnDone; err != nil {
+		t.Fatal(err)
+	}
+	if editedDuringHook {
+		t.Fatal("the turn ran and edited between the operator's decision and its apply")
+	}
+	if !e.has("in-progress.go") {
+		t.Fatal("the operator's apply wiped the turn's edit")
+	}
+	if c := e.cycle(t); c == nil || c.Phase != state.CycleWorking {
+		t.Fatalf("cycle %+v, want working after the failed turn", c)
+	}
+}
+
+// The other order: the producer's turn start holds the lock (deciding,
+// refreshing, marking working) when the operator's non-forced refresh
+// arrives. The operator waits, re-reads the cycle under the lock, sees
+// working, and refuses. The turn's edit survives.
+func TestOperatorRefreshRefusesWhenATurnStartedFirst(t *testing.T) {
+	e := newE2E(t)
+	e.setCycle(t, func(st *state.State) { st.SetCycle(state.CycleClean, time.Now()) })
+	e.wake(t)
+	opDone := make(chan error, 1)
+	opStarted := false
+	mkDeps := func(context.Context) (refresh.Deps, error) {
+		return e.depsWithHook(t, func() {
+			// The turn start has decided and holds the lock. The operator
+			// runs an ordinary refresh now.
+			opStarted = true
+			go func() {
+				_, _, err := refresh.Guarded(context.Background(), e.cfg, e.depsWithHook(t, nil), false)
+				opDone <- err
+			}()
+			select {
+			case err := <-opDone:
+				t.Errorf("the operator's refresh completed (%v) while the turn start held the lock", err)
+				opDone <- err
+			case <-time.After(300 * time.Millisecond):
+			}
+		}), nil
+	}
+	r := &scriptedRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		e.edit(t, "in-progress.go", "the turn's work")
+		e.progress(t)
+		return supervise.TurnResult{ExitCode: 1} // fails before declaring: cycle stays working
+	}}
+	s, err := supervise.New(supervise.Options{
+		Config: e.cfg, Role: "producer", Runner: r,
+		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Sleep:      func(ctx context.Context, d time.Duration) error { return ctx.Err() },
+		MaxTurns:   1,
+		BeforeTurn: refresh.BeforeTurn(e.cfg, mkDeps),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx, cancel := context.WithTimeout(context.Background(), 20*time.Second)
+	defer cancel()
+	if err := s.Run(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal(err)
+	}
+	s.Close()
+	if !opStarted {
+		t.Fatal("the hook did not run; the test proved nothing")
+	}
+	err = <-opDone
+	if !errors.Is(err, refresh.ErrRefused) || !strings.Contains(err.Error(), "working") {
+		t.Fatalf("operator refresh returned %v, want a refusal naming the working cycle", err)
+	}
+	if !e.has("in-progress.go") {
+		t.Fatal("the operator's refresh wiped the turn's work")
+	}
+	if e.refreshes != 1 {
+		t.Fatalf("refreshes=%d, want 1 (the turn start's)", e.refreshes)
+	}
+}

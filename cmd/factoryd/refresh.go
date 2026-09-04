@@ -3,6 +3,7 @@ package main
 import (
 	"bytes"
 	"context"
+	"errors"
 	"flag"
 	"fmt"
 	"os"
@@ -17,7 +18,6 @@ import (
 	"github.com/aicix-labs/factoryd/internal/factory"
 	"github.com/aicix-labs/factoryd/internal/gittransport"
 	"github.com/aicix-labs/factoryd/internal/refresh"
-	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/submit"
 	"github.com/aicix-labs/factoryd/internal/supervise"
 )
@@ -48,28 +48,19 @@ func runRefresh(args []string) int {
 		fmt.Fprintf(os.Stderr, "factoryd refresh: %v\n", err)
 		return exitConfig
 	}
-	var r refresh.Result
-	if *force {
-		var prev string
-		r, prev, err = refresh.Force(ctx, cfg, deps)
-		if err == nil {
-			fmt.Fprintf(os.Stderr, "factoryd refresh: forced; the previous cycle was %s\n", prev)
-		}
-	} else {
-		st, lerr := state.Load(cfg.StatePath(), cfg.Name)
-		if lerr != nil {
-			fmt.Fprintf(os.Stderr, "factoryd refresh: %v\n", lerr)
-			return exitConfig
-		}
-		if run, why := refresh.Decide(st); !run {
-			fmt.Fprintf(os.Stderr, "factoryd refresh: refused: %s; --force discards the producer's tree\n", why)
-			return exitError
-		}
-		r, _, err = refresh.Force(ctx, cfg, deps)
+	// Decision and apply under one lock, shared with the producer's turn
+	// start: a non-forced refresh that raced a turn could wipe its work.
+	r, prev, err := refresh.Guarded(ctx, cfg, deps, *force)
+	if errors.Is(err, refresh.ErrRefused) {
+		fmt.Fprintf(os.Stderr, "factoryd refresh: %v; --force discards the producer's tree\n", err)
+		return exitError
 	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "factoryd refresh: %v\n", err)
 		return exitError
+	}
+	if *force {
+		fmt.Fprintf(os.Stderr, "factoryd refresh: forced; the previous cycle was %s\n", prev)
 	}
 	fmt.Printf("%s at %s\n", cfg.Paths.ProducerWorkdir, r.SHA)
 	return exitOK

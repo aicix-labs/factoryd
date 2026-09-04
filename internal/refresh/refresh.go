@@ -134,69 +134,76 @@ func Decide(st *state.State) (run bool, reason string) {
 	}
 }
 
-// BeforeTurn is the producer supervisor's before-turn step. It refreshes
-// only when Decide allows, records the new cycle at its base, and marks
-// the cycle working before the turn runs -- so a turn that edits and fails
-// before declaring leaves "working", and its retry keeps the edits.
+// ErrRefused is returned by Guarded when the cycle, re-read under the
+// lock, does not allow a refresh.
+var ErrRefused = errors.New("refresh refused")
+
+// Guarded is the one way a refresh is decided and applied: inside a single
+// state update, under the document's exclusive lock, which the producer's
+// turn start takes too (BeforeTurn). The cycle is re-read there, the
+// refresh runs while the lock is held, and the new cycle is recorded
+// before it is released -- so an operator's non-forced refresh and a
+// producer turn that starts between decision and apply cannot interleave:
+// whichever holds the lock first wins, and the other sees its record. A
+// decision taken outside the lock is a decision about a tree someone else
+// may be editing by the time it is acted on (#41 review). With force the
+// cycle is not consulted; the previous phase is returned for the operator.
+func Guarded(ctx context.Context, cfg *config.Config, deps Deps, force bool) (Result, string, error) {
+	var r Result
+	var prev string
+	_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		prev = state.CycleUnknown
+		if st.Cycle != nil {
+			prev = st.Cycle.Phase
+		}
+		if !force {
+			if run, why := Decide(st); !run {
+				return fmt.Errorf("%w: %s", ErrRefused, why)
+			}
+		}
+		var err error
+		if r, err = Run(ctx, cfg, deps); err != nil {
+			return err
+		}
+		st.SetCycle(state.CycleNew, time.Now()).Base = r.SHA
+		return nil
+	})
+	return r, prev, err
+}
+
+// BeforeTurn is the producer supervisor's before-turn step. Under the
+// same lock as Guarded, it decides, refreshes when the cycle allows,
+// records the new cycle at its base, and marks the cycle working -- all
+// before the lock is released and the turn runs. So a turn that edits and
+// fails before declaring leaves "working", its retry keeps the edits, and
+// an operator refresh racing the turn start sees "working" and refuses.
 func BeforeTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, error)) func(ctx context.Context, t supervise.Turn) (string, error) {
 	return func(ctx context.Context, t supervise.Turn) (string, error) {
-		st, err := state.Load(cfg.StatePath(), cfg.Name)
-		if err != nil {
-			return "", fmt.Errorf("refresh: %w", err)
-		}
-		run, why := Decide(st)
-		msg := "workdir not refreshed: " + why
-		if run {
-			deps, err := mkDeps(ctx)
-			if err != nil {
-				return "", fmt.Errorf("refresh: %w", err)
-			}
-			r, err := Run(ctx, cfg, deps)
-			if err != nil {
-				return "", err
-			}
-			if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		var msg string
+		_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+			run, why := Decide(st)
+			msg = "workdir not refreshed: " + why
+			if run {
+				deps, err := mkDeps(ctx)
+				if err != nil {
+					return err
+				}
+				r, err := Run(ctx, cfg, deps)
+				if err != nil {
+					return err
+				}
 				st.SetCycle(state.CycleNew, time.Now()).Base = r.SHA
-				return nil
-			}); err != nil {
-				return "", fmt.Errorf("refresh: recording the new cycle: %w", err)
+				msg = fmt.Sprintf("workdir refreshed to %s at %s", cfg.TargetBranch, short(r.SHA))
 			}
-			msg = fmt.Sprintf("workdir refreshed to %s at %s", cfg.TargetBranch, short(r.SHA))
-		}
-		// The turn is about to run: from here the tree is the producer's.
-		if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+			// The turn is about to run: from here the tree is the producer's.
 			if c := st.Cycle; c != nil && c.Phase == state.CycleNew {
 				st.SetCycle(state.CycleWorking, time.Now())
 			}
 			return nil
-		}); err != nil {
-			return "", fmt.Errorf("refresh: recording the working cycle: %w", err)
+		})
+		if err != nil {
+			return "", fmt.Errorf("refresh: %w", err)
 		}
 		return msg, nil
 	}
-}
-
-// Force runs a refresh regardless of the cycle and starts a new one: the
-// operator's explicit acknowledgement that whatever the tree held is not
-// wanted. The previous phase is returned for the operator to see.
-func Force(ctx context.Context, cfg *config.Config, deps Deps) (Result, string, error) {
-	st, err := state.Load(cfg.StatePath(), cfg.Name)
-	if err != nil {
-		return Result{}, "", err
-	}
-	prev := state.CycleUnknown
-	if st.Cycle != nil {
-		prev = st.Cycle.Phase
-	}
-	r, err := Run(ctx, cfg, deps)
-	if err != nil {
-		return Result{}, prev, err
-	}
-	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
-		st.SetCycle(state.CycleNew, time.Now()).Base = r.SHA
-		return nil
-	}); err != nil {
-		return Result{}, prev, fmt.Errorf("refresh: recording the new cycle: %w", err)
-	}
-	return r, prev, nil
 }
