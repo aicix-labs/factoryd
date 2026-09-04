@@ -898,9 +898,15 @@ verdict carries the id, `.producer-branch` is consumed by submit. So
 `outbox/<id>.json` carries, besides `change_id`, `kind`, `sha`, `summary`, `at`
 and `merge_commit` (verified merges only), `branch` (the pushed
 `<declared>-<tree>`) and `declared_branch` (the family). A verdict-triggered
-turn is also told `FACTORYD_VERDICT`, `FACTORYD_CHANGE_ID` and
-`FACTORYD_CHANGE_BRANCH` (the family) in its environment; on any other turn
-those keys are present and empty. Found on the first production cycle (#29):
+turn is told every verdict it carries, exactly: `FACTORYD_VERDICTS` is a JSON
+array with one entry per verdict trigger (`path`, `change_id`, `kind`, `sha`,
+`branch`, `declared_branch`) — a turn may be woken by several at once, and a
+scalar that named the first one's family for all would send a fix to the wrong
+change. The scalar keys `FACTORYD_VERDICT`, `FACTORYD_CHANGE_ID` and
+`FACTORYD_CHANGE_BRANCH` name the verdict only when the turn carries exactly
+one, and are empty otherwise; on a turn with no verdict all four are present,
+the array `[]`. A verdict file the runner cannot read or parse is a runner
+error: the turn does not start, rather than starting with empty values. Found on the first production cycle (#29):
 without the family name the producer re-declared a stale one from its seed
 clone and got an unrelated draft beside the change under review, not a
 superseding one.

@@ -2,6 +2,7 @@ package supervise
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -62,7 +63,11 @@ func (r *ExecRunner) Run(ctx context.Context, t Turn, started func(proc.Ref)) (T
 	cmd.Dir = r.Config.TurnWorkdir(r.Role)
 	cmd.Stdout = r.Stdout
 	cmd.Stderr = r.Stderr
-	cmd.Env = append(r.env(t), r.ExtraEnv...)
+	turnEnv, envErr := r.env(t)
+	if envErr != nil {
+		return TurnResult{ExitCode: -1}, fmt.Errorf("exec: %s turn: %w", r.Role, envErr)
+	}
+	cmd.Env = append(turnEnv, r.ExtraEnv...)
 	// Give the turn its own process group so that killing it at the deadline
 	// takes its children too. A turn that spawns a build and times out would
 	// otherwise leave the build running and the next turn racing it.
@@ -216,7 +221,22 @@ func asExitError(err error, target **exec.ExitError) bool {
 // env is what a turn is told about its world. Everything an agent needs to find
 // its trigger and report progress is here, so a turn never has to know the
 // factory's layout.
-func (r *ExecRunner) env(t Turn) []string {
+// VerdictEnv is one entry of FACTORYD_VERDICTS: the verdict document that
+// woke the turn, with the path it was read from. A turn may carry several
+// verdict triggers at once; a scalar could name only one family, and a
+// producer that re-declared the wrong one would get an unrelated draft
+// (#29, second round). So every verdict is mapped exactly, and the scalar
+// keys are filled only when there is exactly one.
+type VerdictEnv struct {
+	Path           string `json:"path"`
+	ChangeID       string `json:"change_id"`
+	Kind           string `json:"kind"`
+	SHA            string `json:"sha"`
+	Branch         string `json:"branch"`
+	DeclaredBranch string `json:"declared_branch"`
+}
+
+func (r *ExecRunner) env(t Turn) ([]string, error) {
 	var trigPaths []string
 	for _, tr := range t.Triggers {
 		trigPaths = append(trigPaths, tr.Path)
@@ -237,27 +257,48 @@ func (r *ExecRunner) env(t Turn) []string {
 		// factoryd's own verbs (the reviewer: scm, audit, signal) does not
 		// have to be told by hand (canary issue #22).
 		"FACTORYD_CONFIG": r.Config.Path(),
-		// On a verdict-triggered turn: what the verdict is about, and the
-		// family to declare to update that change (#29). Empty otherwise;
-		// the keys are always present, so the generated set is exact.
+		// Verdicts (#29): FACTORYD_VERDICTS is an exact JSON mapping of
+		// EVERY verdict trigger; the scalar keys name the one verdict when
+		// the turn carries exactly one, and are empty otherwise -- never
+		// the first of several. All keys are always present, so the
+		// generated set is exact.
+		"FACTORYD_VERDICTS":      "[]",
 		"FACTORYD_VERDICT":       "",
 		"FACTORYD_CHANGE_ID":     "",
 		"FACTORYD_CHANGE_BRANCH": "",
 	}
+	var verdicts []VerdictEnv
 	for _, tr := range t.Triggers {
 		if tr.Label != "verdict" {
 			continue
 		}
-		if v, err := state.ReadVerdictFile(tr.Path); err == nil {
-			factoryd["FACTORYD_VERDICT"] = v.Kind
-			factoryd["FACTORYD_CHANGE_ID"] = v.ChangeID
-			factoryd["FACTORYD_CHANGE_BRANCH"] = v.DeclaredBranch
+		v, err := state.ReadVerdictFile(tr.Path)
+		if err != nil {
+			// A verdict the runner cannot read is not a turn to start with
+			// empty values: the agent would act on the trigger without the
+			// facts it carries. It is a runner error, said as such.
+			return nil, fmt.Errorf("verdict trigger %s: %w", tr.Path, err)
 		}
-		break
+		if v.ChangeID == "" || v.Kind == "" {
+			return nil, fmt.Errorf("verdict trigger %s: document names no change or no kind", tr.Path)
+		}
+		verdicts = append(verdicts, VerdictEnv{Path: tr.Path, ChangeID: v.ChangeID, Kind: v.Kind, SHA: v.SHA, Branch: v.Branch, DeclaredBranch: v.DeclaredBranch})
+	}
+	if len(verdicts) > 0 {
+		b, err := json.Marshal(verdicts)
+		if err != nil {
+			return nil, err
+		}
+		factoryd["FACTORYD_VERDICTS"] = string(b)
+	}
+	if len(verdicts) == 1 {
+		factoryd["FACTORYD_VERDICT"] = verdicts[0].Kind
+		factoryd["FACTORYD_CHANGE_ID"] = verdicts[0].ChangeID
+		factoryd["FACTORYD_CHANGE_BRANCH"] = verdicts[0].DeclaredBranch
 	}
 	// Constructed, never inherited: os.Environ() is consulted for exactly the
 	// reviewer's credential name and nothing else (Config.TurnEnv).
-	return r.Config.TurnEnv(r.Role, factoryd, os.Environ())
+	return r.Config.TurnEnv(r.Role, factoryd, os.Environ()), nil
 }
 
 // credentialFor resolves an OS user to the credential the turn is started

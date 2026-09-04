@@ -387,34 +387,82 @@ func TestGeneratedTurnKeysMatchTheRunner(t *testing.T) {
 	}
 }
 
-// A verdict-triggered turn is told what the verdict is about and which
-// family to declare to update that change (#29), from the verdict file
-// that woke it; any other turn sees the keys empty.
-func TestVerdictTurnIsToldTheChangeAndItsFamily(t *testing.T) {
-	fx, r, out := execFixture(t, []string{"sh", "-c", "env | grep '^FACTORYD_\\(VERDICT\\|CHANGE\\)'"}, 30)
-	vpath := filepath.Join(fx.outbox, "48.json")
-	v := state.Verdict{ChangeID: "48", Kind: "changes-requested", SHA: "abc", Summary: "s", Branch: "producer/fix-0123456789", DeclaredBranch: "producer/fix"}
-	b, _ := json.Marshal(v)
-	if err := os.WriteFile(vpath, b, 0o644); err != nil {
-		t.Fatal(err)
+// Verdict triggers reach the turn as an exact mapping, one entry per file
+// (#29, second round): a turn woken by two verdicts must not be told the
+// first one's family for both. The scalar keys name the verdict only when
+// there is exactly one; an unreadable or malformed verdict is a runner
+// error before the turn starts, never empty values.
+func TestVerdictTurnIsToldEveryVerdictExactly(t *testing.T) {
+	write := func(t *testing.T, dir, id, family string) string {
+		t.Helper()
+		p := filepath.Join(dir, id+".json")
+		v := state.Verdict{ChangeID: id, Kind: "changes-requested", SHA: "sha-" + id, Summary: "s", Branch: family + "-0123456789", DeclaredBranch: family}
+		b, _ := json.Marshal(v)
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
 	}
+	// Two verdicts at once.
+	fx, r, out := execFixture(t, []string{"sh", "-c", "env | grep '^FACTORYD_\\(VERDICT\\|CHANGE\\)'"}, 30)
+	p48 := write(t, fx.outbox, "48", "producer/ci-host")
+	p49 := write(t, fx.outbox, "49", "producer/auth-session")
 	tn := turn(fx, 0)
-	tn.Triggers = []watch.Trigger{{Label: "verdict", Path: vpath}}
+	tn.Triggers = []watch.Trigger{{Label: "verdict", Path: p48}, {Label: "verdict", Path: p49}}
 	if _, err := r.Run(context.Background(), tn, nil); err != nil {
 		t.Fatal(err)
 	}
 	env := out.String()
-	for _, want := range []string{"FACTORYD_VERDICT=changes-requested", "FACTORYD_CHANGE_ID=48", "FACTORYD_CHANGE_BRANCH=producer/fix"} {
-		if !strings.Contains(env, want) {
-			t.Errorf("the verdict turn was not told %s\ngot:\n%s", want, env)
+	var line string
+	for _, l := range strings.Split(env, "\n") {
+		if strings.HasPrefix(l, "FACTORYD_VERDICTS=") {
+			line = strings.TrimPrefix(l, "FACTORYD_VERDICTS=")
 		}
 	}
-	// A wake turn: the keys exist and are empty.
-	fx2, r2, out2 := execFixture(t, []string{"sh", "-c", "env | grep '^FACTORYD_CHANGE_BRANCH='"}, 30)
-	if _, err := r2.Run(context.Background(), turn(fx2, 0), nil); err != nil {
+	var got []supervise.VerdictEnv
+	if err := json.Unmarshal([]byte(line), &got); err != nil {
+		t.Fatalf("FACTORYD_VERDICTS is not JSON: %v\n%s", err, env)
+	}
+	if len(got) != 2 || got[0].ChangeID != "48" || got[0].DeclaredBranch != "producer/ci-host" || got[0].Path != p48 ||
+		got[1].ChangeID != "49" || got[1].DeclaredBranch != "producer/auth-session" || got[1].Path != p49 {
+		t.Fatalf("mapping=%+v; every verdict must be mapped exactly to its own family", got)
+	}
+	for _, scalar := range []string{"FACTORYD_VERDICT=", "FACTORYD_CHANGE_ID=", "FACTORYD_CHANGE_BRANCH="} {
+		if !strings.Contains(env, scalar+"\n") {
+			t.Fatalf("with two verdicts the scalar %s must be EMPTY, not the first one's:\n%s", scalar, env)
+		}
+	}
+	// Exactly one: the scalars name it.
+	fx1, r1, out1 := execFixture(t, []string{"sh", "-c", "env | grep '^FACTORYD_\\(VERDICT\\|CHANGE\\)'"}, 30)
+	p1 := write(t, fx1.outbox, "48", "producer/ci-host")
+	tn1 := turn(fx1, 0)
+	tn1.Triggers = []watch.Trigger{{Label: "verdict", Path: p1}}
+	if _, err := r1.Run(context.Background(), tn1, nil); err != nil {
 		t.Fatal(err)
 	}
-	if strings.TrimSpace(out2.String()) != "FACTORYD_CHANGE_BRANCH=" {
-		t.Fatalf("a non-verdict turn saw %q", out2.String())
+	for _, want := range []string{"FACTORYD_VERDICT=changes-requested", "FACTORYD_CHANGE_ID=48", "FACTORYD_CHANGE_BRANCH=producer/ci-host"} {
+		if !strings.Contains(out1.String(), want) {
+			t.Fatalf("single verdict: not told %s\n%s", want, out1.String())
+		}
+	}
+	// Malformed: the turn does not start.
+	fx2, r2, _ := execFixture(t, []string{"sh", "-c", "touch \"$FACTORYD_ROOT/started\""}, 30)
+	bad := filepath.Join(fx2.outbox, "50.json")
+	os.WriteFile(bad, []byte("{not json"), 0o644)
+	tn2 := turn(fx2, 0)
+	tn2.Triggers = []watch.Trigger{{Label: "verdict", Path: bad}}
+	if _, err := r2.Run(context.Background(), tn2, nil); err == nil || !strings.Contains(err.Error(), "verdict trigger") {
+		t.Fatalf("err=%v; a malformed verdict must be a runner error", err)
+	}
+	if _, err := os.Stat(filepath.Join(fx2.root, "started")); err == nil {
+		t.Fatal("the turn started on a verdict the runner could not read")
+	}
+	// A wake turn: the keys exist and are empty, the mapping is [].
+	fx3, r3, out3 := execFixture(t, []string{"sh", "-c", "env | grep '^FACTORYD_\\(VERDICTS\\|CHANGE_BRANCH\\)='"}, 30)
+	if _, err := r3.Run(context.Background(), turn(fx3, 0), nil); err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(out3.String(), "FACTORYD_VERDICTS=[]\n") || !strings.Contains(out3.String(), "FACTORYD_CHANGE_BRANCH=\n") {
+		t.Fatalf("a non-verdict turn saw %q", out3.String())
 	}
 }

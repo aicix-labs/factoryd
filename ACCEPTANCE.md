@@ -133,7 +133,8 @@ the branch family by prefix.
   found the producer re-declaring a stale name from its seed clone and getting
   an unrelated draft beside the change under review. `outbox/<id>.json` carries
   `branch` and `declared_branch`, and a verdict turn is told
-  `FACTORYD_CHANGE_BRANCH`; a wrapper that persisted `.producer-branch` before
+  every verdict it carries in `FACTORYD_VERDICTS` (the scalars only when there is
+  exactly one); a wrapper that persisted `.producer-branch` before
   submit consumed it is no longer needed.
 
 - **"A second pass with agent CLIs changes nothing except who writes the code"
