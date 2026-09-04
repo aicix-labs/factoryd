@@ -43,21 +43,30 @@ func runRefresh(args []string) int {
 		return exitConfig
 	}
 	ctx := context.Background()
-	st, err := state.Load(cfg.StatePath(), cfg.Name)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "factoryd refresh: %v\n", err)
-		return exitConfig
-	}
-	if busy, why := refresh.InFlight(st); busy && !*force {
-		fmt.Fprintf(os.Stderr, "factoryd refresh: refused: %s; --force discards the producer's tree\n", why)
-		return exitError
-	}
 	deps, err := refreshDeps(ctx, cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "factoryd refresh: %v\n", err)
 		return exitConfig
 	}
-	r, err := refresh.Run(ctx, cfg, deps)
+	var r refresh.Result
+	if *force {
+		var prev string
+		r, prev, err = refresh.Force(ctx, cfg, deps)
+		if err == nil {
+			fmt.Fprintf(os.Stderr, "factoryd refresh: forced; the previous cycle was %s\n", prev)
+		}
+	} else {
+		st, lerr := state.Load(cfg.StatePath(), cfg.Name)
+		if lerr != nil {
+			fmt.Fprintf(os.Stderr, "factoryd refresh: %v\n", lerr)
+			return exitConfig
+		}
+		if run, why := refresh.Decide(st); !run {
+			fmt.Fprintf(os.Stderr, "factoryd refresh: refused: %s; --force discards the producer's tree\n", why)
+			return exitError
+		}
+		r, _, err = refresh.Force(ctx, cfg, deps)
+	}
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "factoryd refresh: %v\n", err)
 		return exitError
@@ -66,29 +75,10 @@ func runRefresh(args []string) int {
 	return exitOK
 }
 
-// producerBeforeTurn is the refresh step of the producer's loop: before a
-// turn, when no change of the producer's is in flight, the workdir is
-// brought to the target branch. A change in flight is logged and left
-// alone; a refresh that fails is a failed turn (#35).
+// producerBeforeTurn is the refresh step of the producer's loop (#35):
+// refresh.BeforeTurn with the real dependencies.
 func producerBeforeTurn(cfg *config.Config) func(ctx context.Context, t supervise.Turn) (string, error) {
-	return func(ctx context.Context, t supervise.Turn) (string, error) {
-		st, err := state.Load(cfg.StatePath(), cfg.Name)
-		if err != nil {
-			return "", fmt.Errorf("refresh: %w", err)
-		}
-		if busy, why := refresh.InFlight(st); busy {
-			return "workdir not refreshed: " + why, nil
-		}
-		deps, err := refreshDeps(ctx, cfg)
-		if err != nil {
-			return "", fmt.Errorf("refresh: %w", err)
-		}
-		r, err := refresh.Run(ctx, cfg, deps)
-		if err != nil {
-			return "", err
-		}
-		return fmt.Sprintf("workdir refreshed to %s at %s", cfg.TargetBranch, r.SHA), nil
-	}
+	return refresh.BeforeTurn(cfg, func(ctx context.Context) (refresh.Deps, error) { return refreshDeps(ctx, cfg) })
 }
 
 // refreshDeps: the transport for the fetch (factoryd's credential, factoryd's
@@ -143,7 +133,13 @@ func applyAsProducer(ctx context.Context, cfg *config.Config, self, bundle, bran
 	}
 	cmd.Env = env
 	cmd.SysProcAttr = &syscall.SysProcAttr{Setpgid: true}
-	if spec, ok := cfg.RoleSpec("producer"); ok && spec.RunAs != nil && spec.RunAs.User != "" {
+	spec, _ := cfg.RoleSpec("producer")
+	// The producer's sandbox, exactly as a turn gets it: git in the
+	// producer's tree runs sealed or not at all (#41 review).
+	if err := supervise.ApplySandbox(spec, cmd.SysProcAttr); err != nil {
+		return "", fmt.Errorf("_refresh as the producer: %w", err)
+	}
+	if spec.RunAs != nil && spec.RunAs.User != "" {
 		u, err := user.Lookup(spec.RunAs.User)
 		if err != nil {
 			return "", fmt.Errorf("producer run_as user %q: %w", spec.RunAs.User, err)

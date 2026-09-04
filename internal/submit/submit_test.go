@@ -289,11 +289,11 @@ func TestSubmitOpensADraftAndSignals(t *testing.T) {
 	if r.Branch != want {
 		t.Fatalf("result branch = %s, want %s", r.Branch, want)
 	}
-	// The submission is on record for the refresh step (#35): without it a
-	// draft in flight looks like nothing in flight and the next turn's
-	// refresh discards the tree the producer is iterating on.
-	if st, err := state.Load(l.cfg.StatePath(), l.cfg.Name); err != nil || st.LastSubmit == nil || st.LastSubmit.ChangeID != "42" || st.LastSubmit.Branch != want || st.LastSubmit.At.IsZero() {
-		t.Fatalf("last_submit not recorded: %+v %v", st, err)
+	// The cycle names the open draft (#35): supersession moves the id, the
+	// merge of that id finishes the cycle, and a refresh under an open
+	// draft is refused.
+	if st, err := state.Load(l.cfg.StatePath(), l.cfg.Name); err != nil || st.Cycle == nil || st.Cycle.Phase != state.CycleOpen || st.Cycle.ChangeID != "42" || st.Cycle.Family != "producer/fix" || st.Cycle.Digest != want {
+		t.Fatalf("cycle not recorded as open: %+v %v", st.Cycle, err)
 	}
 	if l.drv.opened == nil || l.drv.opened.Title != "gate: match command position" || l.drv.opened.TargetBranch != "main" {
 		t.Fatalf("draft spec = %+v", l.drv.opened)
@@ -1219,5 +1219,37 @@ func TestDeclaredFamilyInvertsImmutableBranch(t *testing.T) {
 		if got := submit.DeclaredFamily(plain); got != plain {
 			t.Fatalf("DeclaredFamily(%q) = %q, want unchanged", plain, got)
 		}
+	}
+}
+
+// The cycle says "submitting" before the push, so a crash between the
+// draft's creation and the record of it leaves a phase that forbids a
+// refresh, never an absence that permits one (#41 review). Proved by a
+// push that fails: the record is already there.
+func TestCycleIsRecordedAsSubmittingBeforeThePush(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "gate: match command position\n\nlonger body")
+	var seen *state.Cycle
+	l.tr.onPush = func() {
+		st, err := state.Load(l.cfg.StatePath(), l.cfg.Name)
+		if err != nil {
+			t.Error(err)
+			return
+		}
+		seen = st.Cycle
+		panic("crash during the push")
+	}
+	func() {
+		defer func() { recover() }()
+		submit.Run(context.Background(), l.cfg, l.deps)
+	}()
+	want := submit.ImmutableBranch("producer/fix", "abc123")
+	if seen == nil || seen.Phase != state.CycleSubmitting || seen.Family != "producer/fix" || seen.Digest != want {
+		t.Fatalf("cycle at push time = %+v, want submitting %s/%s", seen, "producer/fix", want)
+	}
+	st, _ := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if st.Cycle == nil || st.Cycle.Phase != state.CycleSubmitting {
+		t.Fatalf("after the crash the cycle is %+v, want submitting", st.Cycle)
 	}
 }

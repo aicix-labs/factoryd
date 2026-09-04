@@ -396,6 +396,17 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		}
 	}
 
+	// Write-ahead: the cycle says "submitting" BEFORE the push, so a crash
+	// between the draft's creation and the record of it leaves a phase that
+	// forbids a refresh, never an absence that permits one (#35 review).
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		c := st.SetCycle(state.CycleSubmitting, deps.Now())
+		c.Family, c.Digest = declared, branch
+		return nil
+	}); err != nil {
+		return Result{}, wrap(ExitConfig, err, "recording the submission before the push")
+	}
+
 	// Non-force: a branch that somehow already exists with different content
 	// is rejected by git itself. The push cannot modify anything.
 	if err := deps.Transport.Push(ctx, "refs/heads/"+branch+":refs/heads/"+branch); err != nil {
@@ -442,14 +453,15 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	for _, f := range []string{BranchFile, CommitMsgFile} {
 		_ = os.Remove(filepath.Join(work, f))
 	}
-	// The submission is recorded where the refresh step can see it: a
-	// submission with no merged verdict yet is a change in flight, and the
-	// workdir is not refreshed under it (#35).
+	// The draft is open: the cycle names it. Supersession moves the id to
+	// the newest member of the family; the merge of THAT id finishes the
+	// cycle (#35).
 	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
-		st.LastSubmit = &state.Submit{ChangeID: string(change.ID), Branch: branch, At: time.Now()}
+		c := st.SetCycle(state.CycleOpen, deps.Now())
+		c.Family, c.Digest, c.ChangeID = declared, branch, string(change.ID)
 		return nil
 	}); err != nil {
-		return Result{}, wrap(ExitConfig, err, "recording the submission in state")
+		return Result{}, wrap(ExitConfig, err, "recording the open draft in state")
 	}
 	return Result{Exit: ExitSubmitted, Reason: "submitted", Change: &change, Branch: branch, Supersedes: supersedes}, nil
 }

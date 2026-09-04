@@ -203,6 +203,12 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 	res.Path = path
 	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(s *state.State) error {
 		s.LastVerdict = &v
+		// The cycle finishes on the merge of ITS change, by id. A verdict on
+		// any other change -- an older member of the family, an unrelated
+		// draft -- says nothing about the producer's workdir (#35 review).
+		if c := s.Cycle; c != nil && v.Kind == state.VerdictMerged && c.Phase == state.CycleOpen && c.ChangeID == v.ChangeID {
+			s.SetCycle(state.CycleFinished, now())
+		}
 		return nil
 	}); err != nil {
 		return res, failed("recording the verdict in state: %w", err)

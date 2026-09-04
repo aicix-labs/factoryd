@@ -23,9 +23,11 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"time"
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/state"
+	"github.com/aicix-labs/factoryd/internal/supervise"
 )
 
 // Deps are the three sides of the crossing. Each is faked in tests.
@@ -103,17 +105,97 @@ func short(s string) string {
 	return s
 }
 
-// InFlight reports whether the producer has a change that is not finished:
-// its last submission has no merged verdict recorded. A refresh then would
-// throw away the tree the producer is expected to iterate on. The reason is
-// returned for the log and for `refresh` to print when it refuses.
-func InFlight(st *state.State) (bool, string) {
-	ls := st.LastSubmit
-	if ls == nil {
-		return false, ""
+// Decide says whether a refresh may run now, from the cycle record alone.
+// Only the start of a cycle qualifies: CycleNew (nothing has touched the
+// tree) and CycleFinished (its draft merged). Working, submitting and open
+// name the producer's work; unknown is unknown. Absence is never "no
+// draft": a nil cycle is unknown too.
+func Decide(st *state.State) (run bool, reason string) {
+	c := st.Cycle
+	if c == nil {
+		return false, "no cycle record; unknown authorizes nothing (`factoryd refresh --force` starts a new cycle)"
 	}
-	if v := st.LastVerdict; v != nil && v.ChangeID == ls.ChangeID && v.Kind == state.VerdictMerged {
-		return false, ""
+	switch c.Phase {
+	case state.CycleNew, state.CycleFinished:
+		return true, ""
+	case state.CycleWorking:
+		return false, "cycle is working: a turn has edited this tree and no draft has merged"
+	case state.CycleSubmitting:
+		return false, fmt.Sprintf("cycle is submitting %s (%s): a draft may exist that state does not name yet", c.Family, short(c.Digest))
+	case state.CycleOpen:
+		return false, fmt.Sprintf("cycle is open: draft %s on %s has not merged", c.ChangeID, c.Family)
+	default:
+		note := c.Note
+		if note == "" {
+			note = "`factoryd refresh --force` starts a new cycle"
+		}
+		return false, "cycle is " + c.Phase + ": " + note
 	}
-	return true, fmt.Sprintf("change %s (%s), submitted %s, has no merged verdict", ls.ChangeID, ls.Branch, ls.At.Format("2006-01-02T15:04:05Z07:00"))
+}
+
+// BeforeTurn is the producer supervisor's before-turn step. It refreshes
+// only when Decide allows, records the new cycle at its base, and marks
+// the cycle working before the turn runs -- so a turn that edits and fails
+// before declaring leaves "working", and its retry keeps the edits.
+func BeforeTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, error)) func(ctx context.Context, t supervise.Turn) (string, error) {
+	return func(ctx context.Context, t supervise.Turn) (string, error) {
+		st, err := state.Load(cfg.StatePath(), cfg.Name)
+		if err != nil {
+			return "", fmt.Errorf("refresh: %w", err)
+		}
+		run, why := Decide(st)
+		msg := "workdir not refreshed: " + why
+		if run {
+			deps, err := mkDeps(ctx)
+			if err != nil {
+				return "", fmt.Errorf("refresh: %w", err)
+			}
+			r, err := Run(ctx, cfg, deps)
+			if err != nil {
+				return "", err
+			}
+			if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+				st.SetCycle(state.CycleNew, time.Now()).Base = r.SHA
+				return nil
+			}); err != nil {
+				return "", fmt.Errorf("refresh: recording the new cycle: %w", err)
+			}
+			msg = fmt.Sprintf("workdir refreshed to %s at %s", cfg.TargetBranch, short(r.SHA))
+		}
+		// The turn is about to run: from here the tree is the producer's.
+		if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+			if c := st.Cycle; c != nil && c.Phase == state.CycleNew {
+				st.SetCycle(state.CycleWorking, time.Now())
+			}
+			return nil
+		}); err != nil {
+			return "", fmt.Errorf("refresh: recording the working cycle: %w", err)
+		}
+		return msg, nil
+	}
+}
+
+// Force runs a refresh regardless of the cycle and starts a new one: the
+// operator's explicit acknowledgement that whatever the tree held is not
+// wanted. The previous phase is returned for the operator to see.
+func Force(ctx context.Context, cfg *config.Config, deps Deps) (Result, string, error) {
+	st, err := state.Load(cfg.StatePath(), cfg.Name)
+	if err != nil {
+		return Result{}, "", err
+	}
+	prev := state.CycleUnknown
+	if st.Cycle != nil {
+		prev = st.Cycle.Phase
+	}
+	r, err := Run(ctx, cfg, deps)
+	if err != nil {
+		return Result{}, prev, err
+	}
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		st.SetCycle(state.CycleNew, time.Now()).Base = r.SHA
+		return nil
+	}); err != nil {
+		return Result{}, prev, fmt.Errorf("refresh: recording the new cycle: %w", err)
+	}
+	return r, prev, nil
 }

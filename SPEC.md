@@ -95,22 +95,35 @@ operator ──brief──▶ ┌───────────┐
 
 **REFRESH precedes a producer turn** (#35). The producer's workdir is a clone
 that nothing else brings forward: the producer holds no provider credential and
-may run without network, and factoryd never runs git in a directory the producer
-can write (§4.4). So before a producer turn, when no change of the producer's is
-in flight (`last_submit` with no `merged` verdict in `last_verdict`), the
-supervisor fetches the target branch into its own clone, writes a git bundle
-under `<root>/refresh/` where the producer can read it, and starts this binary's
-`_refresh` verb *as the producer*, in the producer's repository, which fetches
-from the bundle and makes the tree exactly that commit: branch pointed, reset
-hard, and cleaned of everything untracked or ignored — a stale
-`.producer-branch` would be a resubmission. The result is verified by sha, not
-by the helper's exit. A change in flight is logged and left alone; a refresh
-that fails is a failed turn on the streak, and the agent does not run over a
-tree the step could not prepare: the stale case looks like a model ignoring its
-brief, and the state that explains it is the one place nobody looks.
-`factoryd refresh --config <f>` is the same step by hand; it refuses while a
-change is in flight unless `--force`d. Anything the producer wants to keep
-across cycles belongs under the cache root, not in the tree.
+may run without network, and factoryd never runs git as itself in a directory
+the producer can write (§4.4). So before a producer turn, at the start of a
+cycle, the supervisor fetches the target branch into its own clone, writes a
+git bundle under `<root>/refresh/` where the producer can read it, and starts
+this binary's `_refresh` verb *as the producer*, under the producer's declared
+sandbox exactly as a turn gets it, in the producer's workdir. The helper
+replaces the repository — the old `.git` and every hook, filter and config in
+it go first, and git runs with the system and global config disabled, so no
+producer-controlled configuration executes during the reset — fetches from the
+bundle, points the branch, resets hard, and cleans everything untracked or
+ignored (a stale `.producer-branch` would be a resubmission). The result is
+verified by sha, not by the helper's exit.
+
+**When** is decided by the *cycle*, a durable, write-ahead record in state and
+never by absence. `cycle.phase` is `new` after a refresh (at `base`), `working`
+once a turn has started on the tree, `submitting` from the moment submit has
+validated an intent and *before* it pushes (so a crash between the draft's
+creation and the record of it leaves a phase that forbids a refresh), `open`
+with the draft's `change_id` (supersession moves the id to the newest member of
+the family), and `finished` when the verdict `merged` names *that* id — a merge
+of an older member or an unrelated draft changes nothing. Refresh runs only at
+`new` and `finished`; `working` keeps a first turn's edits through the retry
+that follows its failure; a document written before the record existed loads
+as `unknown`, and unknown authorizes nothing. A refresh that fails is a failed
+turn on the streak (exit 1002), and the agent does not run over a tree the step
+could not prepare. `factoryd refresh --config <f>` is the same step by hand,
+refused outside `new`/`finished` unless `--force`d, which is the operator's
+acknowledgement that the tree is not wanted and starts the next cycle. Anything
+the producer wants to keep across cycles belongs under the cache root.
 
 Both agent roles are **one-shot turns**. Neither polls, waits, or loops. The
 supervisors own all continuity. This is the single most important change from v1,

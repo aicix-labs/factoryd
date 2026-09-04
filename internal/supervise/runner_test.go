@@ -10,6 +10,7 @@ import (
 	"os"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 	"time"
 
@@ -478,5 +479,21 @@ func TestVerdictTurnIsToldEveryVerdictExactly(t *testing.T) {
 	}
 	if !strings.Contains(out3.String(), "FACTORYD_VERDICTS=[]\n") || !strings.Contains(out3.String(), "FACTORYD_CHANGE_BRANCH=\n") {
 		t.Fatalf("a non-verdict turn saw %q", out3.String())
+	}
+}
+
+// ApplySandbox is the one function both the turn and the refresh helper go
+// through (#41 review): a role promised no_network is sealed or refused,
+// never started connected.
+func TestApplySandboxRefusesWithoutRootAndIsNoOpWithoutASandbox(t *testing.T) {
+	if os.Geteuid() == 0 {
+		t.Skip("running as root; the refusal path is for the unprivileged case")
+	}
+	attr := &syscall.SysProcAttr{}
+	if err := supervise.ApplySandbox(config.RoleSpec{Sandbox: &config.Sandbox{NoNetwork: true}}, attr); !errors.Is(err, supervise.ErrNoNetworkNeedsRoot) {
+		t.Fatalf("err=%v; a helper promised no_network must not run connected", err)
+	}
+	if err := supervise.ApplySandbox(config.RoleSpec{}, attr); err != nil {
+		t.Fatalf("no sandbox declared: %v", err)
 	}
 }
