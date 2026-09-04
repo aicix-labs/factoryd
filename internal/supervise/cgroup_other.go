@@ -4,6 +4,7 @@ package supervise
 
 import (
 	"errors"
+	"os/exec"
 	"syscall"
 )
 
@@ -16,3 +17,10 @@ func (*turnCgroup) attr(*syscall.SysProcAttr)                   {}
 func (*turnCgroup) killAll() (int, error)                       { return 0, nil }
 func (*turnCgroup) close()                                      {}
 func ProbeContainment() error                                   { return ErrNoContainment }
+
+var (
+	probePlace      = true
+	probeKillFile   = "cgroup.kill"
+	probeChild      = []string{"/bin/sleep", "60"}
+	probeBeforeKill func(*exec.Cmd)
+)
