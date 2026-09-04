@@ -129,13 +129,13 @@ type Options struct {
 type Supervisor struct {
 	beforeTurn func(ctx context.Context, t Turn) (string, error)
 	afterTurn  func(ctx context.Context, t Turn, res TurnResult) (string, error)
-	cfg       *config.Config
-	role      string
-	runner    Runner
-	log       *slog.Logger
-	now       func() time.Time
-	sleep     func(context.Context, time.Duration) error
-	maxTurn   int
+	cfg        *config.Config
+	role       string
+	runner     Runner
+	log        *slog.Logger
+	now        func() time.Time
+	sleep      func(context.Context, time.Duration) error
+	maxTurn    int
 
 	watcher *watch.Watcher
 	turnSeq int
@@ -187,13 +187,13 @@ func New(opts Options) (*Supervisor, error) {
 	s := &Supervisor{
 		beforeTurn: opts.BeforeTurn,
 		afterTurn:  opts.AfterTurn,
-		cfg:       opts.Config,
-		role:      opts.Role,
-		runner:    opts.Runner,
-		log:       opts.Log,
-		now:       opts.Now,
-		sleep:     opts.Sleep,
-		maxTurn:   opts.MaxTurns,
+		cfg:        opts.Config,
+		role:       opts.Role,
+		runner:     opts.Runner,
+		log:        opts.Log,
+		now:        opts.Now,
+		sleep:      opts.Sleep,
+		maxTurn:    opts.MaxTurns,
 	}
 	if s.log == nil {
 		s.log = slog.New(slog.NewTextHandler(os.Stderr, nil))
