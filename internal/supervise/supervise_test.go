@@ -1251,7 +1251,7 @@ func TestAHaltWhoseSentinelWasNeverWrittenIsNotResetByARestart(t *testing.T) {
 	if err := s.Run(ctx); !errors.Is(err, supervise.ErrHalted) {
 		t.Fatalf("Run returned %v, want ErrHalted", err)
 	}
-	if rs := fx.roleState(t); !rs.Halted || rs.SentinelWritten {
+	if rs := fx.roleState(t); !rs.Halted || rs.SentinelWritten == nil || *rs.SentinelWritten {
 		t.Fatalf("halt state: %+v", rs)
 	}
 	s.Close()
@@ -1268,7 +1268,7 @@ func TestAHaltWhoseSentinelWasNeverWrittenIsNotResetByARestart(t *testing.T) {
 	}
 	s2.Close()
 	rs := fx.roleState(t)
-	if !rs.Halted || rs.LastHalt != nil || !rs.SentinelWritten {
+	if !rs.Halted || rs.LastHalt != nil || rs.SentinelWritten == nil || !*rs.SentinelWritten {
 		t.Fatalf("the refused restart did not keep the halt and persist the sentinel: %+v", rs)
 	}
 	if body, err := os.ReadFile(stop); err != nil || !strings.Contains(string(body), rs.HaltReason) {
@@ -1284,7 +1284,7 @@ func TestAHaltWhoseSentinelWasNeverWrittenIsNotResetByARestart(t *testing.T) {
 	if err := s3.Run(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
 		t.Fatalf("Run after the reset: %v", err)
 	}
-	if rs := fx.roleState(t); rs.Halted || rs.SentinelWritten || rs.LastHalt == nil {
+	if rs := fx.roleState(t); rs.Halted || rs.SentinelWritten != nil || rs.LastHalt == nil {
 		t.Fatalf("the reset did not clear the halt: %+v", rs)
 	}
 }
@@ -1324,5 +1324,93 @@ func TestLeftoverTurnThatRecordedProgressStandsAndIsNotRetried(t *testing.T) {
 	}
 	if rs.LeftoverTurns != 1 {
 		t.Fatalf("leftover_turns=%d, want 1: the leak was not counted, so its silence reads as clean", rs.LeftoverTurns)
+	}
+}
+
+// A halt recorded by a binary that predates sentinel_written has the field
+// absent. That binary also recorded the halt before writing the sentinel and
+// only logged a failure, so absent and no file is exactly the #32 shape
+// seen through the upgrade: unknown cannot authorize a reset (#37 review).
+// The first restart persists the sentinel and refuses, saying why; the
+// removal of that sentinel is the acknowledgement, and the next restart
+// resumes.
+func TestLegacyHaltWithNoFieldRequiresAnExplicitAcknowledgement(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	// The state a pre-#32 binary left after a halt whose sentinel write
+	// failed: halted, reason, time, no field, no file.
+	_, err := state.Update(fx.cfg.StatePath(), fx.cfg.Name, func(st *state.State) error {
+		rs := st.Role(state.RoleReviewer)
+		rs.Halted, rs.HaltReason, rs.HaltedAt, rs.SentinelWritten = true, "fail_abort before the upgrade", time.Now().Add(-time.Hour), nil
+		return nil
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	if b, _ := os.ReadFile(fx.cfg.StatePath()); strings.Contains(string(b), "sentinel_written") {
+		t.Fatalf("the pre-upgrade state must not carry the field:\n%s", b)
+	}
+	stop := fx.cfg.StopPath("reviewer")
+	clean := func() *fakeRunner {
+		return &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult { fx.progress(t); return supervise.TurnResult{} }}
+	}
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+
+	s := fx.newSupervisor(t, clean(), 1)
+	err = s.Run(ctx)
+	if !errors.Is(err, supervise.ErrStopSentinel) {
+		t.Fatalf("the first restart after the upgrade returned %v, want ErrStopSentinel: an unknown sentinel state authorized a reset", err)
+	}
+	if !strings.Contains(err.Error(), "predates sentinel_written") || !strings.Contains(err.Error(), "remove it and restart") {
+		t.Fatalf("the refusal does not say what happened or what to do: %v", err)
+	}
+	s.Close()
+	rs := fx.roleState(t)
+	if !rs.Halted || rs.LastHalt != nil || rs.SentinelWritten == nil || !*rs.SentinelWritten {
+		t.Fatalf("the refused restart did not keep the halt and record the written sentinel: %+v", rs)
+	}
+	if body, err := os.ReadFile(stop); err != nil || !strings.Contains(string(body), "fail_abort before the upgrade") {
+		t.Fatalf("sentinel after the refused restart: %q %v", body, err)
+	}
+
+	// The operator removes the sentinel this binary wrote: that is the reset.
+	if err := os.Remove(stop); err != nil {
+		t.Fatal(err)
+	}
+	fx.wake(t)
+	s2 := fx.newSupervisor(t, clean(), 1)
+	if err := s2.Run(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatalf("the restart after the acknowledgement did not resume: %v", err)
+	}
+	if rs := fx.roleState(t); rs.Halted || rs.LastHalt == nil || rs.LastHalt.Reason != "fail_abort before the upgrade" {
+		t.Fatalf("the halt was not cleared after the acknowledgement: %+v", rs)
+	}
+}
+
+// A control-plane halt (haltNow) whose sentinel write fails records the
+// failure explicitly, so the next start cannot mistake it for a halt that
+// predates the field and resume on its own (#37).
+func TestControlPlaneHaltRecordsAFailedSentinelWriteExplicitly(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	stop := fx.cfg.StopPath("reviewer")
+	r := &fakeRunner{act: func(_ int, tr supervise.Turn) supervise.TurnResult {
+		for _, trig := range tr.Triggers {
+			os.Remove(trig.Path)
+		}
+		lockInbox(t, fx)          // consumed, then the retry marker cannot be written: haltNow
+		_ = os.Mkdir(stop, 0o755) // and the sentinel write fails too
+		return supervise.TurnResult{ExitCode: 1}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted", err)
+	}
+	rs := fx.roleState(t)
+	if !rs.Halted || rs.SentinelWritten == nil || *rs.SentinelWritten {
+		t.Fatalf("a failed sentinel write must be recorded as false, not left absent: %+v", rs)
 	}
 }

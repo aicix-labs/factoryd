@@ -60,12 +60,18 @@ func (s *Supervisor) claim() error {
 		// the recorded halt is cleared and kept as last_halt for the record
 		// (#30). Left in place, the first halt a factory ever took kept its
 		// health red for good -- a red that never goes green.
-		if rs.Halted && !rs.SentinelWritten {
+		if rs.Halted && (rs.SentinelWritten == nil || !*rs.SentinelWritten) {
+			// Never written, or -- the field absent -- recorded by a binary
+			// that predates it, which also recorded the halt before the
+			// write and only logged a failure. Unknown cannot authorize a
+			// circuit-breaker reset (#37 review): both cases persist the
+			// sentinel now and refuse, so the reset is always the removal
+			// of a sentinel this binary knows it wrote.
 			return errHaltUnacknowledged
 		}
 		if rs.Halted {
 			rs.LastHalt = &state.Halt{Reason: rs.HaltReason, At: rs.HaltedAt, ClearedAt: s.now()}
-			rs.Halted, rs.HaltReason, rs.HaltedAt, rs.SentinelWritten = false, "", time.Time{}, false
+			rs.Halted, rs.HaltReason, rs.HaltedAt, rs.SentinelWritten = false, "", time.Time{}, nil
 			s.log.Info("halt cleared by restart", "reason", rs.LastHalt.Reason, "halted_at", rs.LastHalt.At)
 		}
 		rs.Supervisor = &self
@@ -90,19 +96,24 @@ var errHaltUnacknowledged = errors.New("halt recorded but its sentinel was never
 func (s *Supervisor) persistUnacknowledgedHalt() error {
 	var reason string
 	var at time.Time
+	legacy := false
 	if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
 		rs := st.Role(state.Role(s.role))
-		reason, at = rs.HaltReason, rs.HaltedAt
+		reason, at, legacy = rs.HaltReason, rs.HaltedAt, rs.SentinelWritten == nil
 		if err := s.writeStopSentinel(reason, at); err != nil {
 			return fmt.Errorf("%w; writing it now failed too: %v", errHaltUnacknowledged, err)
 		}
-		rs.SentinelWritten = true
+		rs.SentinelWritten = state.Bool(true)
 		return nil
 	}); err != nil {
 		return err
 	}
-	s.log.Error("halt sentinel written on restart; the halt stands", "reason", reason, "halted_at", at)
-	return fmt.Errorf("%w: the halt at %s (%s) was recorded but its sentinel was never written; written now at %s -- remove it to resume",
+	s.log.Error("halt sentinel written on restart; the halt stands", "reason", reason, "halted_at", at, "predates_sentinel_written", legacy)
+	if legacy {
+		return fmt.Errorf("%w: the halt at %s (%s) was recorded by a factoryd that predates sentinel_written, so whether its sentinel was ever written is unknown and cannot authorize a reset; written now at %s -- remove it and restart to resume (once, on this upgrade)",
+			ErrStopSentinel, at.Format(time.RFC3339), reason, s.cfg.StopPath(s.role))
+	}
+	return fmt.Errorf("%w: the halt at %s (%s) was recorded but its sentinel could not be written then; written now at %s -- remove it to resume",
 		ErrStopSentinel, at.Format(time.RFC3339), reason, s.cfg.StopPath(s.role))
 }
 
@@ -110,7 +121,7 @@ func (s *Supervisor) persistUnacknowledgedHalt() error {
 // next start can tell a removed sentinel from one that never existed.
 func (s *Supervisor) markSentinelWritten() {
 	if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
-		st.Role(state.Role(s.role)).SentinelWritten = true
+		st.Role(state.Role(s.role)).SentinelWritten = state.Bool(true)
 		return nil
 	}); err != nil {
 		s.log.Error("could not record that the stop sentinel was written", "err", err)
@@ -360,6 +371,7 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 			rs.Halted = true
 			rs.HaltReason = haltReason
 			rs.HaltedAt = ended
+			rs.SentinelWritten = state.Bool(false) // until the write below succeeds
 		}
 		if hygiene {
 			rs.LeftoverTurns++
@@ -523,6 +535,7 @@ func (s *Supervisor) haltNow(at time.Time, reason string) error {
 	if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
 		rs := st.Role(state.Role(s.role))
 		rs.Halted, rs.HaltReason, rs.HaltedAt = true, reason, at
+		rs.SentinelWritten = state.Bool(false) // until the write below succeeds
 		return nil
 	}); err != nil {
 		s.log.Error("could not record the halt in state", "err", err)
