@@ -10,7 +10,7 @@ import (
 )
 
 const good = `{
-  "schema_version": 4,
+  "schema_version": 5,
   "name": "widgets",
   "provider": "github",
   "github": {"owner": "acme", "repo": "widgets"},
@@ -37,7 +37,13 @@ const good = `{
     "producer": {"command": ["claude", "-p", "producer-brief"], "env": {"PATH": "/usr/local/bin:/usr/bin:/bin"}, "run_as": {"user": "factoryd-producer"}},
     "reviewer": {"command": ["claude", "-p", "reviewer-playbook"], "env": {"PATH": "/usr/local/bin:/usr/bin:/bin"}}
   },
-  "alerts": [{"kind": "file", "path": "/var/log/factoryd/alerts.log"}]
+  "alerts": [{"kind": "file", "path": "/var/log/factoryd/alerts.log"}],
+  "scope": {
+    "deny_regexes": ["^\\.github/workflows/", "(^|/)Dockerfile$"],
+    "allow_regexes": ["^deploy/.*\\.md$"],
+    "hold_diff_regexes": ["-----BEGIN [A-Z ]*PRIVATE KEY-----"],
+    "escalate_regexes": ["(^|/)(auth|token|secret)"]
+  }
 }`
 
 func write(t *testing.T, body string) string {
@@ -77,9 +83,9 @@ func TestUnknownKeyIsRefused(t *testing.T) {
 
 func TestValidationFailures(t *testing.T) {
 	cases := map[string]struct{ from, to, want string }{
-		"missing schema version":              {`"schema_version": 4,`, ``, "schema_version"},
-		"future schema version":               {`"schema_version": 4`, `"schema_version": 99`, "schema_version"},
-		"previous schema version":             {`"schema_version": 4`, `"schema_version": 3`, "schema_version"},
+		"missing schema version":              {`"schema_version": 5,`, ``, "schema_version"},
+		"future schema version":               {`"schema_version": 5`, `"schema_version": 99`, "schema_version"},
+		"previous schema version":             {`"schema_version": 5`, `"schema_version": 4`, "schema_version"},
 		"no producer turn":                    {`"command": ["claude", "-p", "producer-brief"], `, `"command": [], `, "roles.producer.command"},
 		"warn at or above abort":              {`"gate":`, `"supervisor": {"spin_warn": 9, "spin_abort": 4}, "gate":`, "spin_warn"},
 		"no submit repo":                      {`"submit_repo": "/var/lib/factoryd/widgets/submit"`, `"submit_repo": ""`, "submit_repo"},
@@ -106,13 +112,22 @@ func TestValidationFailures(t *testing.T) {
 		"empty gate":                          {`"command": ["go", "test", "./..."]`, `"command": []`, "gate.command"},
 		"no alerts":                           {`[{"kind": "file", "path": "/var/log/factoryd/alerts.log"}]`, `[]`, "alert transport"},
 		"unknown alert kind":                  {`"kind": "file"`, `"kind": "carrier-pigeon"`, "carrier-pigeon"},
-		"alert missing path":                  {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "file"}`, "no path"},
-		"webhook is not deliverable here":     {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "webhook"}`, "not implemented"},
-		"syslog is not deliverable here":      {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "syslog"}`, "not implemented"},
-		"alert command without PATH":          {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "command", "command": ["notify"]}`, "PATH"},
-		"alert file relative path":            {`"path": "/var/log/factoryd/alerts.log"`, `"path": "alerts.log"`, "absolute"},
-		"cache without a bound":               {`"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go", "max_bytes": 1}]},`, `"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go"}]},`, "max_bytes"},
-		"cache relative path":                 {`"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go", "max_bytes": 1}]},`, `"health": {"caches": [{"path": "go", "max_bytes": 1}]},`, "absolute"},
+		"scope absent": {`,
+  "scope": {
+    "deny_regexes": ["^\\.github/workflows/", "(^|/)Dockerfile$"],
+    "allow_regexes": ["^deploy/.*\\.md$"],
+    "hold_diff_regexes": ["-----BEGIN [A-Z ]*PRIVATE KEY-----"],
+    "escalate_regexes": ["(^|/)(auth|token|secret)"]
+  }`, ``, "scope is absent"},
+		"scope regex does not compile":    {`"(^|/)Dockerfile$"`, `"(^|/Dockerfile$"`, "does not compile"},
+		"scope empty pattern":             {`"^deploy/.*\\.md$"`, `""`, "is empty"},
+		"alert missing path":              {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "file"}`, "no path"},
+		"webhook is not deliverable here": {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "webhook"}`, "not implemented"},
+		"syslog is not deliverable here":  {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "syslog"}`, "not implemented"},
+		"alert command without PATH":      {`{"kind": "file", "path": "/var/log/factoryd/alerts.log"}`, `{"kind": "command", "command": ["notify"]}`, "PATH"},
+		"alert file relative path":        {`"path": "/var/log/factoryd/alerts.log"`, `"path": "alerts.log"`, "absolute"},
+		"cache without a bound":           {`"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go", "max_bytes": 1}]},`, `"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go"}]},`, "max_bytes"},
+		"cache relative path":             {`"health": {"caches": [{"path": "/var/cache/factoryd/widgets/go", "max_bytes": 1}]},`, `"health": {"caches": [{"path": "go", "max_bytes": 1}]},`, "absolute"},
 		"caches without a cache root": {`"submit_repo": "/var/lib/factoryd/widgets/submit",
     "cache_root": "/var/cache/factoryd/widgets"`, `"submit_repo": "/var/lib/factoryd/widgets/submit"`, "cache_root"},
 		"cache root is /":                     {`"cache_root": "/var/cache/factoryd/widgets"`, `"cache_root": "/"`, "delete the host"},

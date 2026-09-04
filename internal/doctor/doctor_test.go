@@ -127,7 +127,7 @@ func fixture(t *testing.T) *config.Config {
 	}
 
 	cfg := &config.Config{
-		SchemaVersion: config.SchemaVersion, Health: config.DefaultHealth(),
+		SchemaVersion: config.SchemaVersion, Scope: config.EmptyScope(), Health: config.DefaultHealth(),
 		Name:         "widgets",
 		Provider:     "github",
 		GitHub:       &config.GitHub{Owner: "acme", Repo: "widgets"},

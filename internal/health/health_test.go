@@ -71,7 +71,7 @@ func newLab(t *testing.T) *lab {
 	}
 	l := &lab{root: root, now: time.Date(2026, 9, 3, 12, 0, 0, 0, time.UTC), alerts: filepath.Join(root, "alerts.log")}
 	l.cfg = &config.Config{
-		SchemaVersion: config.SchemaVersion, Name: "widgets", Provider: "github",
+		SchemaVersion: config.SchemaVersion, Scope: config.EmptyScope(), Name: "widgets", Provider: "github",
 		GitHub: &config.GitHub{Owner: "acme", Repo: "widgets"}, TargetBranch: "main",
 		Paths:  config.Paths{Root: root, ProducerWorkdir: filepath.Join(root, "work"), SubmitRepo: filepath.Join(root, "submit"), CacheRoot: filepath.Join(root, "cache-root")},
 		Roles:  config.Roles{Producer: config.RoleSpec{TimeoutSeconds: 600}, Reviewer: config.RoleSpec{TimeoutSeconds: 600}},

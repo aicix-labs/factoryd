@@ -1,5 +1,5 @@
 {
-  "schema_version": 4,
+  "schema_version": 5,
   "name": "widgets",
   "provider": "github",
   "github": {
@@ -106,6 +106,28 @@
         "path": "/var/cache/factoryd/widgets/go",
         "max_bytes": 5368709120
       }
+    ]
+  },
+  "scope": {
+    "deny_regexes": [
+      "^\\.github/workflows/",
+      "^\\.gitlab-ci\\.yml$",
+      "(^|/)Dockerfile$",
+      "^deploy/"
+    ],
+    "allow_regexes": [
+      "^deploy/.*\\.md$"
+    ],
+    "hold_diff_regexes": [
+      "-----BEGIN [A-Z ]*PRIVATE KEY-----",
+      "\\bghp_[A-Za-z0-9]{20,}",
+      "\\bglpat-[A-Za-z0-9_-]{20,}",
+      "\\bAKIA[0-9A-Z]{16}\\b"
+    ],
+    "escalate_regexes": [
+      "(^|/)(auth|authn|authz|login|session|oauth|jwt|token)",
+      "(^|/)(crypto|tls|ssl|cert|secret|vault|password)",
+      "(^|/)(iam|policy|acl|permission|rbac)"
     ]
   }
 }
