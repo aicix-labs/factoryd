@@ -213,8 +213,12 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 				add("producer cannot read "+cr.name, nil, prober.Describe()+" cannot read "+cr.file)
 			}
 		}
+		// The control is printed whether it passes or fails: a control that
+		// is silent when it passes cannot be audited (canary review note).
 		if canOwn, err := prober.CanRead(ctx, producerDir); err != nil || !canOwn {
 			add("producer read probe control", fmt.Errorf("%s cannot read its own workdir %s (%v); the credential probes above prove nothing", prober.Describe(), producerDir, err), producerDir)
+		} else {
+			add("producer read probe control", nil, prober.Describe()+" can read "+producerDir+", so the two refusals above are refusals")
 		}
 		canSubmit, err1 := prober.CanWrite(ctx, cfg.Paths.SubmitRepo)
 		canWork, err2 := prober.CanWrite(ctx, producerDir)
