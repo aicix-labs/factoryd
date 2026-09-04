@@ -140,6 +140,27 @@ record, and a decision is never acted on for a tree someone else may be
 editing by then. Anything
 the producer wants to keep across cycles belongs under the cache root.
 
+**SUBMIT's failures have dispositions** (#42, #40). Every refusal submit
+returns says what may follow it. *Transient* is safe to replay and argued so
+at each site — a fetch, a non-force push of a content-derived branch, local git
+over the same tree, the gate over the same tree, a provider read, a state
+record before any external effect — and the supervisor re-arms a retry marker
+naming the *after-turn step*: the retry resumes submit over the intent the
+producer already declared and does not rerun the model, which would be new
+work, not a retry. *Blocked* cannot be changed by a retry — an invalid
+declaration, a policy or boundary refusal, a change that left the producer's
+hands — and *unknown*, the default for anything that did not say it is safe to
+repeat, might repeat an external effect whose outcome was not observed. Neither
+arms anything: the after-turn step records a durable `blocked` on the producer
+(disposition, reason, turn, family, digest), moves the declaration files aside
+for blocked (`.producer-branch.blocked-<turn>`, never the source work), and
+the factory idles *visibly* — `health` reports `blocked/producer`, `status`
+reports it as a need and not working — until a submission succeeds, which is
+the only thing that clears it. A progress touch, a restart, a new brief change
+nothing. Before this, a refusal that could not change was retried every two
+seconds with a full gate each time: thirty turns in ninety seconds, every one
+"consuming its trigger", invisible to both guards.
+
 Both agent roles are **one-shot turns**. Neither polls, waits, or loops. The
 supervisors own all continuity. This is the single most important change from v1,
 where each agent was told to "run forever" and reliably did not.

@@ -64,11 +64,24 @@ type Result struct {
 	DirtyPaths []string
 }
 
-// Error carries an exit code out of Run.
+// Error carries an exit code and a disposition out of Run. The disposition
+// is what the supervisor acts on (#42): blocked cannot be changed by a
+// retry, transient is safe to replay, unknown must not be replayed
+// automatically. It is set per site, deliberately, and defaults to
+// unknown: a refusal that did not say it is safe to repeat is not.
 type Error struct {
 	Exit   int
 	Reason string
 	Err    error
+	Kind   supervise.Disposition
+}
+
+// Disposition implements supervise.Disposer.
+func (e *Error) Disposition() supervise.Disposition {
+	if e.Kind == "" {
+		return supervise.DispositionUnknown
+	}
+	return e.Kind
 }
 
 func (e *Error) Error() string {
@@ -85,6 +98,26 @@ func fail(exit int, format string, args ...any) error {
 
 func wrap(exit int, err error, format string, args ...any) error {
 	return &Error{Exit: exit, Reason: fmt.Sprintf(format, args...), Err: err}
+}
+
+// blocked: no retry can change this answer. Invalid declarations, policy
+// and boundary refusals, and a change that left the producer's hands.
+func blocked(err error) error {
+	if e, ok := err.(*Error); ok {
+		e.Kind = supervise.DispositionBlocked
+	}
+	return err
+}
+
+// transient: safe to replay, and argued so at each site: a fetch, a
+// non-force push of a content-derived branch, local git over the same
+// tree, the gate over the same tree, a provider read, a state record
+// before any external effect.
+func transient(err error) error {
+	if e, ok := err.(*Error); ok {
+		e.Kind = supervise.DispositionTransient
+	}
+	return err
 }
 
 // Transport is the git side submit needs. gittransport.Transport satisfies
@@ -178,14 +211,14 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		return Result{}, fail(ExitConfig, "the producer credential did not resolve to an identity")
 	}
 	if deps.Reviewer.ID != "" && deps.Producer.ID == deps.Reviewer.ID {
-		return Result{}, fail(ExitConfig, "producer and reviewer both resolve to %s; the producer would review its own work", deps.Producer)
+		return Result{}, blocked(fail(ExitConfig, "producer and reviewer both resolve to %s; the producer would review its own work", deps.Producer))
 	}
 	gitID, err := deps.Transport.Identity(ctx)
 	if err != nil {
 		return Result{}, wrap(ExitConfig, err, "git identity is undecided")
 	}
 	if gitID.Login != deps.Producer.Login {
-		return Result{}, fail(ExitConfig, "git would push as %q but the producer's API identity is %q; the two mechanisms disagree", gitID.Login, deps.Producer.Login)
+		return Result{}, blocked(fail(ExitConfig, "git would push as %q but the producer's API identity is %q; the two mechanisms disagree", gitID.Login, deps.Producer.Login))
 	}
 	fmt.Fprintf(log, "identity: %s (git and API agree)\n", deps.Producer)
 
@@ -197,7 +230,7 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	work := cfg.TurnWorkdir("producer")
 	intent, err := ReadIntent(work)
 	if err != nil && !errors.Is(err, ErrNoIntent) {
-		return Result{}, wrap(ExitConfig, err, "reading the producer's intent")
+		return Result{}, blocked(wrap(ExitConfig, err, "reading the producer's intent"))
 	}
 	msg, branch := intent.Message, intent.Branch
 	if errors.Is(err, ErrNoIntent) {
@@ -213,15 +246,15 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 			}
 		}
 		if err := RecordNoWork(cfg, deps.Now()); err != nil {
-			return Result{}, wrap(ExitConfig, err, "recording the clean cycle")
+			return Result{}, transient(wrap(ExitConfig, err, "recording the clean cycle"))
 		}
 		return r, nil
 	}
 	if branch == cfg.TargetBranch {
-		return Result{}, fail(ExitConfig, "%s names the target branch %q; the producer never writes to the target", BranchFile, branch)
+		return Result{}, blocked(fail(ExitConfig, "%s names the target branch %q; the producer never writes to the target", BranchFile, branch))
 	}
 	if strings.ContainsAny(branch, " \t\n~^:?*[\\") || strings.HasPrefix(branch, "-") {
-		return Result{}, fail(ExitConfig, "%s names an invalid branch %q", BranchFile, branch)
+		return Result{}, blocked(fail(ExitConfig, "%s names an invalid branch %q", BranchFile, branch))
 	}
 	fmt.Fprintf(log, "intent: branch %s, message %q\n", branch, firstLine(msg))
 
@@ -233,35 +266,35 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	// no-op. No lease is needed from a provider that offers none. The
 	// declared name is the family; each submission is an immutable member.
 	if err := deps.Transport.Guard(); err != nil {
-		return Result{}, wrap(ExitConfig, err, "the submit repository failed its guard before any git ran")
+		return Result{}, blocked(wrap(ExitConfig, err, "the submit repository failed its guard before any git ran"))
 	}
 	if err := deps.Transport.Fetch(ctx, "+refs/heads/"+cfg.TargetBranch+":refs/remotes/factoryd/"+cfg.TargetBranch); err != nil {
-		return Result{}, wrap(ExitConfig, err, "fetching %s", cfg.TargetBranch)
+		return Result{}, transient(wrap(ExitConfig, err, "fetching %s", cfg.TargetBranch))
 	}
 	declared := branch
 	if err := deps.Git.Checkout(ctx, declared, "refs/remotes/factoryd/"+cfg.TargetBranch); err != nil {
-		return Result{}, wrap(ExitConfig, err, "creating %s from %s", declared, cfg.TargetBranch)
+		return Result{}, transient(wrap(ExitConfig, err, "creating %s from %s", declared, cfg.TargetBranch))
 	}
 	if err := gittransport.CopyTree(work, cfg.Paths.SubmitRepo); err != nil {
-		return Result{}, wrap(ExitConfig, err, "copying the producer's tree into the submit repository")
+		return Result{}, transient(wrap(ExitConfig, err, "copying the producer's tree into the submit repository"))
 	}
 	sha, committed, err := deps.Git.Commit(ctx, msg, deps.Producer.Login, authorEmail(deps.Producer, cfg))
 	if err != nil {
-		return Result{}, wrap(ExitConfig, err, "committing")
+		return Result{}, transient(wrap(ExitConfig, err, "committing"))
 	}
 	if !committed {
 		if err := RecordNoWork(cfg, deps.Now()); err != nil {
-			return Result{}, wrap(ExitConfig, err, "recording the clean cycle")
+			return Result{}, transient(wrap(ExitConfig, err, "recording the clean cycle"))
 		}
 		return Result{Exit: ExitNothing, Reason: "the producer's tree is identical to " + cfg.TargetBranch + "; nothing to submit"}, nil
 	}
 	tree, err := deps.Git.Tree(ctx)
 	if err != nil {
-		return Result{}, wrap(ExitConfig, err, "reading the tree of %s", sha)
+		return Result{}, transient(wrap(ExitConfig, err, "reading the tree of %s", sha))
 	}
 	branch = ImmutableBranch(declared, tree)
 	if err := deps.Git.Checkout(ctx, branch, "HEAD"); err != nil {
-		return Result{}, wrap(ExitConfig, err, "naming the immutable branch %s", branch)
+		return Result{}, transient(wrap(ExitConfig, err, "naming the immutable branch %s", branch))
 	}
 	fmt.Fprintf(log, "materialised: %s at %s (tree %s)\n", branch, sha, tree)
 
@@ -270,13 +303,13 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	// nothing new to gate or push, and the answer is "already submitted".
 	family, err := openInFamily(ctx, deps.Driver, declared)
 	if err != nil {
-		return Result{}, wrap(ExitConfig, err, "looking for open changes on %s", declared)
+		return Result{}, transient(wrap(ExitConfig, err, "looking for open changes on %s", declared))
 	}
 	for _, c := range family {
 		// Every member must be ours. A ready or foreign change in the family
 		// stops the submission before the gate spends anything.
 		if err := changeIsOurs(c, c.SourceBranch, cfg.TargetBranch, deps.Producer); err != nil {
-			return Result{}, wrap(ExitConfig, err, "an open change exists on %s and is not one this producer may update", declared)
+			return Result{}, blocked(wrap(ExitConfig, err, "an open change exists on %s and is not one this producer may update", declared))
 		}
 		if c.SourceBranch == branch {
 			existing := c
@@ -312,10 +345,10 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	if home != "" {
 		can, err := deps.Provision.GateCanTraverse(ctx, home)
 		if err != nil {
-			return Result{}, wrap(ExitConfig, err, "probing whether the gate can traverse the producer's home %s", home)
+			return Result{}, blocked(wrap(ExitConfig, err, "probing whether the gate can traverse the producer's home %s", home))
 		}
 		if can {
-			return Result{}, fail(ExitConfig, "the gate identity can traverse the producer's home %s; the producer reopened it after doctor, and producer-authored gate code would reach its model credential -- not running the gate", home)
+			return Result{}, blocked(fail(ExitConfig, "the gate identity can traverse the producer's home %s; the producer reopened it after doctor, and producer-authored gate code would reach its model credential -- not running the gate", home))
 		}
 		fmt.Fprintf(log, "boundary: the gate cannot traverse %s\n", home)
 	}
@@ -334,7 +367,7 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 				return Result{}, wrap(ExitConfig, err, "gate path %s", p)
 			}
 			if phys := gittransport.PhysicalPrefix(resolved); config.PathsOverlap(phys, physHome) {
-				return Result{}, fail(ExitConfig, "gate path %q resolves to %s, which overlaps the producer's home %s; provisioning it would hand the gate the producer's model credential -- not provisioning, not running the gate", p, phys, physHome)
+				return Result{}, blocked(fail(ExitConfig, "gate path %q resolves to %s, which overlaps the producer's home %s; provisioning it would hand the gate the producer's model credential -- not provisioning, not running the gate", p, phys, physHome))
 			}
 		}
 	}
@@ -356,12 +389,12 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 			return Result{}, wrap(ExitConfig, err, "re-probing the producer's home %s after provisioning", home)
 		}
 		if can {
-			return Result{}, fail(ExitConfig, "the gate identity can traverse the producer's home %s AFTER provisioning the gate paths; a declared path reached the home -- not running the gate", home)
+			return Result{}, blocked(fail(ExitConfig, "the gate identity can traverse the producer's home %s AFTER provisioning the gate paths; a declared path reached the home -- not running the gate", home))
 		}
 	}
 	exe, err := config.LookPathIn(cfg.Gate.Env["PATH"], cfg.Gate.Command[0])
 	if err != nil {
-		return Result{}, wrap(ExitConfig, err, "gate command")
+		return Result{}, transient(wrap(ExitConfig, err, "gate command"))
 	}
 
 	// 6. The gate, as the gate's own identity, in the constructed environment.
@@ -374,7 +407,7 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	gateExit, err := deps.Gate.Run(ctx, cfg, exe, env, log)
 	if err != nil {
 		// Could not run at all: the host, not the branch.
-		return Result{}, wrap(ExitConfig, err, "the gate could not run")
+		return Result{}, transient(wrap(ExitConfig, err, "the gate could not run"))
 	}
 	if gateExit != 0 {
 		// Red. Do not push. Tell the reviewer why, in a form the producer can
@@ -403,11 +436,11 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	// because the push below targets a branch no change references.
 	family, err = openInFamily(ctx, deps.Driver, declared)
 	if err != nil {
-		return Result{}, wrap(ExitConfig, err, "re-reading open changes on %s before the push", declared)
+		return Result{}, transient(wrap(ExitConfig, err, "re-reading open changes on %s before the push", declared))
 	}
 	for _, c := range family {
 		if err := changeIsOurs(c, c.SourceBranch, cfg.TargetBranch, deps.Producer); err != nil {
-			return Result{}, wrap(ExitConfig, err, "change %s left the producer's hands while the gate ran; not pushing", c.ID)
+			return Result{}, blocked(wrap(ExitConfig, err, "change %s left the producer's hands while the gate ran; not pushing", c.ID))
 		}
 	}
 
@@ -419,13 +452,13 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		c.Family, c.Digest = declared, branch
 		return nil
 	}); err != nil {
-		return Result{}, wrap(ExitConfig, err, "recording the submission before the push")
+		return Result{}, transient(wrap(ExitConfig, err, "recording the submission before the push"))
 	}
 
 	// Non-force: a branch that somehow already exists with different content
 	// is rejected by git itself. The push cannot modify anything.
 	if err := deps.Transport.Push(ctx, "refs/heads/"+branch+":refs/heads/"+branch); err != nil {
-		return Result{}, wrap(ExitConfig, err, "pushing %s", branch)
+		return Result{}, transient(wrap(ExitConfig, err, "pushing %s", branch))
 	}
 	fmt.Fprintf(log, "pushed: %s\n", branch)
 
@@ -508,11 +541,13 @@ func AfterTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, error
 		}
 		deps, err := mkDeps(ctx)
 		if err != nil {
-			return "", fmt.Errorf("submit: %w", err)
+			// Not classified: a credential that did not resolve, an identity
+			// the provider would not confirm. Unknown, and recorded as such.
+			return "", recordBlock(cfg, t, fmt.Errorf("submit: %w", err))
 		}
 		r, err := Run(ctx, cfg, deps)
 		if err != nil {
-			return "", fmt.Errorf("submit: %w", err)
+			return "", recordBlock(cfg, t, fmt.Errorf("submit: %w", err))
 		}
 		switch r.Exit {
 		case ExitSubmitted:
@@ -523,6 +558,60 @@ func AfterTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, error
 			return r.Reason, nil
 		}
 	}
+}
+
+// recordBlock is the after-turn step's failure path (#42). A transient
+// failure is returned as it is: the supervisor re-arms a retry of this
+// step. A blocked or unknown one is recorded in state -- durable,
+// operator-visible, cleared only by a later successful submission -- and,
+// for blocked, the declaration files are moved aside so the next turn
+// cannot resubmit the same refused intent; the producer's source work is
+// not touched. The error is returned with its disposition intact.
+func recordBlock(cfg *config.Config, t supervise.Turn, err error) error {
+	d := supervise.DispositionOf(err)
+	if d == supervise.DispositionTransient {
+		return err
+	}
+	b := &state.Block{Disposition: string(d), Reason: err.Error(), Turn: t.ID, At: time.Now()}
+	var se *Error
+	if errors.As(err, &se) {
+		if intent, ierr := ReadIntent(cfg.TurnWorkdir("producer")); ierr == nil {
+			b.Family = intent.Branch
+		}
+	}
+	if d == supervise.DispositionBlocked {
+		b.Quarantined = quarantineIntent(cfg.TurnWorkdir("producer"), t.ID)
+	}
+	if _, uerr := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		if c := st.Cycle; c != nil {
+			b.Digest = c.Digest
+			if b.Family == "" {
+				b.Family = c.Family
+			}
+		}
+		st.Role(state.RoleProducer).Blocked = b
+		return nil
+	}); uerr != nil {
+		return fmt.Errorf("%w; and the block could not be recorded: %v", err, uerr)
+	}
+	return err
+}
+
+// quarantineIntent moves the declaration files aside, named by the turn
+// that was refused. Source work is not touched.
+func quarantineIntent(work, turnID string) []string {
+	var moved []string
+	for _, f := range []string{BranchFile, CommitMsgFile} {
+		src := filepath.Join(work, f)
+		if _, err := os.Lstat(src); err != nil {
+			continue
+		}
+		dst := src + ".blocked-" + turnID
+		if err := os.Rename(src, dst); err == nil {
+			moved = append(moved, filepath.Base(dst))
+		}
+	}
+	return moved
 }
 
 // recordOpen names the open draft in the cycle. Supersession moves the id
@@ -538,6 +627,8 @@ func recordOpen(cfg *config.Config, now time.Time, declared, branch, changeID st
 		}
 		c := st.SetCycle(phase, now)
 		c.Family, c.Digest, c.ChangeID = declared, branch, changeID
+		// A submission that succeeded is the only thing that clears a block.
+		st.Role(state.RoleProducer).Blocked = nil
 		return nil
 	})
 	return err

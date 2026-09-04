@@ -127,6 +127,20 @@ the branch family by prefix.
 
 ### Operating notes from the runs
 
+- **A refused submission is not retried into a loop** (#40, #42). A reviewer
+  marked the family's open change ready; the producer re-declared the family;
+  submit refused, correctly — and the supervisor re-armed a retry of the whole
+  turn, thirty times in ninety seconds. Submit's failures now carry a
+  disposition (SPEC §3): transient resumes submit alone, blocked and unknown
+  record a durable block, quarantine the declaration, arm nothing, and show in
+  `status`/`health` until a submission succeeds. Proved through the shipped
+  `examples/turn-wrapper.sh` around a scripted producer: exactly one producer
+  turn after the terminal refusal, no further gate or submit; a transient push
+  failure resumed without a second producer turn; an unknown provider answer
+  stayed blocked pending reconciliation; a progress touch and a restart left
+  the block in place. The wrappers' own stale-intent workaround is no longer
+  needed.
+
 - **The producer's workdir is refreshed before a turn** (#35). The second
   production cycle found the clone one merge behind with cycle 1's script
   still untracked; the brief described the merged tree, the producer saw an
