@@ -5,7 +5,9 @@ import (
 	"errors"
 	"flag"
 	"fmt"
+	"github.com/aicix-labs/factoryd/internal/supervise"
 	"os"
+	"path/filepath"
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/factory"
@@ -30,47 +32,12 @@ func runSubmit(args []string) int {
 	}
 	ctx := context.Background()
 
-	// Both credentials, both fail closed. The producer's drives everything;
-	// the reviewer's is resolved only to prove it is someone else.
-	producerTok, err := cfg.Credentials.Producer.Resolve()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "factoryd submit: producer credential: %v\n", err)
-		return exitConfig
-	}
-	reviewerTok, err := cfg.Credentials.Reviewer.Resolve()
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "factoryd submit: reviewer credential: %v\n", err)
-		return exitConfig
-	}
-	driver, err := factory.NewDriver(cfg, producerTok)
+	deps, err := submitDeps(ctx, cfg)
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "factoryd submit: %v\n", err)
 		return exitConfig
 	}
-	producer, err := driver.Whoami(ctx)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "factoryd submit: producer identity: %v\n", err)
-		return exitConfig
-	}
-	reviewer, err := driver.WhoamiWith(ctx, reviewerTok)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "factoryd submit: reviewer identity: %v\n", err)
-		return exitConfig
-	}
-	transport, err := gittransport.New(cfg, driver, producerTok)
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "factoryd submit: %v\n", err)
-		return exitConfig
-	}
-
-	r, err := submit.Run(ctx, cfg, submit.Deps{
-		Driver: driver, Transport: transport,
-		Git:       &submit.RepoGit{Cfg: cfg},
-		Gate:      submit.GateExec{},
-		Provision: submit.GateProvisioner{Cfg: cfg},
-		Producer:  producer, Reviewer: reviewer,
-		Log: os.Stderr,
-	})
+	r, err := submit.Run(ctx, cfg, deps)
 	if err != nil {
 		var se *submit.Error
 		if errors.As(err, &se) {
@@ -82,7 +49,7 @@ func runSubmit(args []string) int {
 	}
 	switch r.Exit {
 	case submit.ExitSubmitted:
-		fmt.Printf("submitted %s as %s: draft %s\n", r.Branch, producer.Login, r.Change.ID)
+		fmt.Printf("submitted %s as %s: draft %s\n", r.Branch, deps.Producer.Login, r.Change.ID)
 		if r.Change.WebURL != "" {
 			fmt.Println(r.Change.WebURL)
 		}
@@ -95,4 +62,73 @@ func runSubmit(args []string) int {
 		fmt.Println(r.Reason)
 	}
 	return r.Exit
+}
+
+// submitDeps builds everything submit needs, both credentials fail closed.
+// The producer's drives everything; the reviewer's is resolved only to
+// prove it is someone else. Shared by the verb and by the producer
+// supervisor's after-turn step, so the two cannot drift.
+func submitDeps(ctx context.Context, cfg *config.Config) (submit.Deps, error) {
+	producerTok, err := cfg.Credentials.Producer.Resolve()
+	if err != nil {
+		return submit.Deps{}, fmt.Errorf("producer credential: %w", err)
+	}
+	reviewerTok, err := cfg.Credentials.Reviewer.Resolve()
+	if err != nil {
+		return submit.Deps{}, fmt.Errorf("reviewer credential: %w", err)
+	}
+	driver, err := factory.NewDriver(cfg, producerTok)
+	if err != nil {
+		return submit.Deps{}, err
+	}
+	producer, err := driver.Whoami(ctx)
+	if err != nil {
+		return submit.Deps{}, fmt.Errorf("producer identity: %w", err)
+	}
+	reviewer, err := driver.WhoamiWith(ctx, reviewerTok)
+	if err != nil {
+		return submit.Deps{}, fmt.Errorf("reviewer identity: %w", err)
+	}
+	transport, err := gittransport.New(cfg, driver, producerTok)
+	if err != nil {
+		return submit.Deps{}, err
+	}
+	return submit.Deps{
+		Driver: driver, Transport: transport,
+		Git:       &submit.RepoGit{Cfg: cfg},
+		Gate:      submit.GateExec{},
+		Provision: submit.GateProvisioner{Cfg: cfg},
+		Producer:  producer, Reviewer: reviewer,
+		Log: os.Stderr,
+	}, nil
+}
+
+// producerAfterTurn is the SUBMIT step of the §3 loop: after a producer turn
+// that declared intent, submit runs outside the sandbox, as factoryd. A
+// turn that declared nothing is left alone (exit 4 is not a failure); a
+// red gate has already written its question and woken the reviewer (exit
+// 5, not a failure either); only a configuration or identity failure (3)
+// is the supervisor's to count.
+func producerAfterTurn(cfg *config.Config) func(ctx context.Context, t supervise.Turn, res supervise.TurnResult) (string, error) {
+	return func(ctx context.Context, t supervise.Turn, res supervise.TurnResult) (string, error) {
+		if _, err := os.Stat(filepath.Join(cfg.TurnWorkdir("producer"), submit.BranchFile)); err != nil {
+			return "no intent declared; nothing to submit", nil
+		}
+		deps, err := submitDeps(ctx, cfg)
+		if err != nil {
+			return "", fmt.Errorf("submit: %w", err)
+		}
+		r, err := submit.Run(ctx, cfg, deps)
+		if err != nil {
+			return "", fmt.Errorf("submit: %w", err)
+		}
+		switch r.Exit {
+		case submit.ExitSubmitted:
+			return fmt.Sprintf("submitted %s as draft %s", r.Branch, r.Change.ID), nil
+		case submit.ExitGateRed:
+			return "gate red: " + r.Reason, nil
+		default:
+			return r.Reason, nil
+		}
+	}
 }

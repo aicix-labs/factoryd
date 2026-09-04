@@ -6,9 +6,12 @@ import (
 	"errors"
 	"io"
 	"os"
+	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
+	"time"
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/gittransport"
@@ -812,5 +815,133 @@ func TestSameTreeRecommittedIsAlreadySubmitted(t *testing.T) {
 	}
 	if r.Exit != submit.ExitNothing || r.Change == nil || r.Change.ID != "7" || len(l.tr.pushed) != 0 {
 		t.Fatalf("result=%+v pushed=%v; a recommit of the same tree is not new content", r, l.tr.pushed)
+	}
+}
+
+// A control file is read by root. Linked to a credential, os.ReadFile would
+// hand its content to the commit message and the draft body before any push.
+// The read is no-follow on a handle: the link is refused, nothing is
+// committed, pushed or opened, and the secret reaches no log and no error.
+func TestSymlinkedControlFileIsRefusedAndLeaksNothing(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	secretFile := filepath.Join(t.TempDir(), "reviewer.token")
+	const secret = "FAKE-CREDENTIAL-7f3a9c2b"
+	if err := os.WriteFile(secretFile, []byte(secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink(secretFile, filepath.Join(l.work, submit.CommitMsgFile)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(l.work, submit.BranchFile), []byte("producer/fix\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if err == nil {
+		t.Fatalf("a symlinked control file was accepted; calls=%v", l.git.calls)
+	}
+	// Outside the workdir the root handle refuses the escape; inside it the
+	// no-follow open refuses the link. Either way it is never read.
+	if exitOf(t, err) != submit.ExitConfig || !(strings.Contains(err.Error(), "symlink") || strings.Contains(err.Error(), "escapes")) {
+		t.Fatalf("err=%v", err)
+	}
+	for _, out := range []string{err.Error(), l.log.String()} {
+		if strings.Contains(out, secret) {
+			t.Fatalf("the secret reached an output:\n%s", out)
+		}
+	}
+	if len(l.git.calls) != 0 || len(l.tr.pushed) != 0 || l.drv.opened != nil || l.gate.ran {
+		t.Fatalf("git=%v pushed=%v opened=%v gate=%v; nothing may follow a refused control file", l.git.calls, l.tr.pushed, l.drv.opened != nil, l.gate.ran)
+	}
+}
+
+// The in-tree variant: the control file links to a file INSIDE the workdir.
+// The root handle would follow that; the no-follow open does not.
+func TestControlFileLinkedInsideTheTreeIsRefused(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	if err := os.WriteFile(filepath.Join(l.work, "notes.txt"), []byte("fix\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.Symlink("notes.txt", filepath.Join(l.work, submit.CommitMsgFile)); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(l.work, submit.BranchFile), []byte("producer/fix\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if err == nil || !strings.Contains(err.Error(), "symlink") || len(l.git.calls) != 0 {
+		t.Fatalf("err=%v git=%v", err, l.git.calls)
+	}
+}
+
+// The reviewer's case: a turn exits clean but a DETACHED child keeps
+// running and swaps a source file for a symlink to a credential before
+// submit copies the tree. The copy is no-follow on a handle: the swap is
+// refused, nothing is committed or pushed, and the secret crosses nowhere.
+func TestDetachedChildSwappingASourceFileIsRefused(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "fix")
+	secretFile := filepath.Join(t.TempDir(), "reviewer.token")
+	const secret = "FAKE-CREDENTIAL-detached-9a1c"
+	if err := os.WriteFile(secretFile, []byte(secret+"\n"), 0o600); err != nil {
+		t.Fatal(err)
+	}
+	// The "turn": exits at once; a setsid'd child (outside the turn's process
+	// group, so the runner's reaper cannot see it) does the swap after it.
+	swapped := filepath.Join(l.work, "swapped")
+	turn := exec.Command("sh", "-c", "setsid sh -c 'ln -sf "+secretFile+" "+filepath.Join(l.work, "src/a.go")+"; touch "+swapped+"' >/dev/null 2>&1 & exit 0")
+	if err := turn.Run(); err != nil {
+		t.Fatal(err)
+	}
+	deadline := time.Now().Add(3 * time.Second)
+	for time.Now().Before(deadline) {
+		if _, err := os.Lstat(swapped); err == nil {
+			break
+		}
+		time.Sleep(10 * time.Millisecond)
+	}
+	if fi, err := os.Lstat(filepath.Join(l.work, "src/a.go")); err != nil || fi.Mode()&os.ModeSymlink == 0 {
+		t.Fatal("the detached child did not swap the file; the test proved nothing")
+	}
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if err == nil {
+		t.Fatalf("the swapped tree was accepted; git=%v pushed=%v", l.git.calls, l.tr.pushed)
+	}
+	if !strings.Contains(err.Error(), "copytree") {
+		t.Fatalf("err=%v", err)
+	}
+	for _, c := range l.git.calls {
+		if strings.HasPrefix(c, "commit") {
+			t.Fatalf("a commit was made from a swapped tree: %v", l.git.calls)
+		}
+	}
+	if len(l.tr.pushed) != 0 || l.drv.opened != nil {
+		t.Fatalf("pushed=%v opened=%v", l.tr.pushed, l.drv.opened != nil)
+	}
+	if b, err := os.ReadFile(filepath.Join(l.cfg.Paths.SubmitRepo, "src/a.go")); err == nil && strings.Contains(string(b), secret) {
+		t.Fatal("the secret was copied into the submit repository")
+	}
+	if strings.Contains(l.log.String(), secret) {
+		t.Fatal("the secret reached the log")
+	}
+}
+
+// A control file that is not a regular file -- a fifo, which would block a
+// root reader without O_NONBLOCK and reads as empty with it -- is refused
+// on the opened descriptor, not read as "no work declared".
+func TestFifoControlFileIsRefused(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	if err := syscall.Mkfifo(filepath.Join(l.work, submit.CommitMsgFile), 0o644); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	if err := os.WriteFile(filepath.Join(l.work, submit.BranchFile), []byte("producer/fix\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if err == nil || !strings.Contains(err.Error(), "not a regular file") || len(l.git.calls) != 0 {
+		t.Fatalf("err=%v git=%v", err, l.git.calls)
 	}
 }

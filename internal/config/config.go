@@ -213,6 +213,12 @@ type RoleSpec struct {
 	// Workdir overrides where the turn runs. Defaults to the producer workdir
 	// for the producer and to paths.root for the reviewer.
 	Workdir string `json:"workdir,omitempty"`
+	// Sandbox is what the supervisor itself takes away from the turn. It is
+	// enforced by the supervisor, as root, at the moment the turn is
+	// started -- not trusted from whatever sandbox the agent's own tooling
+	// may or may not apply. §4.4: a safety property inferred from how one
+	// sandbox happened to behave is an assumption, not a boundary.
+	Sandbox *Sandbox `json:"sandbox,omitempty"`
 	// Env is the turn's WHOLE environment beyond the FACTORYD_* variables.
 	// Nothing is inherited. Passing the supervisor's environment through
 	// would hand the producer every variable the supervisor holds -- including
@@ -279,6 +285,16 @@ const (
 	DefaultDiskMinFree     = 10
 	DefaultAlertCmdTimeout = 30
 )
+
+// Sandbox is the set of things a turn is denied.
+type Sandbox struct {
+	// NoNetwork starts the turn in a new, empty network namespace: no
+	// interfaces but a downed loopback, so nothing can be reached -- not
+	// the provider, not a proxy, not another process's socket. Requires
+	// factoryd to run as root; a factoryd that cannot create the namespace
+	// refuses to start the turn rather than starting it connected.
+	NoNetwork bool `json:"no_network,omitempty"`
+}
 
 // Gate is the build/vet/test command submit runs before pushing anything.
 type Gate struct {

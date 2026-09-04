@@ -57,11 +57,12 @@ func (f *fakeRunner) count() int {
 }
 
 type fixture struct {
-	cfg    *config.Config
-	root   string
-	inbox  string
-	outbox string
-	slept  []time.Duration
+	afterTurn func(ctx context.Context, t supervise.Turn, res supervise.TurnResult) (string, error)
+	cfg       *config.Config
+	root      string
+	inbox     string
+	outbox    string
+	slept     []time.Duration
 }
 
 func currentUser(t *testing.T) string {
@@ -160,7 +161,8 @@ func (fx *fixture) newSupervisor(t *testing.T, r supervise.Runner, maxTurns int)
 			fx.slept = append(fx.slept, d)
 			return ctx.Err()
 		},
-		MaxTurns: maxTurns,
+		MaxTurns:  maxTurns,
+		AfterTurn: fx.afterTurn,
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -1086,5 +1088,97 @@ func TestNewRejectsBadOptions(t *testing.T) {
 			s.Close()
 			t.Errorf("%s: New accepted it", name)
 		}
+	}
+}
+
+// The after-turn step is SUBMIT's seat in the §3 loop: it runs once after a
+// clean turn, with that turn, and not after a turn that failed or timed
+// out -- there is nothing to submit from a turn that did not finish.
+func TestAfterTurnRunsOnceAfterACleanTurnOnly(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	var seen []string
+	fx.afterTurn = func(_ context.Context, tn supervise.Turn, res supervise.TurnResult) (string, error) {
+		seen = append(seen, tn.ID)
+		return "submitted", nil
+	}
+	r := &fakeRunner{act: func(n int, _ supervise.Turn) supervise.TurnResult {
+		fx.progress(t)
+		switch n {
+		case 1:
+			return supervise.TurnResult{} // clean
+		case 2:
+			return supervise.TurnResult{ExitCode: 1} // failed
+		default:
+			return supervise.TurnResult{TimedOut: true, ExitCode: -1}
+		}
+	}}
+	s := fx.newSupervisor(t, r, 3)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	_ = s.Run(ctx)
+	if r.count() != 3 {
+		t.Fatalf("ran %d turns, want 3", r.count())
+	}
+	if len(seen) != 1 {
+		t.Fatalf("after-turn ran %d times %v; want once, after the clean turn only", len(seen), seen)
+	}
+}
+
+// An after-turn failure is the turn's failure: it counts on the fail streak
+// exactly as a non-zero exit does, because a factory whose submit keeps
+// failing is stalled the same way -- and would otherwise read as a stream
+// of clean turns.
+func TestAfterTurnFailureCountsOnTheFailStreak(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	fx.afterTurn = func(context.Context, supervise.Turn, supervise.TurnResult) (string, error) {
+		return "", errors.New("submit: identity failure")
+	}
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		return supervise.TurnResult{} // the agent itself is fine every time
+	}}
+	s := fx.newSupervisor(t, r, 50)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	err := s.Run(ctx)
+	if !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted after fail_abort after-turn failures", err)
+	}
+	if got := r.count(); got != 3 {
+		t.Fatalf("ran %d turns before halting, want 3 (fail_abort)", got)
+	}
+	rs := fx.roleState(t)
+	if !rs.Halted || rs.LastTurn == nil || rs.LastTurn.ExitCode == nil || *rs.LastTurn.ExitCode != supervise.ExitAfterTurnFailed {
+		t.Fatalf("state=%+v; the after-turn failure must be recorded as the turn's exit", rs)
+	}
+}
+
+// A turn that left processes running is not clean: nothing follows it and
+// it counts on the fail streak.
+func TestLeftoverTurnIsNotCleanAndNothingFollowsIt(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	ran := 0
+	fx.afterTurn = func(context.Context, supervise.Turn, supervise.TurnResult) (string, error) { ran++; return "", nil }
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		return supervise.TurnResult{ExitCode: 0, Leftover: true}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	err := s.Run(ctx)
+	if !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted after fail_abort leftover turns", err)
+	}
+	if ran != 0 {
+		t.Fatalf("after-turn ran %d times after turns that left processes running", ran)
+	}
+	if got := r.count(); got != 3 {
+		t.Fatalf("ran %d turns before halting, want 3", got)
+	}
+	rs := fx.roleState(t)
+	if rs.LastTurn == nil || rs.LastTurn.ExitCode == nil || *rs.LastTurn.ExitCode != supervise.ExitLeftover {
+		t.Fatalf("state=%+v", rs.LastTurn)
 	}
 }

@@ -7,6 +7,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"strings"
+	"syscall"
 	"testing"
 
 	"github.com/aicix-labs/factoryd/internal/config"
@@ -458,5 +459,21 @@ func TestGitIsResolvedFromTheDeclaredPathNotTheAmbientOne(t *testing.T) {
 	_ = tr2.Guard()
 	if _, err := os.Stat(marker); err != nil {
 		t.Fatal("the wrapper on the declared PATH did not run; the marker mechanism does not detect execution")
+	}
+}
+
+// A fifo in the producer tree would block root's read forever; a device is
+// not content. Neither is a file, directory or symlink, and both are refused
+// on the opened descriptor, not by a name-based check.
+func TestCopyTreeRefusesAFifo(t *testing.T) {
+	src, dst := t.TempDir(), t.TempDir()
+	if err := os.MkdirAll(filepath.Join(dst, ".git"), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := syscall.Mkfifo(filepath.Join(src, "pipe"), 0o644); err != nil {
+		t.Skipf("mkfifo: %v", err)
+	}
+	if err := gittransport.CopyTree(src, dst); err == nil || !strings.Contains(err.Error(), "not a file") {
+		t.Fatalf("err=%v; a fifo must be refused, not read", err)
 	}
 }

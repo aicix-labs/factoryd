@@ -38,7 +38,25 @@ type TurnResult struct {
 	// distinct from a non-zero exit: an agent that failed and an agent that
 	// never finished need different responses from an operator.
 	TimedOut bool
+	// Leftover records that the turn's leader exited but other processes in
+	// its group were still running -- a background child the agent left
+	// behind. They were killed. A turn that is still running is not a clean
+	// turn: nothing may follow it (no submit) while something the producer
+	// started can still rewrite the tree, and it counts as a failure. A
+	// child that detached from the group escapes this check; the root-
+	// mediated crossing does not rely on it (§4.4: every read is no-follow,
+	// judged on the opened descriptor).
+	Leftover bool
 }
+
+// ExitLeftover is recorded for a turn whose leader exited zero but left
+// processes running in its group.
+const ExitLeftover = 1001
+
+// ExitAfterTurnFailed is the exit code recorded for a turn whose agent
+// exited zero but whose after-turn step failed. It is outside any code a
+// process can return, so it is never mistaken for the agent's own.
+const ExitAfterTurnFailed = 1000
 
 // Runner executes one turn. started is called with a handle to the turn's
 // process as soon as there is one, so the supervisor can record it in state and
@@ -74,17 +92,28 @@ type Options struct {
 	// wants; tests set it so a loop that never terminates fails as a test
 	// rather than hanging one.
 	MaxTurns int
+
+	// AfterTurn runs after a turn that exited zero and was not interrupted,
+	// before progress and consumption are judged. It is how SUBMIT follows
+	// the producer's turn in the §3 loop: the turn declares intent in files
+	// and exits; the supervisor, outside the sandbox and as itself, does
+	// the git and network work. An error from it is a failed turn -- it
+	// counts on the fail streak like an agent that exited non-zero, because
+	// a factory whose submit keeps failing is stalled exactly the same way.
+	// The returned string is logged.
+	AfterTurn func(ctx context.Context, t Turn, res TurnResult) (string, error)
 }
 
 // Supervisor is one role's loop.
 type Supervisor struct {
-	cfg     *config.Config
-	role    string
-	runner  Runner
-	log     *slog.Logger
-	now     func() time.Time
-	sleep   func(context.Context, time.Duration) error
-	maxTurn int
+	afterTurn func(ctx context.Context, t Turn, res TurnResult) (string, error)
+	cfg       *config.Config
+	role      string
+	runner    Runner
+	log       *slog.Logger
+	now       func() time.Time
+	sleep     func(context.Context, time.Duration) error
+	maxTurn   int
 
 	watcher *watch.Watcher
 	turnSeq int
@@ -134,13 +163,14 @@ func New(opts Options) (*Supervisor, error) {
 	}
 
 	s := &Supervisor{
-		cfg:     opts.Config,
-		role:    opts.Role,
-		runner:  opts.Runner,
-		log:     opts.Log,
-		now:     opts.Now,
-		sleep:   opts.Sleep,
-		maxTurn: opts.MaxTurns,
+		afterTurn: opts.AfterTurn,
+		cfg:       opts.Config,
+		role:      opts.Role,
+		runner:    opts.Runner,
+		log:       opts.Log,
+		now:       opts.Now,
+		sleep:     opts.Sleep,
+		maxTurn:   opts.MaxTurns,
 	}
 	if s.log == nil {
 		s.log = slog.New(slog.NewTextHandler(os.Stderr, nil))

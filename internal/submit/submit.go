@@ -20,6 +20,7 @@ import (
 	"path/filepath"
 	"sort"
 	"strings"
+	"syscall"
 	"time"
 
 	"github.com/aicix-labs/factoryd/internal/config"
@@ -183,7 +184,7 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	// and reading the default here would report "nothing to submit" while
 	// the declared work sat elsewhere.
 	work := cfg.TurnWorkdir("producer")
-	msg, hasWork, err := readControl(filepath.Join(work, CommitMsgFile))
+	msg, hasWork, err := readControl(work, CommitMsgFile)
 	if err != nil {
 		return Result{}, wrap(ExitConfig, err, "reading %s", CommitMsgFile)
 	}
@@ -201,7 +202,7 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		}
 		return r, nil
 	}
-	branch, hasBranch, err := readControl(filepath.Join(work, BranchFile))
+	branch, hasBranch, err := readControl(work, BranchFile)
 	if err != nil {
 		return Result{}, wrap(ExitConfig, err, "reading %s", BranchFile)
 	}
@@ -389,11 +390,42 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 }
 
 // readControl reads a control file. Absent or blank means "not declared".
-func readControl(path string) (string, bool, error) {
-	raw, err := os.ReadFile(path)
+// readControl reads a control file the producer wrote, as root, without
+// following anything the producer controls: the file is opened through a
+// handle on the workdir with O_NOFOLLOW on the final component, and must be
+// a regular file on the descriptor that was actually opened. There is no
+// separate stat: a check by path and a read by path are two looks at a
+// thing the producer can change between them. A control file that is a
+// symlink -- to a credential, say -- is refused, and its target is never
+// read, so nothing of it can reach a commit message, a draft body, or a log.
+func readControl(work, name string) (string, bool, error) {
+	dir, err := os.OpenFile(work, os.O_RDONLY|syscall.O_DIRECTORY, 0)
+	if err != nil {
+		return "", false, err
+	}
+	defer dir.Close()
+	f, err := gittransport.OpenNoFollow(dir, name, os.O_RDONLY)
 	if errors.Is(err, os.ErrNotExist) {
 		return "", false, nil
 	}
+	if err != nil {
+		if errors.Is(err, syscall.ELOOP) {
+			return "", false, fmt.Errorf("%s is a symlink; a control file must be a regular file the producer wrote, not a pointer to something else", name)
+		}
+		return "", false, err
+	}
+	defer f.Close()
+	fi, err := f.Stat()
+	if err != nil {
+		return "", false, err
+	}
+	if !fi.Mode().IsRegular() {
+		return "", false, fmt.Errorf("%s is not a regular file (%v); refusing to read it", name, fi.Mode().Type())
+	}
+	if fi.Size() > 64*1024 {
+		return "", false, fmt.Errorf("%s is %d bytes; a control file is a branch name or a commit message", name, fi.Size())
+	}
+	raw, err := io.ReadAll(f)
 	if err != nil {
 		return "", false, err
 	}

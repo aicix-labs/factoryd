@@ -42,6 +42,7 @@ pretending.
 | 5b | `submit`: materialize, gate, open the Draft PR/MR, signal | **done** |
 | 6 | Health tick, alert transports (`file`, `command`), resource guards, bounded caches | **done** |
 | 7 | Status page: `factoryd status`, HTML + JSON, read-only | **done** |
+| §12 | Acceptance: one real factory end-to-end under the real supervisors, sandbox, identities and gate — see [ACCEPTANCE.md](ACCEPTANCE.md) | **done** with scripted turns; real agent CLIs next |
 
 Every verb in the SPEC's surface is built. `signal merged` is the merge gate:
 the `scope` policy in the config (deny / allow / hold-diff / escalate regexes,
@@ -146,7 +147,14 @@ $ factoryd signal --config f.json 61 merged auto --summary "cleared: authz bypas
 merged 61 at 3f9a1c2b7d merged as 8c2e41d0aa (verified); wrote /var/lib/factoryd/widgets/outbox/61.json
 ```
 
-a supervised role loop, where the agent turn is any command you configure:
+a supervised role loop, where the agent turn is any command you configure. The
+producer's turn can be sandboxed by the supervisor itself
+(`roles.producer.sandbox.no_network`: a new network namespace, created as root
+before the identity switch, proved by `doctor` from inside — for scripted turns
+or tool-sandboxed agents, **not** for a producer that is itself a hosted-model
+CLI, which must reach its API), and `submit` is the
+producer supervisor's after-turn step — the turn declares intent in files and
+exits; the supervisor does the git and network work outside the sandbox:
 
 ```console
 $ factoryd supervise --config f.json --role reviewer
