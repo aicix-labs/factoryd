@@ -157,7 +157,14 @@ for blocked (`.producer-branch.blocked-<turn>`, never the source work), and
 the factory idles *visibly* — `health` reports `blocked/producer`, `status`
 reports it as a need and not working — until a submission succeeds, which is
 the only thing that clears it. A progress touch, a restart, a new brief change
-nothing. Before this, a refusal that could not change was retried every two
+nothing: while a block stands the automatic after-turn step consults it first
+and does nothing at all — no read of the intent as a submission, no deps, no
+gate, no push — so an unknown outcome's intent, kept live for reconciliation,
+is never replayed by a later turn that declared nothing new. Only the
+operator's explicit `factoryd submit`, after fixing the cause, uses it again. A
+malformed declaration (one control file without the other, a link, a fifo) is
+a blocked submission like any other: recorded and quarantined, never a plain
+error suppressed in silence. Before this, a refusal that could not change was retried every two
 seconds with a full gate each time: thirty turns in ninety seconds, every one
 "consuming its trigger", invisible to both guards.
 

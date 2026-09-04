@@ -527,9 +527,26 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 // configuration or identity failure (3) is the supervisor's to count.
 func AfterTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, error)) func(ctx context.Context, t supervise.Turn, res supervise.TurnResult) (string, error) {
 	return func(ctx context.Context, t supervise.Turn, res supervise.TurnResult) (string, error) {
+		// A standing block is consulted first (#45 review). While one stands
+		// -- unknown, with the intent kept live for reconciliation, or
+		// blocked -- the automatic step does nothing: no read of the intent
+		// as a submission, no deps, no gate, no push. Only the operator's
+		// explicit `factoryd submit`, after fixing the cause, uses that
+		// intent again, and its success is what clears the block. Without
+		// this, a later brief whose agent declared nothing new would submit
+		// the stale intent -- the automatic replay unknown exists to prevent.
+		st, err := state.Load(cfg.StatePath(), cfg.Name)
+		if err != nil {
+			return "", fmt.Errorf("submit: %w", err)
+		}
+		if b := st.Role(state.RoleProducer).Blocked; b != nil {
+			return fmt.Sprintf("a %s submission stands since turn %s (%s); nothing submitted until the operator reconciles it with factoryd submit", b.Disposition, b.Turn, firstLine(b.Reason)), nil
+		}
 		// The same reader submit uses, so a declaration submit would refuse --
-		// one file without the other, a link, a fifo -- is a failed after-turn
-		// here too, not "no intent" and a consumed trigger over stranded work.
+		// one file without the other, a link, a fifo -- is a blocked
+		// submission here too: recorded, quarantined, never "no intent" and
+		// a consumed trigger over stranded work, and never a plain error
+		// the supervisor suppresses in silence (#45 review).
 		if _, err := ReadIntent(cfg.TurnWorkdir("producer")); err != nil {
 			if errors.Is(err, ErrNoIntent) {
 				if err := RecordNoWork(cfg, time.Now()); err != nil {
@@ -537,7 +554,7 @@ func AfterTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, error
 				}
 				return "no intent declared; nothing to submit", nil
 			}
-			return "", fmt.Errorf("submit: the producer's intent is not a valid declaration: %w", err)
+			return "", recordBlock(cfg, t, blocked(wrap(ExitConfig, err, "submit: the producer's intent is not a valid declaration")))
 		}
 		deps, err := mkDeps(ctx)
 		if err != nil {

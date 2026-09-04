@@ -273,3 +273,91 @@ func mustLoad(t *testing.T, cfg *config.Config) *state.State {
 	}
 	return st
 }
+
+// A malformed declaration -- one control file without the other -- is a
+// blocked submission like any other: recorded, quarantined, not retried,
+// never a plain error the supervisor suppresses in silence (#45 review).
+func TestMalformedDeclarationIsBlockedAndQuarantined(t *testing.T) {
+	const partial = `mkdir -p "$FACTORYD_WORKDIR/src" && printf 'changed\n' > "$FACTORYD_WORKDIR/src/a.go"
+printf 'producer/fix\n' > "$FACTORYD_WORKDIR/.producer-branch"
+touch "$FACTORYD_PROGRESS"
+IFS=:; for p in $FACTORYD_TRIGGER_PATHS; do rm -f "$p"; done
+`
+	a := newAcceptance(t, partial)
+	a.brief(t)
+	if err := a.runFor(t, 50, 4*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.producerTurns(t); got != 1 {
+		t.Fatalf("turns=%d, want 1", got)
+	}
+	rs := a.producer(t)
+	if rs.Blocked == nil || rs.Blocked.Disposition != "blocked" || !strings.Contains(rs.Blocked.Reason, "not a valid declaration") {
+		t.Fatalf("blocked = %+v; a malformed declaration left no durable record", rs.Blocked)
+	}
+	if a.hasRetry() {
+		t.Fatal("a retry was armed for a malformed declaration")
+	}
+	if _, err := os.Stat(filepath.Join(a.work, submit.BranchFile)); !os.IsNotExist(err) {
+		t.Fatal("the malformed declaration was left live")
+	}
+	if len(rs.Blocked.Quarantined) != 1 || !strings.HasPrefix(rs.Blocked.Quarantined[0], ".producer-branch.blocked-") {
+		t.Fatalf("quarantined %v", rs.Blocked.Quarantined)
+	}
+	if len(a.tr.calls) != 0 || len(*a.gate.calls) != 0 {
+		t.Fatalf("submit side effects for a malformed declaration: transport %v gate %v", a.tr.calls, *a.gate.calls)
+	}
+}
+
+// After an unknown outcome the intent is kept live for reconciliation --
+// and a later brief whose agent declares nothing new must not submit it
+// again automatically. The after-turn step consults the block first and
+// does nothing; only the operator's explicit submit uses the intent, and
+// its success clears the block (#45 review).
+func TestSecondTriggerAfterAnUnknownOutcomeHasNoSubmitSideEffects(t *testing.T) {
+	a := newAcceptance(t, `touch "$FACTORYD_PROGRESS"
+IFS=:; for p in $FACTORYD_TRIGGER_PATHS; do rm -f "$p"; done
+`)
+	// The unknown outcome, recorded directly: the intent is live, as it
+	// was left after the provider's ambiguous answer.
+	os.MkdirAll(filepath.Join(a.work, "src"), 0o755)
+	os.WriteFile(filepath.Join(a.work, "src", "a.go"), []byte("changed\n"), 0o644)
+	os.WriteFile(filepath.Join(a.work, submit.BranchFile), []byte("producer/fix\n"), 0o644)
+	os.WriteFile(filepath.Join(a.work, submit.CommitMsgFile), []byte("gate: fix\n\nbody\n"), 0o644)
+	if _, err := state.Update(a.cfg.StatePath(), a.cfg.Name, func(st *state.State) error {
+		st.Role(state.RoleProducer).Blocked = &state.Block{Disposition: "unknown", Reason: "the provider opened 99 but it is not the change that was requested", Turn: "producer-0", At: time.Now()}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	// A new brief; the agent declares nothing new.
+	a.brief(t)
+	if err := a.runFor(t, 1, 4*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.producerTurns(t); got != 1 {
+		t.Fatalf("turns=%d, want 1", got)
+	}
+	if len(a.tr.calls) != 0 || len(*a.gate.calls) != 0 || a.drv.opened != nil {
+		t.Fatalf("the stale intent was replayed automatically: transport %v gate %v opened %v", a.tr.calls, *a.gate.calls, a.drv.opened != nil)
+	}
+	rs := a.producer(t)
+	if rs.Blocked == nil || rs.Blocked.Disposition != "unknown" {
+		t.Fatalf("the block did not stand: %+v", rs.Blocked)
+	}
+	if _, err := os.Stat(filepath.Join(a.work, submit.BranchFile)); err != nil {
+		t.Fatal("the intent kept for reconciliation is gone")
+	}
+	if a.hasRetry() {
+		t.Fatal("a retry was armed")
+	}
+
+	// The operator reconciles: an explicit submit uses the intent and, on
+	// success, clears the block.
+	if r, err := submit.Run(context.Background(), a.cfg, a.deps); err != nil || r.Exit != submit.ExitSubmitted {
+		t.Fatalf("r=%+v err=%v\n%s", r, err, a.log)
+	}
+	if a.producer(t).Blocked != nil {
+		t.Fatal("the operator's successful submission did not clear the block")
+	}
+}
