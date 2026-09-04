@@ -76,6 +76,12 @@ CLIs in the turn commands changes nothing below except who writes the code.
   unconsumed. `doctor` now probes **both handoff directories as the producer**,
   because factoryd being able to write them says nothing (`TestIndividualFailuresAreCaught/producer_cannot_write_the_inbox`, `…outbox`).
 
+### On the sandbox flag in the example
+
+`examples/acceptance/factory.json` sets `roles.producer.sandbox.no_network`
+because its producer is a script. A producer that is itself a hosted-model CLI
+(codex, claude) must reach its own API and **must not** set it — see SPEC §4.4.
+
 ### Not yet done
 
 - The second pass with real agent CLIs in `roles.*.command` (the operator names
