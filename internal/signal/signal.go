@@ -203,6 +203,12 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 	res.Path = path
 	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(s *state.State) error {
 		s.LastVerdict = &v
+		if err := s.RecordCycleReview(&v); err != nil {
+			return err
+		}
+		if v.Kind == state.VerdictMerged {
+			s.ClearOperatorGate(v.ChangeID)
+		}
 		// The cycle finishes on the merge of ITS change, by id. A verdict on
 		// any other change -- an older member of the family, an unrelated
 		// draft -- says nothing about the producer's workdir (#35 review).
@@ -375,6 +381,7 @@ func RecordMerged(ctx context.Context, cfg *config.Config, d scm.Driver, id scm.
 	}
 	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(s *state.State) error {
 		s.LastVerdict = &v
+		s.ClearOperatorGate(v.ChangeID)
 		if c := s.Cycle; c != nil && ((c.Phase == state.CycleOpen && c.ChangeID == v.ChangeID) ||
 			(c.Phase == state.CycleSubmitting && v.Branch != "" && c.Digest == v.Branch)) {
 			s.SetCycle(state.CycleFinished, now())

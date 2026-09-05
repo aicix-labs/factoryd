@@ -225,6 +225,20 @@ func TestNeedsMeNamesEachCondition(t *testing.T) {
 				s.LastVerdict = &state.Verdict{ChangeID: "7", Kind: state.VerdictOperatorGated, Summary: "touches auth"}
 			})
 		}, "change 7 is operator-gated: touches auth", true},
+		"active operator gate survives another changes merge": {func(l *lab, t *testing.T) {
+			l.state(t, func(s *state.State) {
+				c := s.SetCycle(state.CycleOpen, l.now)
+				c.ChangeID, c.Family, c.Digest = "8", "producer/b", "producer/b-0123456789"
+				c.ReviewDecision = &state.ReviewDecision{Kind: state.VerdictOperatorGated, Branch: c.Digest, DeclaredBranch: c.Family, SHA: "b8", Summary: "B needs an operator", At: l.now}
+				// The global activity feed can legitimately be a later merge for A.
+				s.LastVerdict = &state.Verdict{ChangeID: "7", Kind: state.VerdictMerged, Summary: "A landed"}
+			})
+		}, "change 8 is operator-gated: B needs an operator", true},
+		"operator-gated queue continuing": {func(l *lab, t *testing.T) {
+			l.state(t, func(s *state.State) {
+				s.OperatorGates = []state.OperatorGate{{ChangeID: "7", Branch: "producer/fix-abc", Family: "producer/fix", SHA: "abc", Summary: "CI host issue", GatedAt: l.now}}
+			})
+		}, "operator-gated change 7 awaits you: CI host issue", true},
 		"question waiting": {func(l *lab, t *testing.T) {
 			os.WriteFile(filepath.Join(l.cfg.InboxDir(), "question.md"), []byte("?"), 0o644)
 		}, "a question is waiting", true},

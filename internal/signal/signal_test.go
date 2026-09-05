@@ -443,7 +443,7 @@ func TestMergeFinishesOnlyTheCycleOfThatChange(t *testing.T) {
 	l3 := newLab(t)
 	if _, err := state.Update(l3.cfg.StatePath(), l3.cfg.Name, func(st *state.State) error {
 		c := st.SetCycle(state.CycleOpen, time.Now())
-		c.ChangeID = "42"
+		c.ChangeID, c.Family, c.Digest = "42", "producer/fix-abc", "producer/fix-abc"
 		return nil
 	}); err != nil {
 		t.Fatal(err)
@@ -452,7 +452,7 @@ func TestMergeFinishesOnlyTheCycleOfThatChange(t *testing.T) {
 		t.Fatal(err)
 	}
 	st, _ = state.Load(l3.cfg.StatePath(), l3.cfg.Name)
-	if st.Cycle.Phase != state.CycleOpen {
+	if st.Cycle.Phase != state.CycleOpen || st.Cycle.ReviewDecision == nil || st.Cycle.ReviewDecision.Kind != state.VerdictChangesRequested || st.Cycle.ReviewDecision.SHA != "abc123" {
 		t.Fatalf("changes-requested finished the cycle: %+v", st.Cycle)
 	}
 }

@@ -78,6 +78,21 @@ when no draft is in flight, moves it to `inbox/briefs/done/` before the turn,
 and leaves later entries untouched. An empty queue is intentional idle: health
 and status say “brief queue empty; waiting for work,” not unhealthy.
 
+The conservative default keeps that queue behind every open draft. An operator
+may set `queue.continue_while_gated: true` to continue after the reviewer has
+explicitly marked the current change `operator-gated`. Factoryd keeps that
+change in a distinct “awaiting operator” record and refreshes the next brief
+from the target branch; the operator accepts that the two open changes may
+conflict when merged. The enabling review decision is bound to that active
+change's cycle, so recording a later verdict for another change cannot strand
+the queue. `changes-requested` never releases the queue.
+
+This policy adds an operator-gate record to factory state. On an upgrade from
+an earlier state schema, stop the producer, reviewer, `status --serve`, and
+`health --loop` processes, then run `factoryd migrate --config <file>
+service-registry` before starting the new services. Doctor reports the required
+restart sweep and no normal state update is allowed to promote the schema.
+
 A change a human merged outside factoryd is reconciled by one provider read
 when the next refresh is decided, and `factoryd verdict <id> merged` records
 it as a real verdict that wakes the producer (SPEC §3). Nothing polls.

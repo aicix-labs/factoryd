@@ -156,6 +156,12 @@ func Text(s Snapshot) string {
 	if s.Verdict != nil {
 		fmt.Fprintf(&sb, "verdict   %s on %s at %s: %s\n", s.Verdict.Kind, s.Verdict.ChangeID, s.Verdict.At.Format(time.RFC3339), s.Verdict.Summary)
 	}
+	if len(s.OperatorGates) > 0 {
+		sb.WriteString("operator gates (awaiting you):\n")
+		for _, gate := range s.OperatorGates {
+			fmt.Fprintf(&sb, "  ! change %s since %s: %s\n", gate.ChangeID, gate.GatedAt.Format(time.RFC3339), gate.Summary)
+		}
+	}
 	return sb.String()
 }
 
@@ -249,6 +255,7 @@ small{color:#666}
 {{if .Changes.Open}}<table>{{range .Changes.Open}}<tr><td>{{.ID}}</td><td>{{draft .Draft}}</td><td><code>{{.SourceBranch}}</code> → <code>{{.TargetBranch}}</code></td><td>{{.Title}}</td><td><small>{{.Author}}</small></td></tr>{{end}}</table>
 {{else if not .Changes.Skipped}}<p><small>none open as of {{rfc .Changes.AsOf}}</small></p>{{end}}
 {{if .Verdict}}<h2>Last verdict</h2><p><b>{{.Verdict.Kind}}</b> on {{.Verdict.ChangeID}} <small>{{rfc .Verdict.At}}</small><br>{{.Verdict.Summary}}</p>{{end}}
+{{if .OperatorGates}}<h2 class="warn">Awaiting operator</h2><ul>{{range .OperatorGates}}<li><b>change {{.ChangeID}}</b> since {{rfc .GatedAt}}: {{.Summary}}<br><small>the producer is done; this change remains yours while the brief queue continues under operator policy</small></li>{{end}}</ul>{{end}}
 {{if .Errors}}<h2 class="bad">Could not read</h2><ul>{{range .Errors}}<li>{{.}}</li>{{end}}</ul>{{end}}
 </section>{{end}}
 {{define "roles"}}<table>

@@ -20,6 +20,7 @@ import (
 	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/refresh"
 	"github.com/aicix-labs/factoryd/internal/scm"
+	"github.com/aicix-labs/factoryd/internal/signal"
 	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/submit"
 	"github.com/aicix-labs/factoryd/internal/supervise"
@@ -484,6 +485,9 @@ func TestStateWithoutCycleIsNeverRefreshed(t *testing.T) {
 	if err := os.WriteFile(e.cfg.StatePath(), []byte(legacy), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := state.MigrateServiceRegistry(e.cfg.StatePath(), e.cfg.Name); err != nil {
+		t.Fatal(err)
+	}
 	e.edit(t, "in-flight.go", "a draft the old binary opened")
 	e.wake(t)
 	r := &scriptedRunner{act: func(int, supervise.Turn) supervise.TurnResult { e.progress(t); return supervise.TurnResult{} }}
@@ -747,6 +751,22 @@ type lookupFake struct {
 	ancCalls int
 }
 
+// mergedRecordFake supplies the two provider facts RecordMerged needs. The
+// embedded interface intentionally keeps this small fake usable as an SCM
+// driver without making this queue test about unrelated provider operations.
+type mergedRecordFake struct {
+	scm.Driver
+	change scm.Change
+}
+
+func (f *mergedRecordFake) Get(context.Context, scm.ChangeID) (scm.Change, error) {
+	return f.change, nil
+}
+
+func (f *mergedRecordFake) IsAncestor(context.Context, string, string) (bool, error) {
+	return true, nil
+}
+
 func (f *lookupFake) get(context.Context, scm.ChangeID) (scm.Change, error) {
 	f.calls++
 	if f.err != nil {
@@ -860,6 +880,191 @@ func TestQueueStartReconcilesAndReservesAnOperatorMergedCycle(t *testing.T) {
 	q := st.Role(state.RoleProducer).QueueReservation
 	if st.Cycle == nil || st.Cycle.Phase != state.CycleWorking || st.Cycle.Base != "abc123" || q == nil || q.Source != filepath.Join(cfg.BriefsDir(), "010-next.md") || q.Taken || f.calls != 1 || f.ancCalls != 1 {
 		t.Fatalf("cycle=%+v lookup=%d ancestor=%d", st.Cycle, f.calls, f.ancCalls)
+	}
+}
+
+// The queue only moves beside a draft when the operator explicitly enables
+// the policy AND the reviewer has declared this exact open change
+// operator-gated. The old change is retained as an operator obligation before
+// the active cycle is reset for the next immutable brief.
+func TestQueueStartContinuesBesideAnOperatorGatedCycleWhenEnabled(t *testing.T) {
+	cfg := cfgFor(t)
+	cfg.Queue.ContinueWhileGated = true
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.ChangeID, c.Family, c.Digest = "55", "feat/x", "feat/x-abc"
+		v := &state.Verdict{ChangeID: "55", Kind: state.VerdictOperatorGated, Branch: "feat/x-abc", DeclaredBranch: "feat/x", SHA: "abc", Summary: "CI host needs an operator", At: time.Now()}
+		st.LastVerdict = v
+		return st.RecordCycleReview(v)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f := &lookupFake{state: scm.StateOpen}
+	started, note, err := refresh.QueueStart(cfg, func(context.Context) (refresh.Deps, error) {
+		return refresh.Deps{
+			Fetch:    func(context.Context, string) error { return nil },
+			Bundle:   func(context.Context, string, string) (string, error) { return "next-base", nil },
+			Apply:    func(context.Context, string, string) (string, error) { return "next-base", nil },
+			Lookup:   f.get,
+			Ancestor: f.ancestor,
+		}, nil
+	})(context.Background(), supervise.Turn{ID: "queue-gated", Role: "producer", Triggers: []watch.Trigger{{
+		Label: brief.Label, Path: filepath.Join(cfg.BriefsDir(), "010-next.md"),
+	}}})
+	if err != nil || !started || !strings.Contains(note, "workdir refreshed") {
+		t.Fatalf("started=%v note=%q err=%v", started, note, err)
+	}
+	st, err := state.Load(cfg.StatePath(), cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Cycle == nil || st.Cycle.Phase != state.CycleWorking || st.Cycle.Base != "next-base" || st.Role(state.RoleProducer).QueueReservation == nil {
+		t.Fatalf("queue continuation did not reserve the next cycle: cycle=%+v role=%+v", st.Cycle, st.Role(state.RoleProducer))
+	}
+	if len(st.OperatorGates) != 1 || st.OperatorGates[0].ChangeID != "55" || st.OperatorGates[0].Summary != "CI host needs an operator" {
+		t.Fatalf("operator-gated change was not retained: %+v", st.OperatorGates)
+	}
+}
+
+// A is already awaiting an operator, then B becomes the active open change
+// and is operator-gated too. Recording A's eventual merge updates the global
+// activity feed, but must not erase B's cycle-bound review decision before the
+// queue admits its next brief (#56 review).
+func TestQueueStartKeepsActiveGateAfterOperatorRecordsAnotherChangesMerge(t *testing.T) {
+	cfg := cfgFor(t)
+	cfg.Queue.ContinueWhileGated = true
+	if err := os.MkdirAll(cfg.OutboxDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	decisionAt := time.Date(2026, 9, 5, 12, 0, 0, 0, time.UTC)
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		c := st.SetCycle(state.CycleOpen, decisionAt)
+		c.ChangeID, c.Family, c.Digest = "55", "producer/b", "producer/b-b55"
+		decision := &state.Verdict{
+			ChangeID: "55", Kind: state.VerdictOperatorGated,
+			Branch: "producer/b-b55", DeclaredBranch: "producer/b", SHA: "b55",
+			Summary: "B needs an operator", At: decisionAt,
+		}
+		st.LastVerdict = decision
+		if err := st.RecordCycleReview(decision); err != nil {
+			return err
+		}
+		st.OperatorGates = []state.OperatorGate{{
+			ChangeID: "44", Branch: "producer/a-a44", Family: "producer/a", SHA: "a44",
+			Summary: "A needs an operator", GatedAt: decisionAt.Add(-time.Hour),
+		}}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	// This is the interleaving: an operator records the merge of older change
+	// A after B's verdict, which necessarily replaces LastVerdict with A.
+	mergedA := &mergedRecordFake{change: scm.Change{
+		ID: "44", State: scm.StateMerged, TargetBranch: cfg.TargetBranch,
+		HeadSHA: "a44", SourceBranch: "producer/a-a44",
+	}}
+	if _, _, err := signal.RecordMerged(context.Background(), cfg, mergedA, "44", "A landed", func() time.Time {
+		return decisionAt.Add(time.Minute)
+	}); err != nil {
+		t.Fatalf("recording A's merge: %v", err)
+	}
+	before, err := state.Load(cfg.StatePath(), cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if before.LastVerdict == nil || before.LastVerdict.ChangeID != "44" || before.LastVerdict.Kind != state.VerdictMerged {
+		t.Fatalf("recording A did not replace the global activity verdict: %+v", before.LastVerdict)
+	}
+	if before.Cycle == nil || before.Cycle.ReviewDecision == nil || before.Cycle.ReviewDecision.Kind != state.VerdictOperatorGated || before.Cycle.ReviewDecision.SHA != "b55" {
+		t.Fatalf("B's active review decision was lost after recording A: %+v", before.Cycle)
+	}
+	if len(before.OperatorGates) != 0 {
+		t.Fatalf("recording A's merge left its old operator gate behind: %+v", before.OperatorGates)
+	}
+
+	f := &lookupFake{state: scm.StateOpen}
+	started, note, err := refresh.QueueStart(cfg, func(context.Context) (refresh.Deps, error) {
+		return refresh.Deps{
+			Fetch:    func(context.Context, string) error { return nil },
+			Bundle:   func(context.Context, string, string) (string, error) { return "next-base", nil },
+			Apply:    func(context.Context, string, string) (string, error) { return "next-base", nil },
+			Lookup:   f.get,
+			Ancestor: f.ancestor,
+		}, nil
+	})(context.Background(), supervise.Turn{ID: "queue-after-A-merge", Role: "producer", Triggers: []watch.Trigger{{
+		Label: brief.Label, Path: filepath.Join(cfg.BriefsDir(), "010-next.md"),
+	}}})
+	if err != nil || !started || !strings.Contains(note, "workdir refreshed") {
+		t.Fatalf("started=%v note=%q err=%v", started, note, err)
+	}
+	after, err := state.Load(cfg.StatePath(), cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if after.Cycle == nil || after.Cycle.Phase != state.CycleWorking || after.Cycle.Base != "next-base" {
+		t.Fatalf("queue did not start B's successor: %+v", after.Cycle)
+	}
+	if len(after.OperatorGates) != 1 || after.OperatorGates[0].ChangeID != "55" || after.OperatorGates[0].SHA != "b55" {
+		t.Fatalf("B was not retained as the operator obligation: %+v", after.OperatorGates)
+	}
+}
+
+func TestQueueStartDefersOperatorGatedCycleByDefault(t *testing.T) {
+	cfg := cfgFor(t) // ContinueWhileGated is intentionally false by default.
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.ChangeID, c.Family, c.Digest = "55", "feat/x", "feat/x-abc"
+		v := &state.Verdict{ChangeID: "55", Kind: state.VerdictOperatorGated, Branch: "feat/x-abc", DeclaredBranch: "feat/x", SHA: "abc", At: time.Now()}
+		st.LastVerdict = v
+		return st.RecordCycleReview(v)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f := &lookupFake{state: scm.StateOpen}
+	var fetched bool
+	started, note, err := refresh.QueueStart(cfg, func(context.Context) (refresh.Deps, error) {
+		return refresh.Deps{Fetch: func(context.Context, string) error { fetched = true; return nil }, Lookup: f.get, Ancestor: f.ancestor}, nil
+	})(context.Background(), supervise.Turn{ID: "queue-default", Role: "producer", Triggers: []watch.Trigger{{
+		Label: brief.Label, Path: filepath.Join(cfg.BriefsDir(), "010-next.md"),
+	}}})
+	if err != nil || started || !strings.Contains(note, "cycle is open") {
+		t.Fatalf("started=%v note=%q err=%v, want conservative deferral", started, note, err)
+	}
+	if fetched {
+		t.Fatal("default queue policy refreshed beside an operator-gated draft")
+	}
+}
+
+func TestQueueStartNeverContinuesChangesRequestedEvenWhenEnabled(t *testing.T) {
+	cfg := cfgFor(t)
+	cfg.Queue.ContinueWhileGated = true
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.ChangeID, c.Family, c.Digest = "55", "feat/x", "feat/x-abc"
+		v := &state.Verdict{ChangeID: "55", Kind: state.VerdictChangesRequested, Branch: "feat/x-abc", DeclaredBranch: "feat/x", SHA: "abc", At: time.Now()}
+		st.LastVerdict = v
+		return st.RecordCycleReview(v)
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f := &lookupFake{state: scm.StateOpen}
+	var fetched, bundled, applied bool
+	started, note, err := refresh.QueueStart(cfg, func(context.Context) (refresh.Deps, error) {
+		return refresh.Deps{
+			Fetch:  func(context.Context, string) error { fetched = true; return nil },
+			Bundle: func(context.Context, string, string) (string, error) { bundled = true; return "", nil },
+			Apply:  func(context.Context, string, string) (string, error) { applied = true; return "", nil },
+			Lookup: f.get, Ancestor: f.ancestor,
+		}, nil
+	})(context.Background(), supervise.Turn{ID: "queue-changes-requested", Role: "producer", Triggers: []watch.Trigger{{
+		Label: brief.Label, Path: filepath.Join(cfg.BriefsDir(), "010-next.md"),
+	}}})
+	if err != nil || started || !strings.Contains(note, "cycle is open") {
+		t.Fatalf("started=%v note=%q err=%v, want changes-requested deferral", started, note, err)
+	}
+	if fetched || bundled || applied {
+		t.Fatalf("queue refreshed beside changes-requested work: fetch=%v bundle=%v apply=%v", fetched, bundled, applied)
 	}
 }
 

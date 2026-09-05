@@ -106,15 +106,8 @@ func TestV2StateBlocksUntilServiceRegistryMigration(t *testing.T) {
 	if err := s.ClaimService(ServiceStatusServe, holder); !errors.Is(err, ErrServiceRegistryMigrationRequired) {
 		t.Fatalf("v2 registry admitted a new service before attestation: %v", err)
 	}
-	if _, err := Update(p, "widgets", func(*State) error { return nil }); err != nil {
-		t.Fatal(err)
-	}
-	persisted, err := Load(p, "widgets")
-	if err != nil {
-		t.Fatal(err)
-	}
-	if !errors.Is(persisted.ServiceRegistry.MigrationError(), ErrServiceRegistryMigrationRequired) {
-		t.Fatalf("persisted v2 upgrade silently trusted empty services: %+v", persisted.ServiceRegistry)
+	if _, err := Update(p, "widgets", func(*State) error { return nil }); !errors.Is(err, ErrSchemaMigrationRequired) {
+		t.Fatalf("v2 state update = %v, want all-process schema migration refusal", err)
 	}
 	if err := MigrateServiceRegistry(p, "widgets"); err != nil {
 		t.Fatal(err)
@@ -150,6 +143,34 @@ func TestServiceRegistryMigrationRefusesLiveLegacySupervisor(t *testing.T) {
 	}
 	if !strings.Contains(string(raw), `"schema_version":3`) {
 		t.Fatalf("migration wrote a new schema while legacy supervisor was live:\n%s", raw)
+	}
+}
+
+func TestLegacySchemaRefusesAnUpdateBeforeItsCallback(t *testing.T) {
+	p := tmpPath(t)
+	body := `{"schema_version":4,"factory":"widgets","roles":{},"verdict_registry":{"status":"ready"},"service_registry":{"status":"ready"},"cycle":{"phase":"new"}}`
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	ran := false
+	if _, err := Update(p, "widgets", func(*State) error {
+		ran = true // QueueStart can refresh here, so it must never be reached.
+		return nil
+	}); !errors.Is(err, ErrSchemaMigrationRequired) {
+		t.Fatalf("legacy update error=%v, want schema migration refusal", err)
+	}
+	if ran {
+		t.Fatal("legacy update callback ran before the all-process migration")
+	}
+	if err := MigrateServiceRegistry(p, "widgets"); err != nil {
+		t.Fatal(err)
+	}
+	upgraded, err := Load(p, "widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if upgraded.SchemaVersion != SchemaVersion || !upgraded.ServicesReady() {
+		t.Fatalf("explicit migration did not complete v4 -> v%d: %+v", SchemaVersion, upgraded)
 	}
 }
 

@@ -62,6 +62,9 @@ type Config struct {
 	// supervisor owns all continuity.
 	Roles      Roles      `json:"roles"`
 	Supervisor Supervisor `json:"supervisor"`
+	// Queue controls operator-approved throughput tradeoffs for the producer
+	// brief backlog. Its zero value preserves the one-open-draft policy.
+	Queue Queue `json:"queue,omitempty"`
 	// Alerts must not be empty. A factory that detects a stall and has nowhere
 	// to report it recorded the stall correctly into a journal nobody read --
 	// which is what v1 did for two hours and twenty minutes.
@@ -277,6 +280,16 @@ type Supervisor struct {
 	BackoffSeconds int `json:"backoff_seconds,omitempty"`
 	// ForcePoll disables inotify. Set it only to reproduce the fallback.
 	ForcePoll bool `json:"force_poll,omitempty"`
+}
+
+// Queue controls how queued producer briefs interact with an open change.
+// Continuing beside an operator-gated change can create two drafts from
+// different target bases, so it is never enabled implicitly.
+type Queue struct {
+	// ContinueWhileGated lets the next queued brief start after the reviewer
+	// has explicitly declared the current open change operator-gated. The
+	// operator accepts that the two open changes can conflict at merge time.
+	ContinueWhileGated bool `json:"continue_while_gated,omitempty"`
 }
 
 // Defaults, applied by Load. They are named rather than inlined so doctor and
