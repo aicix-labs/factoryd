@@ -26,6 +26,8 @@ func TestProducerAgentWrapperComposesTheProtocolAroundTheBrief(t *testing.T) {
 	got := filepath.Join(root, "prompt-seen")
 	// The fake agent: record stdin, then "do the work" (touch progress).
 	agent := "cat > " + got + " && touch " + progress
+	var lastStderr string
+	var extraEnv []string
 	run := func(triggers, triggerPaths, tsv string, brief string) (string, int) {
 		t.Helper()
 		os.Remove(got)
@@ -40,7 +42,9 @@ func TestProducerAgentWrapperComposesTheProtocolAroundTheBrief(t *testing.T) {
 			"FACTORYD_TRIGGERS=" + triggers, "FACTORYD_TRIGGER_PATHS=" + triggerPaths,
 			"FACTORYD_VERDICTS_TSV=" + tsv,
 		}
+		cmd.Env = append(cmd.Env, extraEnv...)
 		out, err := cmd.CombinedOutput()
+		lastStderr = string(out)
 		rc := 0
 		if ee, ok := err.(*exec.ExitError); ok {
 			rc = ee.ExitCode()
@@ -193,6 +197,71 @@ func TestProducerAgentWrapperComposesTheProtocolAroundTheBrief(t *testing.T) {
 	for _, m := range mustGlob(t, filepath.Join(work, ".producer-*.wrong-family-*")) {
 		os.Remove(m)
 	}
+
+	// Observable work without a declaration is progress, decided by
+	// content, type and mode -- never by timestamp (#50 review, round 8):
+	// a new file, a mode-only change, and a retargeted symlink each keep
+	// the model's progress (exit 0, marker moved, verdict kept); a touch
+	// of an existing file does not (rolled back, exit 4).
+	os.Remove(filepath.Join(work, ".producer-branch"))
+	os.Remove(filepath.Join(work, ".producer-commit-msg"))
+	os.MkdirAll(filepath.Join(work, "src"), 0o755)
+	os.WriteFile(filepath.Join(work, "src", "x.sh"), []byte("#!/bin/sh\n"), 0o644)
+	os.Symlink("x.sh", filepath.Join(work, "src", "link"))
+	os.Remove(filepath.Join(inbox, ".verdict-attempts-48"))
+	for _, c := range []struct {
+		name  string
+		agent string
+		work  bool
+	}{
+		{"touch only", declaring("touch " + work + "/src/x.sh"), false},
+		{"mode only", declaring("chmod +x " + work + "/src/x.sh"), true},
+		{"symlink retargeted", declaring("ln -sfn other " + work + "/src/link"), true},
+		{"new content", declaring("printf 'more\\n' >> " + work + "/src/x.sh"), true},
+	} {
+		agent = c.agent
+		os.Remove(filepath.Join(work, ".producer-branch"))
+		os.Remove(filepath.Join(work, ".producer-commit-msg"))
+		os.WriteFile(vpath, []byte("{}"), 0o644)
+		os.WriteFile(progress, []byte("x"), 0o644)
+		base := time.Date(2026, 9, 1, 12, 0, 0, 123456789, time.UTC)
+		os.Chtimes(progress, base, base)
+		_, rc := run("verdict", vpath, line(vpath, "48", "changes-requested", "fix/{example}"), "")
+		st, _ := os.Stat(progress)
+		moved := st != nil && !st.ModTime().Equal(base)
+		if _, err := os.Stat(vpath); err != nil {
+			t.Fatalf("%s: the verdict was consumed without a declaration", c.name)
+		}
+		if c.work && (rc != 0 || !moved) {
+			ls, _ := filepath.Glob(filepath.Join(work, ".producer-*"))
+			t.Fatalf("%s: real work read as no progress (rc=%d moved=%v) workdir control files=%v\n%s", c.name, rc, moved, ls, lastStderr)
+		}
+		if !c.work && (rc == 0 || moved) {
+			t.Fatalf("%s: a timestamp read as work (rc=%d moved=%v)", c.name, rc, moved)
+		}
+	}
+	os.Remove(filepath.Join(inbox, ".verdict-attempts-48"))
+
+	// The attempt count is per verdict and cleared when the verdict is
+	// resolved: with a bound of 1, a partial turn, then a declaring turn,
+	// then a FRESH verdict on the same change gets its partial turn again.
+	extraEnv = []string{"PRODUCER_VERDICT_ATTEMPTS=1"}
+	partial := declaring("printf 'step\\n' >> " + work + "/src/x.sh")
+	resolve := declaring("printf 'fix/{example}\\n' > " + work + "/.producer-branch && printf 'msg\\n' > " + work + "/.producer-commit-msg")
+	for i, step := range []struct {
+		agent  string
+		wantRC int
+	}{{partial, 0}, {resolve, 0}, {partial, 0}, {partial, 4}} {
+		agent = step.agent
+		os.Remove(filepath.Join(work, ".producer-branch"))
+		os.Remove(filepath.Join(work, ".producer-commit-msg"))
+		os.WriteFile(vpath, []byte("{}"), 0o644)
+		if _, rc := run("verdict", vpath, line(vpath, "48", "changes-requested", "fix/{example}"), ""); rc != step.wantRC {
+			t.Fatalf("attempt-count step %d: rc=%d, want %d (the count must reset when the verdict is resolved)\n%s", i, rc, step.wantRC, lastStderr)
+		}
+	}
+	extraEnv = nil
+	os.Remove(filepath.Join(inbox, ".verdict-attempts-48"))
 	agent = "cat > " + got + " && touch " + progress
 	os.Remove(filepath.Join(work, ".producer-branch"))
 	os.Remove(filepath.Join(work, ".producer-commit-msg"))

@@ -611,3 +611,57 @@ touch "$FACTORYD_PROGRESS"`)
 		}
 	}
 }
+
+// A timestamp is not evidence of work (#50 review, round 8). A model that
+// only touches the same worktree artifact each turn -- a heartbeat, a
+// refreshed build file -- changes no content, type or mode: the wrapper
+// rolls progress back, and the factory halts at fail_abort with the
+// verdict kept and nothing submitted.
+func TestTouchOnlyHeartbeatReachesFailAbortWithTheVerdictKept(t *testing.T) {
+	a := newAgentAcceptance(t, `mkdir -p "$FACTORYD_WORKDIR/build"; [ -e "$FACTORYD_WORKDIR/build/heartbeat" ] || printf 'x\n' > "$FACTORYD_WORKDIR/build/heartbeat"
+touch "$FACTORYD_WORKDIR/build/heartbeat"; touch "$FACTORYD_PROGRESS"; exit 0`)
+	// The first turn creates the file (real content change, one partial
+	// turn); every later turn only touches it. fail_abort more turns halt.
+	vp := a.verdictFor(t, "48", "producer/fix")
+	err := a.runFor(t, 50, 30*time.Second)
+	if !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted (turns=%d): a touched timestamp counted as work", err, a.producerTurns(t))
+	}
+	if got := a.producerTurns(t); got != 1+a.cfg.Supervisor.FailAbort {
+		t.Fatalf("turns=%d, want 1 real change + fail_abort=%d touch-only turns", got, a.cfg.Supervisor.FailAbort)
+	}
+	if _, err := os.Stat(vp); err != nil {
+		t.Fatal("the verdict was lost")
+	}
+	if len(a.tr.calls) != 0 || a.drv.opened != nil {
+		t.Fatalf("submit ran: %v", a.tr.calls)
+	}
+}
+
+// Even content changes can be meaningless (#50 review, round 8). A model
+// that rewrites a file with new content every turn and never declares is
+// bounded: after PRODUCER_VERDICT_ATTEMPTS partial turns on the verdict,
+// further partial turns are no progress, and the factory halts at
+// fail_abort with the verdict kept.
+func TestEndlessContentChangesAreBoundedPerVerdict(t *testing.T) {
+	a := newAgentAcceptance(t, `n=$(wc -l < "$FACTORYD_ROOT/turns"); mkdir -p "$FACTORYD_WORKDIR/src"
+printf 'attempt %s\n' "$n" > "$FACTORYD_WORKDIR/src/churn.go"; touch "$FACTORYD_PROGRESS"; exit 0`)
+	a.cfg.Roles.Producer.Env["PRODUCER_VERDICT_ATTEMPTS"] = "2"
+	if err := a.cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	vp := a.verdictFor(t, "48", "producer/fix")
+	err := a.runFor(t, 50, 30*time.Second)
+	if !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted (turns=%d): endless content churn was unbounded", err, a.producerTurns(t))
+	}
+	if got := a.producerTurns(t); got != 2+a.cfg.Supervisor.FailAbort {
+		t.Fatalf("turns=%d, want bound=2 partial turns + fail_abort=%d", got, a.cfg.Supervisor.FailAbort)
+	}
+	if _, err := os.Stat(vp); err != nil {
+		t.Fatal("the verdict was lost")
+	}
+	if len(a.tr.calls) != 0 {
+		t.Fatalf("submit ran: %v", a.tr.calls)
+	}
+}

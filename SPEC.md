@@ -1056,14 +1056,18 @@ the verdict kept, and the turn failed so the after-turn step never submits an
 unrelated draft (#29 again) — so a model that failed, declared nothing, or
 declared the wrong family leaves the verdict for the retry, which is then told
 it again. Whether such a turn was *progress* is decided by observable work,
-not by the touch alone: the wrapper fingerprints the tree (every regular
-file's path, size and mtime, `.git` and the control files aside) and the
-progress marker before the agent; a changed tree with no declaration yet is a
-large fix spanning turns — the model's progress stands, the verdict waits for
-the next turn, the turn is clean; an unchanged tree with no declaration, or a
-wrong family, is no progress — the marker is restored to its exact mtime and
-the turn exits non-zero, so the supervisor's guards count it, back off, and
-halt at `fail_abort` with the verdict still in the outbox. And a turn the
+not by the touch alone, and *a timestamp is not evidence of work*: the wrapper
+fingerprints the tree by content, type and mode — every file's bytes, every
+symlink's target, every directory, `.git` and the control files aside — and
+the progress marker before the agent. A changed tree with no declaration yet is
+a large fix spanning turns — the model's progress stands, the verdict waits for
+the next turn, the turn is clean — up to a bound, because even content changes
+can be meaningless: after `PRODUCER_VERDICT_ATTEMPTS` (default 6) partial
+turns on the same verdict without a declaration, further partial turns are no
+progress. A touched or re-touched file, an unchanged tree with no declaration,
+a wrong family, or the bound reached: the marker is restored to its exact
+mtime and the turn exits non-zero, so the supervisor's guards count it, back
+off, and halt at `fail_abort` with the verdict still in the outbox. And a turn the
 supervisor killed at its deadline counts on the fail streak whatever the
 marker says, because nothing that would have judged its work ran (§6.3); `FACTORYD_TRIGGER_PATHS` is split on the platform's path-list
 separator, so configured paths containing it are refused at load and a trigger

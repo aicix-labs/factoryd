@@ -41,7 +41,7 @@ tab=$(printf '\t')
 
 # verdict_lines prints every verdict as "  - change ID: KIND (family F)".
 verdict_lines() {
-  printf '%s' "${FACTORYD_VERDICTS_TSV:-}" | while IFS="$tab" read -r vpath vid vkind vbranch vfam; do
+  printf '%s\n' "${FACTORYD_VERDICTS_TSV:-}" | while IFS="$tab" read -r vpath vid vkind vbranch vfam; do
     [ -n "$vid" ] && printf '  - change %s: %s%s\n' "$vid" "${vkind:-unknown}" "${vfam:+ (family $vfam)}"
   done
 }
@@ -52,7 +52,7 @@ verdict_lines() {
 # successor; the other changes-requested verdicts keep their triggers and
 # get their own turns (#50 review).
 selected_cr() {
-  printf '%s' "${FACTORYD_VERDICTS_TSV:-}" | while IFS="$tab" read -r vpath vid vkind vbranch vfam; do
+  printf '%s\n' "${FACTORYD_VERDICTS_TSV:-}" | while IFS="$tab" read -r vpath vid vkind vbranch vfam; do
     if [ "$vkind" = "changes-requested" ]; then printf '%s\t%s\t%s\n' "$vpath" "$vid" "$vfam"; break; fi
   done
 }
@@ -117,7 +117,7 @@ sel_path=""
 sel=$(selected_cr)
 if [ -n "$sel" ]; then
   sel_path=$(printf '%s' "$sel" | cut -f1)
-  keep=$(printf '%s' "${FACTORYD_VERDICTS_TSV:-}" | while IFS="$tab" read -r vpath vid vkind vbranch vfam; do
+  keep=$(printf '%s\n' "${FACTORYD_VERDICTS_TSV:-}" | while IFS="$tab" read -r vpath vid vkind vbranch vfam; do
     [ "$vkind" = "changes-requested" ] && [ "$vpath" != "$sel_path" ] && printf '%s\n' "$vpath"
   done)
 fi
@@ -141,14 +141,25 @@ had_progress=0
 if [ -e "$FACTORYD_PROGRESS" ]; then cp -p "$FACTORYD_PROGRESS" "$snap" || exit 3; had_progress=1; fi
 # Observable work is progress even without a declaration: a large fix
 # legitimately spans turns, and a model that edits the tree and waits to
-# declare until the fix is complete is advancing (#50 review). The tree's
-# shape -- every regular file's path, size and mtime, .git and the control
-# files aside -- is fingerprinted before and after; a changed tree keeps
-# the model's progress and the verdict for the next turn.
+# declare until the fix is complete is advancing (#50 review). The tree is
+# fingerprinted before and after by CONTENT, type and mode -- every file's
+# bytes, every symlink's target, every directory, .git and the control
+# files aside -- never by timestamp: a touch is not work, a heartbeat file
+# refreshed each turn is not work (#50 review, round 8). A changed tree
+# keeps the model's progress and the verdict for the next turn, up to a
+# bound: even content changes can be meaningless, so after
+# PRODUCER_VERDICT_ATTEMPTS (default 6) partial turns on the same verdict
+# without a declaration, further partial turns are no progress, and the
+# supervisor halts with the verdict kept.
+if command -v sha256sum >/dev/null 2>&1; then hasher=sha256sum; else hasher=cksum; fi
 tree_fingerprint() {
-  (cd "$FACTORYD_WORKDIR" && find . -path ./.git -prune -o -type f ! -name '.producer-branch*' ! -name '.producer-commit-msg*' -printf '%p %s %T@\n' 2>/dev/null | LC_ALL=C sort | cksum)
+  (cd "$FACTORYD_WORKDIR" && {
+     find . -path ./.git -prune -o ! -name '.producer-branch*' ! -name '.producer-commit-msg*' \( -type f -o -type l -o -type d \) -printf '%y %m %p -> %l\n'
+     find . -path ./.git -prune -o -type f ! -name '.producer-branch*' ! -name '.producer-commit-msg*' -print0 | LC_ALL=C sort -z | xargs -0 -r "$hasher"
+   } 2>/dev/null | LC_ALL=C sort | "$hasher")
 }
 tree_before=$(tree_fingerprint)
+attempt_bound=${PRODUCER_VERDICT_ATTEMPTS:-6}
 printf '%s\n' "$prompt" | "$wrapper" "$@"
 rc=$?
 # The trigger is consumed by the turn that acted on it. The agent cannot be
@@ -168,6 +179,10 @@ if [ "$rc" -eq 0 ] \
    && [ -f "$FACTORYD_WORKDIR/.producer-branch" ] && [ ! -L "$FACTORYD_WORKDIR/.producer-branch" ] && [ -s "$FACTORYD_WORKDIR/.producer-branch" ] \
    && [ -f "$FACTORYD_WORKDIR/.producer-commit-msg" ] && [ ! -L "$FACTORYD_WORKDIR/.producer-commit-msg" ] && [ -s "$FACTORYD_WORKDIR/.producer-commit-msg" ]; then
   declared=1
+fi
+# A resolved verdict clears its attempt count.
+if [ -n "$sel" ] && [ "$declared" -eq 1 ]; then
+  rm -f "$FACTORYD_INBOX/.verdict-attempts-$(printf '%s' "$sel" | cut -f2)"
 fi
 # The declaration must be FOR the selected verdict: .producer-branch must
 # equal its family exactly (#50 review). A complete declaration under
@@ -191,11 +206,19 @@ fi
 if [ -n "$sel" ] && [ "$declared" -eq 0 ]; then
   keep="$keep
 $sel_path"
-  if [ "$rc" -eq 0 ] && [ "$(tree_fingerprint)" != "$tree_before" ]; then
-    # Partial work: the tree changed. The model's progress stands, the
-    # verdict waits for the next turn, and the turn is clean.
-    echo "producer-turn-agent: the selected changes-requested verdict is kept for the next turn: the tree changed but no complete intent was declared yet" >&2
+  sel_id=$(printf '%s' "$sel" | cut -f2)
+  attempts_file="$FACTORYD_INBOX/.verdict-attempts-$sel_id"
+  attempts=$(cat "$attempts_file" 2>/dev/null || echo 0)
+  if [ "$rc" -eq 0 ] && [ "$(tree_fingerprint)" != "$tree_before" ] && [ "$attempts" -lt "$attempt_bound" ]; then
+    # Partial work: the tree's content changed. The model's progress
+    # stands, the verdict waits for the next turn, and the turn is clean.
+    attempts=$((attempts + 1))
+    printf '%s\n' "$attempts" > "$attempts_file"
+    echo "producer-turn-agent: the selected changes-requested verdict is kept for the next turn: the tree changed but no complete intent was declared yet (partial turn $attempts of $attempt_bound)" >&2
   else
+    if [ "$rc" -eq 0 ] && [ "$attempts" -ge "$attempt_bound" ]; then
+      echo "producer-turn-agent: $attempts partial turns on verdict $sel_id without a declaration; the bound is reached, this turn is no progress" >&2
+    fi
     echo "producer-turn-agent: the selected changes-requested verdict is kept: the turn $( [ "$rc" -eq 0 ] && echo 'changed nothing and declared no intent' || echo "exited $rc" )" >&2
     # No progress on the verdict: the marker goes back to its baseline, and
     # the turn is a failure, so the supervisor's guards count it.
