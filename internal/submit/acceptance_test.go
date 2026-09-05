@@ -915,8 +915,18 @@ exit 0`)
 	if iv.PendingSubmission != nil {
 		t.Fatalf("a no-intent deletion looked like a root-side submission: %+v", iv.PendingSubmission)
 	}
-	if b := st.Role(state.RoleProducer).Blocked; b == nil || !strings.Contains(b.Reason, "disappeared from the producer-writable outbox") {
+	rs := st.Role(state.RoleProducer)
+	if b := rs.Blocked; b == nil || !strings.Contains(b.Reason, "disappeared from the producer-writable outbox") {
 		t.Fatalf("deleted unresolved verdict was not visibly blocked: %+v", b)
+	}
+	if rs.CurrentTurn != nil {
+		t.Fatalf("deleted-verdict turn remains running after its process exited: %+v", rs.CurrentTurn)
+	}
+	if rs.LastTurn == nil || rs.LastTurn.EndedAt == nil || rs.LastTurn.ExitCode == nil || rs.LastTurn.ID != rs.Blocked.Turn {
+		t.Fatalf("deleted-verdict turn was not finalized: last=%+v block=%+v", rs.LastTurn, rs.Blocked)
+	}
+	if b := mustLoad(t, a.cfg).Role(state.RoleProducer).Blocked; b == nil || b.Turn != rs.Blocked.Turn {
+		t.Fatalf("deleted-verdict block was not durable: %+v", b)
 	}
 }
 

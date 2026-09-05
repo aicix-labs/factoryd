@@ -453,7 +453,6 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	}
 	if verdictReceiptLost {
 		s.log.Error("changes-requested verdict disappeared without a root-side submission receipt; blocking instead of treating producer deletion as consumption", "turn", turn.ID)
-		return false, nil
 	}
 
 	// A non-zero exit or a timeout is a failed turn whatever happened to the
