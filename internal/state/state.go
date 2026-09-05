@@ -32,8 +32,9 @@ import (
 // for long-running status and health services, so an older binary cannot
 // silently erase the record that doctor uses to detect a replaced executable.
 // v4 refuses to mistake an empty v3 service map for proof that no pre-registry
-// status or health process remains alive. v5 records open changes deliberately
-// left to the operator while the opt-in brief queue starts independent work.
+// status or health process remains alive. v5 records both the review decision
+// for the active open change and open changes deliberately left to the operator
+// while the opt-in brief queue starts independent work.
 const SchemaVersion = 5
 
 var (
@@ -528,10 +529,27 @@ type Cycle struct {
 	Family string `json:"family,omitempty"`
 	Digest string `json:"digest,omitempty"`
 	// ChangeID is the open draft, newest in the family.
-	ChangeID  string    `json:"change_id,omitempty"`
-	Note      string    `json:"note,omitempty"`
-	StartedAt time.Time `json:"started_at"`
-	UpdatedAt time.Time `json:"updated_at"`
+	ChangeID string `json:"change_id,omitempty"`
+	// ReviewDecision is the verified reviewer decision for this exact open
+	// change. LastVerdict is an activity feed across every change, so it is not
+	// authority to advance this cycle (#56 review).
+	ReviewDecision *ReviewDecision `json:"review_decision,omitempty"`
+	Note           string          `json:"note,omitempty"`
+	StartedAt      time.Time       `json:"started_at"`
+	UpdatedAt      time.Time       `json:"updated_at"`
+}
+
+// ReviewDecision is the lineage-bound portion of a verified reviewer verdict.
+// Its change identity lives on Cycle; keeping the branch facts here proves the
+// decision was about that cycle's immutable submitted branch rather than a
+// similarly named or subsequently superseded change.
+type ReviewDecision struct {
+	Kind           string    `json:"kind"`
+	Branch         string    `json:"branch"`
+	DeclaredBranch string    `json:"declared_branch"`
+	SHA            string    `json:"sha"`
+	Summary        string    `json:"summary,omitempty"`
+	At             time.Time `json:"at"`
 }
 
 // OperatorGate is an open change the reviewer declared complete from the
@@ -848,35 +866,68 @@ func (s *State) ReleaseService(service Service, holder proc.Ref) {
 	}
 }
 
-// DeferOperatorGatedCycle records an open cycle as owned by the operator. The
-// verdict must be the reviewer decision for that exact open change; a stale
-// operator-gated verdict is never authority to start another draft.
-func (s *State) DeferOperatorGatedCycle(v *Verdict, now time.Time) error {
-	if v == nil || v.Kind != VerdictOperatorGated {
-		return errors.New("state: no operator-gated verdict authorizes queue continuation")
+// RecordCycleReview stores a verified reviewer verdict on the active cycle it
+// names. Verdicts for another change deliberately leave the active cycle
+// alone: LastVerdict remains a global activity record, never its authority.
+func (s *State) RecordCycleReview(v *Verdict) error {
+	if v == nil || v.Kind == VerdictMerged {
+		return nil
 	}
 	c := s.Cycle
 	if c == nil || c.Phase != CycleOpen || c.ChangeID == "" || c.ChangeID != v.ChangeID {
-		return errors.New("state: operator-gated verdict does not name the open cycle")
+		return nil
 	}
-	if v.Branch == "" || v.DeclaredBranch == "" || v.SHA == "" {
-		return errors.New("state: operator-gated verdict has incomplete lineage")
+	// A partially written legacy/current cycle cannot prove that this verdict
+	// belongs to it. Preserve the global verdict record, but do not manufacture
+	// cycle authority from incomplete or mismatched lineage.
+	if v.Branch == "" || v.DeclaredBranch == "" || v.SHA == "" ||
+		c.Family == "" || c.Digest == "" || c.Family != v.DeclaredBranch || c.Digest != v.Branch {
+		return nil
+	}
+	if v.At.IsZero() {
+		return nil
+	}
+	c.ReviewDecision = &ReviewDecision{
+		Kind:           v.Kind,
+		Branch:         v.Branch,
+		DeclaredBranch: v.DeclaredBranch,
+		SHA:            v.SHA,
+		Summary:        v.Summary,
+		At:             v.At,
+	}
+	return nil
+}
+
+// DeferOperatorGatedCycle records an open cycle as owned by the operator. The
+// authority is the decision durably attached to this exact cycle, not the
+// global LastVerdict, which another change can overwrite at any time.
+func (s *State) DeferOperatorGatedCycle() error {
+	c := s.Cycle
+	if c == nil || c.Phase != CycleOpen || c.ChangeID == "" || c.ReviewDecision == nil {
+		return errors.New("state: no operator-gated review decision authorizes queue continuation")
+	}
+	v := c.ReviewDecision
+	if v.Kind != VerdictOperatorGated {
+		return errors.New("state: no operator-gated review decision authorizes queue continuation")
+	}
+	if v.Branch == "" || v.DeclaredBranch == "" || v.SHA == "" || v.At.IsZero() {
+		return errors.New("state: operator-gated review decision has incomplete lineage")
 	}
 	if c.Family == "" || c.Digest == "" || c.Family != v.DeclaredBranch || c.Digest != v.Branch {
-		return errors.New("state: operator-gated verdict lineage does not match the open cycle")
+		return errors.New("state: operator-gated review decision lineage does not match the open cycle")
 	}
 	for _, gate := range s.OperatorGates {
-		if gate.ChangeID == v.ChangeID {
+		if gate.ChangeID == c.ChangeID {
 			return nil
 		}
 	}
 	s.OperatorGates = append(s.OperatorGates, OperatorGate{
-		ChangeID: v.ChangeID,
+		ChangeID: c.ChangeID,
 		Branch:   v.Branch,
 		Family:   v.DeclaredBranch,
 		SHA:      v.SHA,
 		Summary:  v.Summary,
-		GatedAt:  now,
+		GatedAt:  v.At,
 	})
 	return nil
 }
@@ -996,6 +1047,20 @@ func (s *State) Validate() error {
 		}
 		if c.Phase == CycleOpen && c.ChangeID == "" {
 			return errors.New("state: cycle is open with no change id")
+		}
+		if d := c.ReviewDecision; d != nil {
+			if c.ChangeID == "" || c.Family == "" || c.Digest == "" {
+				return errors.New("state: review decision is not bound to a complete cycle")
+			}
+			if d.Kind != VerdictChangesRequested && d.Kind != VerdictOperatorGated {
+				return fmt.Errorf("state: cycle review decision kind %q cannot authorize an open cycle", d.Kind)
+			}
+			if d.Branch == "" || d.DeclaredBranch == "" || d.SHA == "" || d.At.IsZero() {
+				return errors.New("state: cycle review decision is incomplete")
+			}
+			if d.DeclaredBranch != c.Family || d.Branch != c.Digest {
+				return errors.New("state: cycle review decision lineage does not match the cycle")
+			}
 		}
 	}
 	if v := s.LastVerdict; v != nil && !ValidVerdictKind(v.Kind) {

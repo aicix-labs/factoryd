@@ -83,7 +83,9 @@ may set `queue.continue_while_gated: true` to continue after the reviewer has
 explicitly marked the current change `operator-gated`. Factoryd keeps that
 change in a distinct “awaiting operator” record and refreshes the next brief
 from the target branch; the operator accepts that the two open changes may
-conflict when merged. `changes-requested` never releases the queue.
+conflict when merged. The enabling review decision is bound to that active
+change's cycle, so recording a later verdict for another change cannot strand
+the queue. `changes-requested` never releases the queue.
 
 This policy adds an operator-gate record to factory state. On an upgrade from
 an earlier state schema, stop the producer, reviewer, `status --serve`, and

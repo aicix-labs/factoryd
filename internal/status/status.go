@@ -360,7 +360,13 @@ func needsMe(cfg *config.Config, s Snapshot, st *state.State) []string {
 		}
 		out = append(out, fmt.Sprintf("operator-gated change %s awaits you: %s -- the brief queue is continuing by operator policy; merge or resolve it independently", gate.ChangeID, summary))
 	}
-	if s.Verdict != nil && s.Verdict.Kind == state.VerdictOperatorGated && !hasOperatorGate(s.OperatorGates, s.Verdict.ChangeID) {
+	activeOperatorGate := false
+	if c := st.Cycle; c != nil && c.Phase == state.CycleOpen && c.ChangeID != "" && c.ReviewDecision != nil &&
+		c.ReviewDecision.Kind == state.VerdictOperatorGated && !hasOperatorGate(s.OperatorGates, c.ChangeID) {
+		out = append(out, fmt.Sprintf("change %s is operator-gated: %s", c.ChangeID, c.ReviewDecision.Summary))
+		activeOperatorGate = true
+	}
+	if !activeOperatorGate && s.Verdict != nil && s.Verdict.Kind == state.VerdictOperatorGated && !hasOperatorGate(s.OperatorGates, s.Verdict.ChangeID) {
 		out = append(out, fmt.Sprintf("change %s is operator-gated: %s", s.Verdict.ChangeID, s.Verdict.Summary))
 	}
 	if _, err := os.Lstat(filepath.Join(cfg.InboxDir(), "question.md")); err == nil {

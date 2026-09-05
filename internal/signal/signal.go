@@ -203,6 +203,9 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 	res.Path = path
 	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(s *state.State) error {
 		s.LastVerdict = &v
+		if err := s.RecordCycleReview(&v); err != nil {
+			return err
+		}
 		if v.Kind == state.VerdictMerged {
 			s.ClearOperatorGate(v.ChangeID)
 		}

@@ -852,6 +852,10 @@ func recordOpen(cfg *config.Config, now time.Time, declared, branch, changeID st
 		}
 		c := st.SetCycle(phase, now)
 		c.Family, c.Digest, c.ChangeID = declared, branch, changeID
+		// A new submission can reuse the Cycle allocation after a prior draft
+		// finished. Its review decision belongs only to that prior immutable
+		// branch and must never authorize this new change.
+		c.ReviewDecision = nil
 		// A submission that succeeded is the only thing that clears a block.
 		st.Role(state.RoleProducer).Blocked = nil
 		return nil

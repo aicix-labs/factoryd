@@ -387,7 +387,7 @@ func QueueStart(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 				return err
 			}
 			if continueWhileGated {
-				if err := st.DeferOperatorGatedCycle(st.LastVerdict, time.Now()); err != nil {
+				if err := st.DeferOperatorGatedCycle(); err != nil {
 					return err
 				}
 			}
@@ -412,18 +412,16 @@ func QueueStart(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 	}
 }
 
-// isOperatorGatedOpenCycle is deliberately stricter than LastVerdict's kind:
-// only the review decision for this exact open cycle can authorize independent
-// queued work. A stale decision on a prior change must not turn a live draft
-// into a refreshable worktree.
+// isOperatorGatedOpenCycle uses the review decision attached to the active
+// cycle, never LastVerdict. The latter is global and can be replaced by an
+// operator recording a merge for another open change while this one waits.
 func isOperatorGatedOpenCycle(st *state.State) bool {
-	if st == nil || st.Cycle == nil || st.Cycle.Phase != state.CycleOpen || st.Cycle.ChangeID == "" || st.LastVerdict == nil {
+	if st == nil || st.Cycle == nil || st.Cycle.Phase != state.CycleOpen || st.Cycle.ChangeID == "" || st.Cycle.ReviewDecision == nil {
 		return false
 	}
-	v := st.LastVerdict
+	v := st.Cycle.ReviewDecision
 	return v.Kind == state.VerdictOperatorGated &&
-		v.ChangeID == st.Cycle.ChangeID &&
-		v.Branch != "" && v.DeclaredBranch != "" && v.SHA != "" &&
+		v.Branch != "" && v.DeclaredBranch != "" && v.SHA != "" && !v.At.IsZero() &&
 		st.Cycle.Family == v.DeclaredBranch && st.Cycle.Digest == v.Branch
 }
 
