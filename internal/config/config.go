@@ -617,13 +617,18 @@ func (c *Config) Validate() error {
 	}
 	// A configured path with a control character in it is a path that
 	// cannot be carried exactly in any line- or tab-delimited handoff (#50
-	// review), and no deployment means one. Refused at load.
+	// review), and no deployment means one; one with the platform's path
+	// list separator in it cannot be carried in FACTORYD_TRIGGER_PATHS,
+	// which a wrapper splits on it. Both refused at load.
 	for _, p := range []struct{ name, path string }{
 		{"paths.root", c.Paths.Root}, {"paths.producer_workdir", c.Paths.ProducerWorkdir},
 		{"paths.submit_repo", c.Paths.SubmitRepo}, {"paths.cache_root", c.Paths.CacheRoot},
 	} {
 		if strings.ContainsAny(p.path, "\t\n\r") {
 			add("%s %q contains a control character", p.name, p.path)
+		}
+		if strings.ContainsRune(p.path, os.PathListSeparator) {
+			add("%s %q contains %q, the path list separator; FACTORYD_TRIGGER_PATHS could not carry a path under it", p.name, p.path, os.PathListSeparator)
 		}
 	}
 	if cr := c.Paths.CacheRoot; cr != "" {

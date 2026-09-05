@@ -467,3 +467,36 @@ touch "$FACTORYD_PROGRESS"`)
 		t.Fatalf("the successor was not opened under the family: %+v", a.drv.opened)
 	}
 }
+
+// The model declares completely -- under the WRONG family. The verdict's
+// trigger is kept, the declaration is moved aside, the turn fails, and
+// the after-turn step never runs: no submit, no unrelated draft (#29,
+// #50 review). The retry is told the verdict and its family again.
+func TestAgentWrongFamilyKeepsTheVerdictAndSubmitsNothing(t *testing.T) {
+	a := newAgentAcceptance(t, `mkdir -p "$FACTORYD_WORKDIR/src" && printf 'fixed\n' > "$FACTORYD_WORKDIR/src/a.go"
+printf 'producer/other\n' > "$FACTORYD_WORKDIR/.producer-branch"
+printf 'fix: something else\n\nbody\n' > "$FACTORYD_WORKDIR/.producer-commit-msg"
+touch "$FACTORYD_PROGRESS"`)
+	vp := a.verdictFor(t, "48", "producer/fix")
+	if err := a.runFor(t, 2, 6*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(vp); err != nil {
+		t.Fatal("the verdict trigger was consumed by a declaration under another family")
+	}
+	if len(a.tr.calls) != 0 || a.drv.opened != nil {
+		t.Fatalf("submit ran for a wrong-family declaration: %v opened=%v", a.tr.calls, a.drv.opened != nil)
+	}
+	if _, err := os.Stat(filepath.Join(a.work, submit.BranchFile)); !os.IsNotExist(err) {
+		t.Fatal("the wrong-family declaration was left for submit")
+	}
+	if got := a.producerTurns(t); got < 2 {
+		t.Fatalf("turns=%d, want the failed turn and its retry", got)
+	}
+	if p := a.lastPrompt(t); !strings.Contains(p, "verbatim:\n    producer/fix\n") {
+		t.Fatalf("the retry was not told the family:\n%s", p)
+	}
+	if b, _ := os.ReadFile(filepath.Join(a.work, "src", "a.go")); string(b) != "fixed\n" {
+		t.Fatal("the producer's source work was touched")
+	}
+}

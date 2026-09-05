@@ -148,6 +148,25 @@ if [ "$rc" -eq 0 ] \
    && [ -f "$FACTORYD_WORKDIR/.producer-commit-msg" ] && [ ! -L "$FACTORYD_WORKDIR/.producer-commit-msg" ] && [ -s "$FACTORYD_WORKDIR/.producer-commit-msg" ]; then
   declared=1
 fi
+# The declaration must be FOR the selected verdict: .producer-branch must
+# equal its family exactly (#50 review). A complete declaration under
+# another name would consume this verdict and open an unrelated draft --
+# the stale-family failure #29 addressed. On a mismatch the wrong
+# declaration is moved aside (never the source work), the verdict is
+# kept, and the turn exits non-zero so the supervisor's after-turn step
+# does not run: nothing is submitted, and the retry is told the verdict.
+if [ -n "$sel" ] && [ "$declared" -eq 1 ]; then
+  sel_fam=$(printf '%s' "$sel" | cut -f3)
+  got_fam=$(sed -n '1{s/[[:space:]]*$//;p;}' "$FACTORYD_WORKDIR/.producer-branch")
+  if [ "$got_fam" != "$sel_fam" ]; then
+    stamp=$(date +%s)
+    mv "$FACTORYD_WORKDIR/.producer-branch" "$FACTORYD_WORKDIR/.producer-branch.wrong-family-$stamp"
+    mv "$FACTORYD_WORKDIR/.producer-commit-msg" "$FACTORYD_WORKDIR/.producer-commit-msg.wrong-family-$stamp"
+    echo "producer-turn-agent: the turn declared family '$got_fam' but the selected verdict is on '$sel_fam'; declaration moved aside, verdict kept, turn failed" >&2
+    declared=0
+    rc=4
+  fi
+fi
 if [ -n "$sel" ] && [ "$declared" -eq 0 ]; then
   keep="$keep
 $sel_path"

@@ -237,6 +237,13 @@ type VerdictEnv struct {
 func (r *ExecRunner) env(t Turn) ([]string, error) {
 	var trigPaths []string
 	for _, tr := range t.Triggers {
+		// FACTORYD_TRIGGER_PATHS is split on the path list separator by
+		// every wrapper; a path containing it would be read as fragments,
+		// and a wrapper could submit while the real trigger stayed pending
+		// (#50 review). Config refuses such roots; this refuses the turn.
+		if strings.ContainsRune(tr.Path, os.PathListSeparator) {
+			return nil, fmt.Errorf("trigger path %q contains %q, the path list separator; FACTORYD_TRIGGER_PATHS cannot carry it", tr.Path, os.PathListSeparator)
+		}
 		trigPaths = append(trigPaths, tr.Path)
 	}
 	factoryd := map[string]string{

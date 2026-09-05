@@ -555,3 +555,20 @@ func TestVerdictPathWithATabRefusesTheTurn(t *testing.T) {
 		t.Fatalf("a verdict path with a tab started the turn: %v", err)
 	}
 }
+
+// A trigger path with the path list separator in it cannot be carried in
+// FACTORYD_TRIGGER_PATHS; the turn does not start (#50 review).
+func TestTriggerPathWithTheListSeparatorRefusesTheTurn(t *testing.T) {
+	fx, r, _ := execFixture(t, []string{"true"}, 30)
+	dir := filepath.Join(fx.inbox, "a"+string(os.PathListSeparator)+"b")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "wake")
+	os.WriteFile(p, []byte("x"), 0o644)
+	tn := turn(fx, 0)
+	tn.Triggers = []watch.Trigger{{Label: "wake", Path: p}}
+	if _, err := r.Run(context.Background(), tn, nil); err == nil || !strings.Contains(err.Error(), "path list separator") {
+		t.Fatalf("a trigger path with the separator started the turn: %v", err)
+	}
+}

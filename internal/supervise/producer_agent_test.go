@@ -138,13 +138,16 @@ func TestProducerAgentWrapperComposesTheProtocolAroundTheBrief(t *testing.T) {
 		{"only .producer-commit-msg", declaring("printf 'msg\\n' > " + work + "/.producer-commit-msg"), true},
 		{"empty control files", declaring(": > " + work + "/.producer-branch && : > " + work + "/.producer-commit-msg"), true},
 		{"both files, exit 0", declaring("printf 'fix/{example}\\n' > " + work + "/.producer-branch && printf 'msg\\n' > " + work + "/.producer-commit-msg"), false},
+		// A complete declaration under ANOTHER family is not this
+		// verdict's: kept, and the turn fails (#50 review).
+		{"wrong family", declaring("printf 'fix/other\\n' > " + work + "/.producer-branch && printf 'msg\\n' > " + work + "/.producer-commit-msg"), true},
 	}
 	for _, c := range cases {
 		os.Remove(filepath.Join(work, ".producer-branch"))
 		os.Remove(filepath.Join(work, ".producer-commit-msg"))
 		os.WriteFile(vpath, []byte("{}"), 0o644)
 		agent = c.agent
-		_, _ = run("verdict", vpath, line(vpath, "48", "changes-requested", "fix/{example}"), "")
+		_, rc := run("verdict", vpath, line(vpath, "48", "changes-requested", "fix/{example}"), "")
 		_, err := os.Stat(vpath)
 		if c.keep && err != nil {
 			t.Fatalf("%s: the selected verdict was consumed", c.name)
@@ -152,6 +155,20 @@ func TestProducerAgentWrapperComposesTheProtocolAroundTheBrief(t *testing.T) {
 		if !c.keep && !os.IsNotExist(err) {
 			t.Fatalf("%s: the selected verdict was not consumed after a complete declaration", c.name)
 		}
+		if c.name == "wrong family" {
+			if rc == 0 {
+				t.Fatal("wrong family: the turn exited 0; the after-turn step would submit an unrelated draft")
+			}
+			if _, err := os.Stat(filepath.Join(work, ".producer-branch")); !os.IsNotExist(err) {
+				t.Fatal("wrong family: the declaration was left in place for submit")
+			}
+			if m, _ := filepath.Glob(filepath.Join(work, ".producer-branch.wrong-family-*")); len(m) != 1 {
+				t.Fatalf("wrong family: declaration not moved aside: %v", m)
+			}
+		}
+	}
+	for _, m := range mustGlob(t, filepath.Join(work, ".producer-*.wrong-family-*")) {
+		os.Remove(m)
 	}
 	agent = "cat > " + got + " && touch " + progress
 	os.Remove(filepath.Join(work, ".producer-branch"))
@@ -257,4 +274,13 @@ func TestProducerAgentWrapperComposesTheProtocolAroundTheBrief(t *testing.T) {
 	if err := cmd.Run(); err == nil {
 		t.Fatal("ran without FACTORYD_WORKDIR")
 	}
+}
+
+func mustGlob(t *testing.T, pattern string) []string {
+	t.Helper()
+	m, err := filepath.Glob(pattern)
+	if err != nil {
+		t.Fatal(err)
+	}
+	return m
 }

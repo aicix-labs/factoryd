@@ -1050,9 +1050,14 @@ family is only a character), never parsed out of JSON by a shell. **One
 wrapper selects the first, names it, and *keeps* the other changes-requested
 triggers for their own turns — a consumed verdict nobody acted on is lost for
 good; the selected one is consumed only by a turn that exited zero AND left
-both control files as non-empty regular files, so a model that failed, or
-exited clean having declared nothing, leaves the verdict for the retry, which
-is then told it again; every TSV field, the path included, is refused by the
+both control files as non-empty regular files AND declared *that verdict's
+family exactly* — a complete declaration under another name is moved aside,
+the verdict kept, and the turn failed so the after-turn step never submits an
+unrelated draft (#29 again) — so a model that failed, declared nothing, or
+declared the wrong family leaves the verdict for the retry, which is then told
+it again; `FACTORYD_TRIGGER_PATHS` is split on the platform's path-list
+separator, so configured paths containing it are refused at load and a trigger
+path containing it refuses the turn; every TSV field, the path included, is refused by the
 runner if it holds a tab or newline, and configured paths with control
 characters are refused at load; then the brief; then it runs the agent
 through `turn-wrapper.sh` and consumes the triggers it acted on — never the

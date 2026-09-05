@@ -495,4 +495,10 @@ func TestPathsWithControlCharactersAreRefused(t *testing.T) {
 	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "paths.root") || !strings.Contains(err.Error(), "control character") {
 		t.Fatalf("a root with a tab was accepted: %v", err)
 	}
+	// And the path list separator: FACTORYD_TRIGGER_PATHS is split on it.
+	c, _ = config.Load("../../examples/factory.github.json")
+	c.Paths.Root = "/var/lib/factoryd/a:b"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "path list separator") {
+		t.Fatalf("a root with ':' was accepted: %v", err)
+	}
 }
