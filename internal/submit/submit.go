@@ -448,10 +448,16 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	// between the draft's creation and the record of it leaves a phase that
 	// forbids a refresh, never an absence that permits one (#35 review).
 	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		if err := st.PermitProducerCycleMutation(); err != nil {
+			return err
+		}
 		c := st.SetCycle(state.CycleSubmitting, deps.Now())
 		c.Family, c.Digest = declared, branch
 		return nil
 	}); err != nil {
+		if errors.Is(err, state.ErrProducerLifecycleBusy) {
+			return Result{}, blocked(wrap(ExitConfig, err, "refusing to submit while a queued producer handoff is active"))
+		}
 		return Result{}, transient(wrap(ExitConfig, err, "recording the submission before the push"))
 	}
 
@@ -770,6 +776,9 @@ func quarantineIntent(work, turnID string) []string {
 // here, so either ordering converges.
 func recordOpen(cfg *config.Config, now time.Time, declared, branch, changeID string) error {
 	_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		if err := st.PermitProducerCycleMutation(); err != nil {
+			return err
+		}
 		phase := state.CycleOpen
 		if v := st.LastVerdict; v != nil && v.Kind == state.VerdictMerged && v.ChangeID == changeID {
 			phase = state.CycleFinished
@@ -790,6 +799,9 @@ func recordOpen(cfg *config.Config, now time.Time, declared, branch, changeID st
 // as it is: "nothing new this turn" says nothing about a draft in flight.
 func RecordNoWork(cfg *config.Config, now time.Time) error {
 	_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		if err := st.PermitProducerCycleMutation(); err != nil {
+			return err
+		}
 		if c := st.Cycle; c != nil && (c.Phase == state.CycleNew || c.Phase == state.CycleWorking) {
 			st.SetCycle(state.CycleClean, now)
 		}

@@ -31,6 +31,10 @@ import (
 // silently quarantining the old handoff files.
 const SchemaVersion = 2
 
+// ErrProducerLifecycleBusy means a queued producer handoff has not finished
+// its agent process, so root-side cycle transitions must wait.
+var ErrProducerLifecycleBusy = errors.New("producer queued handoff is active")
+
 // Role is one of the two agent roles.
 type Role string
 
@@ -161,15 +165,36 @@ type RoleState struct {
 
 // QueueReservation binds one ordered brief to the producer turn that reserved
 // the cycle. Source is the queue path, Done is factoryd's immutable handoff
-// path, and Taken says the state write after the rename completed. A restart
-// can therefore distinguish a pending source from a taken brief even though
-// the watched source path no longer exists in the latter case.
+// path, and Taken says the state write after the rename completed. Process
+// flags bind the handoff to the producer process, so restart recovery never
+// launches a duplicate beside an orphaned agent. A restart can therefore
+// distinguish a pending source from a taken brief even though the watched
+// source path no longer exists in the latter case.
 type QueueReservation struct {
 	Source     string    `json:"source"`
 	Done       string    `json:"done"`
 	Turn       string    `json:"turn"`
 	ReservedAt time.Time `json:"reserved_at"`
 	Taken      bool      `json:"taken"`
+	// ProcessStarted means factoryd crossed the durable launch boundary. The
+	// exact process handle follows immediately in CurrentTurn.Process; if that
+	// write is lost, recovery blocks rather than assuming no agent exists.
+	ProcessStarted  bool `json:"process_started,omitempty"`
+	ProcessFinished bool `json:"process_finished,omitempty"`
+}
+
+// PermitProducerCycleMutation refuses a root-side lifecycle mutation while a
+// queued handoff's producer process has not finished. Queue reservation makes
+// CycleWorking mean more than a phase: it binds a specific handoff to the
+// current producer turn. Submit calls this before submitting, opening, or
+// cleaning a cycle, so no root-side operation can create a draft in the small
+// interval after the handoff check but before the agent is launched.
+func (s *State) PermitProducerCycleMutation() error {
+	q := s.Role(RoleProducer).QueueReservation
+	if q == nil || q.ProcessFinished {
+		return nil
+	}
+	return fmt.Errorf("%w: %q is reserved for turn %s, whose process has not finished", ErrProducerLifecycleBusy, q.Source, q.Turn)
 }
 
 // Block is a submission that will not be retried automatically.

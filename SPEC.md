@@ -993,7 +993,10 @@ without a manual wake, while a root-side lifecycle operation cannot turn a
 stale eligibility check into a second producer turn. The reservation records
 whether the move completed: after a restart, a pending source is re-reserved,
 and a taken `done/` handoff is rearmed through the supervisor's retry marker
-rather than silently stranding the queue.
+rather than silently stranding the queue. The reservation also names the
+producer process: recovery first proves that exact process has exited, and
+root-side submission/clean/open transitions are refused until the queued agent
+has finished, so neither a retry nor a draft can run beside an orphaned turn.
 Before the agent starts, factoryd moves the selected file to
 `inbox/briefs/done/` and gives that path to the wrapper as `FACTORYD_BRIEF`. It
 refuses to overwrite an existing done file, so a reused queue name cannot erase

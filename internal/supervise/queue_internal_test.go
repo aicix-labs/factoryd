@@ -2,10 +2,12 @@ package supervise
 
 import (
 	"context"
+	"errors"
 	"io"
 	"log/slog"
 	"os"
 	"path/filepath"
+	"strings"
 	"testing"
 	"time"
 
@@ -185,5 +187,102 @@ func TestTakenQueuedReservationRecoversThroughRetryMarker(t *testing.T) {
 	}
 	if runner.runs != 1 {
 		t.Fatalf("recovered taken reservation ran %d times, want 1", runner.runs)
+	}
+}
+
+// A SIGKILLed supervisor does not get to clean up its runner's process group.
+// The recorded process handle is therefore checked before restart recovery can
+// run the same done/ handoff a second time.
+func TestTakenQueuedReservationDoesNotRearmWhileRecordedProcessLives(t *testing.T) {
+	cfg := queueTestConfig(t)
+	source := filepath.Join(cfg.BriefsDir(), "010-next.md")
+	done, err := brief.DonePath(cfg, source)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(done, []byte("next\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	self, err := proc.Self("live-queued-agent")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		st.SetCycle(state.CycleWorking, time.Now())
+		rs := st.Role(state.RoleProducer)
+		rs.CurrentTurn = &state.Turn{ID: "crashed-queue-turn", StartedAt: time.Now(), Trigger: brief.Label, Process: &self}
+		rs.QueueReservation = &state.QueueReservation{
+			Source: source, Done: done, Turn: "crashed-queue-turn", ReservedAt: time.Now(), Taken: true, ProcessStarted: true,
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	s, err := New(Options{Config: cfg, Role: "producer", Runner: &queueRaceRunner{}, Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.recoverQueuedReservation(); err == nil || !strings.Contains(err.Error(), "still alive") {
+		t.Fatalf("live recorded process was rearmed or not reported safely: %v", err)
+	}
+	if _, err := os.Stat(cfg.RetryPath("producer")); !os.IsNotExist(err) {
+		t.Fatalf("live process recovery wrote a retry marker: %v", err)
+	}
+	st, err := state.Load(cfg.StatePath(), cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Role(state.RoleProducer).QueueReservation == nil {
+		t.Fatal("live process recovery discarded its durable reservation")
+	}
+}
+
+// The final handoff confirmation is not merely advisory. A root-side lifecycle
+// operation that races immediately after it is rejected by the same durable
+// reservation that binds the queued source to this still-unstarted turn.
+func TestQueuedBriefRejectsLifecycleMutationAfterFinalConfirmation(t *testing.T) {
+	cfg := queueTestConfig(t)
+	source := filepath.Join(cfg.BriefsDir(), "010-next.md")
+	if err := os.WriteFile(source, []byte("next\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		st.SetCycle(state.CycleNew, time.Now())
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	runner := &queueRaceRunner{}
+	s, err := New(Options{Config: cfg, Role: "producer", Runner: runner, MaxTurns: 1, Log: slog.New(slog.NewTextHandler(io.Discard, nil))})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	var mutationErr error
+	s.afterQueuedConfirm = func() {
+		_, mutationErr = state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+			if err := st.PermitProducerCycleMutation(); err != nil {
+				return err
+			}
+			st.SetCycle(state.CycleSubmitting, time.Now())
+			return nil
+		})
+	}
+	if err := s.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(mutationErr, state.ErrProducerLifecycleBusy) {
+		t.Fatalf("post-confirm lifecycle mutation err=%v, want active-hand-off refusal", mutationErr)
+	}
+	if runner.runs != 1 {
+		t.Fatalf("runner runs=%d, want one permitted queued turn", runner.runs)
+	}
+	st, err := state.Load(cfg.StatePath(), cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Cycle == nil || st.Cycle.Phase != state.CycleWorking {
+		t.Fatalf("post-confirm mutation changed cycle: %+v", st.Cycle)
 	}
 }

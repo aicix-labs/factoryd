@@ -287,6 +287,8 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 			if !confirmed {
 				s.log.Warn("queued brief restored because its lifecycle changed after handoff", "turn", turn.ID, "reason", reason)
 				res, skipped = TurnResult{ExitCode: ExitBeforeTurnFailed}, true
+			} else if s.afterQueuedConfirm != nil {
+				s.afterQueuedConfirm()
 			}
 		}
 	}
@@ -313,16 +315,30 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 		}
 	}
 	if !skipped {
+		if queued {
+			if err := s.markQueuedProcessLaunching(turn); err != nil {
+				return false, err
+			}
+		}
 		res, runErr = s.runner.Run(ctx, turn, func(p proc.Ref) {
 			if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
-				if t := st.Role(state.Role(s.role)).CurrentTurn; t != nil && t.ID == turn.ID {
+				rs := st.Role(state.Role(s.role))
+				if t := rs.CurrentTurn; t != nil && t.ID == turn.ID {
 					t.Process = &p
+				}
+				if q := rs.QueueReservation; q != nil && q.Turn == turn.ID {
+					q.ProcessStarted = true
 				}
 				return nil
 			}); err != nil {
 				s.log.Warn("could not record the turn's process", "turn", turn.ID, "err", err)
 			}
 		})
+		if queued {
+			if err := s.markQueuedProcessFinished(turn); err != nil {
+				s.log.Warn("could not record queued producer process completion", "turn", turn.ID, "err", err)
+			}
+		}
 	}
 
 	ended := s.now()
@@ -705,6 +721,33 @@ func (s *Supervisor) clearDeferredQueuedTurn(turn Turn, triggers []watch.Trigger
 			rs.CurrentTurn = nil
 		}
 		rs.SetPending(toPending(triggers, s.now()))
+		return nil
+	})
+	return err
+}
+
+// markQueuedProcessFinished is written before AfterTurn may submit or clean a
+// cycle. Root lifecycle mutations use it to distinguish a queued handoff that
+// is still about to run (or running) from one whose agent has actually exited.
+func (s *Supervisor) markQueuedProcessFinished(turn Turn) error {
+	_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		if q := st.Role(state.Role(s.role)).QueueReservation; q != nil && q.Turn == turn.ID && q.ProcessStarted {
+			q.ProcessFinished = true
+		}
+		return nil
+	})
+	return err
+}
+
+// markQueuedProcessLaunching is the last durable step before Runner.Run. If
+// factoryd dies after this point but before it records the child handle, a
+// restart blocks rather than guessing that no agent exists. That conservative
+// state is what binds the final handoff confirmation to process launch.
+func (s *Supervisor) markQueuedProcessLaunching(turn Turn) error {
+	_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		if q := st.Role(state.Role(s.role)).QueueReservation; q != nil && q.Turn == turn.ID {
+			q.ProcessStarted = true
+		}
 		return nil
 	})
 	return err

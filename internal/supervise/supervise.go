@@ -206,6 +206,10 @@ type Supervisor struct {
 	// afterQueuedTake is a deterministic interleaving hook for the package's
 	// lifecycle test. It is never set by production construction.
 	afterQueuedTake func()
+	// afterQueuedConfirm is the matching hook after the final handoff check and
+	// before Runner.Run. It proves root lifecycle operations are rejected for
+	// the active queued turn, rather than merely observed before process start.
+	afterQueuedConfirm func()
 }
 
 // RetryLabel names the supervisor-owned retry trigger.
@@ -421,7 +425,10 @@ func (s *Supervisor) recoverQueuedReservation() error {
 	if q == nil {
 		return nil
 	}
-	q = &state.QueueReservation{Source: q.Source, Done: q.Done, Turn: q.Turn, ReservedAt: q.ReservedAt, Taken: q.Taken}
+	q = &state.QueueReservation{
+		Source: q.Source, Done: q.Done, Turn: q.Turn, ReservedAt: q.ReservedAt, Taken: q.Taken,
+		ProcessStarted: q.ProcessStarted, ProcessFinished: q.ProcessFinished,
+	}
 	if expected, err := brief.DonePath(s.cfg, q.Source); err != nil || expected != q.Done {
 		return s.blockBrokenQueuedReservation(q, "reservation paths are outside the configured brief queue")
 	}
@@ -466,6 +473,9 @@ func (s *Supervisor) recoverQueuedReservation() error {
 		}
 		return s.blockBrokenQueuedReservation(q, "taken done handoff is missing")
 	}
+	if err := queuedProcessExited(st, q); err != nil {
+		return err
+	}
 	markerBrief := readRetryLine(s.cfg.RetryPath(s.role), "brief: ")
 	if markerBrief != "" && markerBrief != q.Done {
 		return s.blockBrokenQueuedReservation(q, "a different supervisor retry marker is already pending")
@@ -483,6 +493,34 @@ func (s *Supervisor) recoverQueuedReservation() error {
 		return nil
 	})
 	return err
+}
+
+// queuedProcessExited is deliberately fail-closed. A supervisor can die while
+// its agent survives (SIGKILL skips runner cleanup), so a retry of the taken
+// done/ handoff is authorized only after the exact recorded process instance
+// is dead. A missing or unreadable handle is not evidence of safety.
+func queuedProcessExited(st *state.State, q *state.QueueReservation) error {
+	rs := st.Role(state.RoleProducer)
+	if q.ProcessFinished {
+		return nil
+	}
+	if !q.ProcessStarted && (rs.CurrentTurn == nil || rs.CurrentTurn.Process == nil) {
+		// The supervisor died before Runner reported a process. Runner invokes
+		// that callback before the agent is allowed to make progress, so the
+		// durable handoff can safely be rearmed.
+		return nil
+	}
+	if rs.CurrentTurn == nil || rs.CurrentTurn.ID != q.Turn || rs.CurrentTurn.Process == nil {
+		return fmt.Errorf("queued brief %q was taken by turn %s, but its process cannot be proven dead; refusing recovery", q.Source, q.Turn)
+	}
+	alive, err := rs.CurrentTurn.Process.Alive()
+	if err != nil {
+		return fmt.Errorf("queued brief %q was taken by turn %s, but its process liveness could not be checked: %w", q.Source, q.Turn, err)
+	}
+	if alive {
+		return fmt.Errorf("queued brief %q was taken by turn %s and process %s is still alive; refusing duplicate recovery", q.Source, q.Turn, rs.CurrentTurn.Process)
+	}
+	return nil
 }
 
 func (s *Supervisor) writeQueuedRecoveryMarker(q *state.QueueReservation) error {
