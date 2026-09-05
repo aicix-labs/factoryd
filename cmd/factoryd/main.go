@@ -35,6 +35,8 @@ usage:
                                                      (refused while a change is in flight; the
                                                      producer supervisor does this before a turn)
                                                      exits 0 submitted, 3 config/identity, 4 nothing, 5 gate red
+  factoryd migrate   --config <f> verdict-registry   explicitly quarantine pre-registry outbox verdicts;
+                                                     reviewer/operator must reissue any still-current verdict
   factoryd health    --config <f> [--loop] [--json]  one model-free tick: detect, alert, write health.json
                                                      exits 0 healthy, 1 findings, 3 could not look
   factoryd status    --config <f> [--config <g>] [--serve :8080] [--json] [--provider=false]
@@ -89,6 +91,8 @@ func main() {
 		os.Exit(runSupervise(args))
 	case "refresh":
 		os.Exit(runRefresh(args))
+	case "migrate":
+		os.Exit(runMigrate(args))
 	case "_refresh":
 		os.Exit(runRefreshHelper(args))
 	case "submit":

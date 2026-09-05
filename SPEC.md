@@ -1026,6 +1026,79 @@ so — the removal of *that* sentinel is the acknowledgement, once (#37). A halt
 the role had recovered and done work (#30) — a red that never goes green is as
 uninformative as a green that never goes red.
 
+**The intent protocol is composed by the wrapper, not written into briefs**
+(#38). A scripted producer writes the two control files itself and never has
+to explain them; a model-driven producer is the party writing those files, and
+nothing else tells it they exist. A brief that happened to end with the two
+`printf` lines worked; the next brief described the work and not the handshake,
+and the producer, never told how to declare intent, produced nothing five times
+and halted — indistinguishable from a model ignoring its brief.
+`examples/producer-turn-agent.sh` composes the protocol once, around every
+turn: the two files, that nothing is submitted without both, that a gate runs
+before any push, that the turn has no SCM remote and no provider credential and
+must not push or fetch (a hosted model still reaches its API; "no network" is
+`sandbox.no_network`, a separate choice), the progress marker; on a verdict
+trigger it lists every verdict by change and kind and instructs *by kind*:
+`merged` and `operator-gated` declare **nothing** — a re-declaration there
+resubmits a change that has left the producer's hands, the loop of #40 —
+and only `changes-requested` re-declares, with the family stated *verbatim*
+(#29's payoff, the easy omission) — read from `FACTORYD_VERDICTS_TSV`, the
+runner's tab-separated rendering of the same verdicts (git refuses control
+characters in refnames, so no field can hold a tab or newline, and `{` in a
+family is only a character), never parsed out of JSON by a shell. **One
+`changes-requested` verdict per turn**: a turn has one declaration, so the
+wrapper selects the first, names it, and *keeps* the other changes-requested
+triggers for their own turns — a consumed verdict nobody acted on is lost for
+good; the selected one is consumed only by a turn that exited zero AND left
+both control files as non-empty regular files AND declared *that verdict's
+family exactly* — a complete declaration under another name is moved aside,
+the verdict kept, and the turn failed so the after-turn step never submits an
+unrelated draft (#29 again) — so a model that failed, declared nothing, or
+declared the wrong family leaves the verdict for the retry, which is then told
+it again. Whether such a turn was *progress* is decided by observable work,
+not by the touch alone, and *a timestamp is not evidence of work*: the wrapper
+fingerprints the tree by content, type and mode — every file's bytes, every
+symlink's target, every directory, `.git` and the control files aside — and
+the progress marker before the agent. A changed tree with no declaration yet is
+a large fix spanning turns — the model's progress stands, the verdict waits for
+the next turn, the turn is clean. A touched or re-touched file, an unchanged
+tree with no declaration, or a wrong family: the marker is restored to its
+exact mtime and the turn exits non-zero, so the supervisor's guards count it,
+back off, and halt at `fail_abort` with the verdict still in the outbox. **How
+many turns a verdict may be carried is the supervisor's bound, not the
+wrapper's**: a bound kept where the bounded principal can write is no bound.
+The supervisor counts, in its own state (`trigger_attempts`, per verdict), the
+turns that left a verdict pending, resets the count when the verdict is
+consumed, and past `supervisor.verdict_attempts` (default 6) credits no
+progress to a turn that leaves it pending, whatever the turn did — so the spin
+guard halts at `spin_abort` with the verdict kept. Three things make that
+bound the supervisor's and not the producer's. **The verdict's identity is
+factoryd's**: every verdict `signal` (or `factoryd verdict`) issues is
+registered in state by change id with the sha256 of the bytes written, before
+the file lands; the outbox is the producer's to write, so an outbox file is a
+trigger only if the registry names it and the bytes match — a forged or
+tampered file is moved aside as `<name>.unregistered` and runs no turn, and a
+registered file the producer deletes and recreates byte for byte is the same
+verdict with the same count. **The active verdict is the supervisor's
+choice**: at most one `changes-requested` verdict is passed to a turn, the
+oldest by issue time; the rest wait, untouched and uncounted, until it is
+consumed, so a multi-turn fix for one never spends another's allowance
+(`merged` and `operator-gated` pass through, they carry no work). **The
+record is out of the producer's reach**: `doctor` proves, as the producer,
+that it cannot write the factory root nor `state.json`, with the inbox write
+as the control — a producer that could replace `state.json` could reset every
+bound kept there. And a turn the
+supervisor killed at its deadline counts on the fail streak whatever the
+marker says, because nothing that would have judged its work ran (§6.3); `FACTORYD_TRIGGER_PATHS` is split on the platform's path-list
+separator, so configured paths containing it are refused at load and a trigger
+path containing it refuses the turn; every TSV field, the path included, is refused by the
+runner if it holds a tab or newline, and configured paths with control
+characters are refused at load; then the brief; then it runs the agent
+through `turn-wrapper.sh` and consumes the triggers it acted on — never the
+supervisor's retry marker, which the supervisor owns and keeps on a halt as
+the record of what was retried. It refuses to run an agent with a
+prompt that does not carry the protocol. A brief describes work.
+
 ### 6.3 Progress, not consumption
 
 `inbox/producer-progress` exists so the supervisor can distinguish *"working, not
@@ -1074,6 +1147,12 @@ not an open draft at the last read, closes with the reason (default
 window is narrowed, not removed. An open family that only grows makes "which
 one do I review" load-bearing; the operator's close is how the family stays
 one draft wide.
+
+
+A turn the supervisor killed at its deadline is a failed turn on the streak
+*whatever the marker says*: the deadline is the operator's bound on a turn,
+and a process that touched the marker and then hung would otherwise reset the
+streak on every deadline and be retried forever (#50).
 
 ### 6.4 Audits
 

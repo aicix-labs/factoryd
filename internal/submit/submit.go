@@ -557,6 +557,17 @@ func AfterTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, error
 			}
 			return "", recordBlock(cfg, t, blocked(wrap(ExitConfig, err, "submit: the producer's intent is not a valid declaration")))
 		}
+		intent, err := ReadIntent(cfg.TurnWorkdir("producer"))
+		if err != nil {
+			// The first ReadIntent above already classified this exact path;
+			// a different result now is a producer-side race and is not safe
+			// to submit or to acknowledge.
+			return "", recordBlock(cfg, t, fmt.Errorf("submit: rereading the producer's intent: %w", err))
+		}
+		receipt, err := prepareVerdictSubmission(cfg, t, intent)
+		if err != nil {
+			return "", recordBlock(cfg, t, blocked(wrap(ExitConfig, err, "submit: declaration does not satisfy its verdict")))
+		}
 		deps, err := mkDeps(ctx)
 		if err != nil {
 			// Not classified: a credential that did not resolve, an identity
@@ -569,13 +580,133 @@ func AfterTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, error
 		}
 		switch r.Exit {
 		case ExitSubmitted:
+			if receipt != nil {
+				if err := completeVerdictSubmission(cfg, *receipt, t.ID); err != nil {
+					// The external submit happened, but its one-shot receipt
+					// did not. Never retry or infer consumption from the
+					// producer's file deletion; leave a durable unknown block.
+					return "", recordBlock(cfg, t, fmt.Errorf("submit: recording the successful verdict acknowledgement: %w", err))
+				}
+			}
 			return fmt.Sprintf("submitted %s as draft %s", r.Branch, r.Change.ID), nil
 		case ExitGateRed:
+			if receipt != nil {
+				if err := releaseVerdictSubmission(cfg, *receipt); err != nil {
+					return "", recordBlock(cfg, t, fmt.Errorf("submit: clearing the unsuccessful verdict acknowledgement: %w", err))
+				}
+			}
 			return "gate red: " + r.Reason, nil
 		default:
+			if receipt != nil {
+				if err := releaseVerdictSubmission(cfg, *receipt); err != nil {
+					return "", recordBlock(cfg, t, fmt.Errorf("submit: clearing the unsuccessful verdict acknowledgement: %w", err))
+				}
+			}
 			return r.Reason, nil
 		}
 	}
+}
+
+type verdictSubmission struct {
+	changeID string
+	digest   string
+}
+
+// prepareVerdictSubmission is the root-side acknowledgement gate for a
+// changes-requested verdict. The producer's wrapper may remove its handoff
+// path, but only this step -- after reading a complete matching declaration --
+// may record that an attempt to satisfy the verdict is in flight.
+func prepareVerdictSubmission(cfg *config.Config, t supervise.Turn, intent Intent) (*verdictSubmission, error) {
+	var selected []supervise.VerifiedVerdict
+	for _, v := range t.Verdicts {
+		if v.Kind == state.VerdictChangesRequested {
+			selected = append(selected, v)
+		}
+	}
+	if len(selected) > 1 {
+		return nil, fmt.Errorf("turn %s carries %d changes-requested verdicts; a declaration can satisfy only one", t.ID, len(selected))
+	}
+	if len(selected) == 1 {
+		v := selected[0]
+		if intent.Branch != v.DeclaredBranch {
+			return nil, fmt.Errorf("declaration family %q does not match changes-requested verdict %s family %q", intent.Branch, v.ChangeID, v.DeclaredBranch)
+		}
+		r := verdictSubmission{changeID: v.ChangeID, digest: v.Digest}
+		if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+			iv, ok := st.Issued[r.changeID]
+			if !ok || iv.Digest != r.digest || iv.ConsumedAt != nil {
+				return fmt.Errorf("verdict %s is no longer the admitted issuance", r.changeID)
+			}
+			iv.PendingSubmission = &state.VerdictSubmission{Turn: t.ID, Digest: r.digest, At: time.Now().UTC()}
+			st.Issued[r.changeID] = iv
+			return nil
+		}); err != nil {
+			return nil, err
+		}
+		return &r, nil
+	}
+
+	// A transient after-turn failure retries submit without rerunning the
+	// producer. Its retry turn has no verdict trigger, so recover the
+	// factoryd-owned pending acknowledgement by declared family.
+	st, err := state.Load(cfg.StatePath(), cfg.Name)
+	if err != nil {
+		return nil, err
+	}
+	var pending []verdictSubmission
+	for id, iv := range st.Issued {
+		if iv.Kind != state.VerdictChangesRequested || iv.ConsumedAt != nil || iv.PendingSubmission == nil || iv.DeclaredBranch != intent.Branch {
+			continue
+		}
+		if iv.PendingSubmission.Digest != iv.Digest {
+			return nil, fmt.Errorf("pending verdict %s has a digest that does not match its issuance", id)
+		}
+		pending = append(pending, verdictSubmission{changeID: id, digest: iv.Digest})
+	}
+	switch len(pending) {
+	case 0:
+		return nil, nil
+	case 1:
+		return &pending[0], nil
+	default:
+		return nil, fmt.Errorf("declaration family %q ambiguously matches %d pending verdict submissions", intent.Branch, len(pending))
+	}
+}
+
+// completeVerdictSubmission writes the only receipt that consumes a
+// changes-requested verdict: root-side submit returned ExitSubmitted for the
+// exact pending issuance. It deliberately does not look at outbox files.
+func completeVerdictSubmission(cfg *config.Config, receipt verdictSubmission, turn string) error {
+	_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		iv, ok := st.Issued[receipt.changeID]
+		if !ok || iv.Digest != receipt.digest || iv.ConsumedAt != nil || iv.PendingSubmission == nil || iv.PendingSubmission.Digest != receipt.digest {
+			return fmt.Errorf("verdict %s no longer has the pending issuance that submitted", receipt.changeID)
+		}
+		at := time.Now().UTC()
+		iv.ConsumedAt = &at
+		iv.ConsumedByTurn = turn
+		iv.PendingSubmission = nil
+		st.Issued[receipt.changeID] = iv
+		return nil
+	})
+	return err
+}
+
+// releaseVerdictSubmission removes the in-flight marker after a conclusive
+// non-submission, such as a red gate or an identical tree. That leaves a
+// missing producer handoff visibly blocked by the supervisor rather than
+// mistaking an unsuccessful attempt for an acknowledgement.
+func releaseVerdictSubmission(cfg *config.Config, receipt verdictSubmission) error {
+	_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		iv, ok := st.Issued[receipt.changeID]
+		if !ok || iv.Digest != receipt.digest || iv.ConsumedAt != nil || iv.PendingSubmission == nil || iv.PendingSubmission.Digest != receipt.digest {
+			return fmt.Errorf("verdict %s no longer has the pending issuance to release", receipt.changeID)
+		}
+		iv.PendingSubmission = nil
+		st.Issued[receipt.changeID] = iv
+		return nil
+	})
+	return err
 }
 
 // recordBlock is the after-turn step's failure path (#42). A transient

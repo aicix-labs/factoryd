@@ -8,7 +8,7 @@ log "triggers=${FACTORYD_TRIGGERS:-} workdir=$(pwd) uid=$(id -u)"
 if (exec 3<>/dev/tcp/127.0.0.1/22) 2>/dev/null; then log "NETWORK REACHABLE -- sandbox not holding"; exit 9; fi
 log "network unreachable (as required)"
 case "${FACTORYD_TRIGGERS:-}" in
-  *verdict*) log "a verdict arrived: $(cat $FACTORYD_OUTBOX/*.json 2>/dev/null | tr -d '\n' | cut -c1-120)"; touch "$FACTORYD_PROGRESS" || exit 1
+  *verdict*) log "a verified verdict arrived: ${FACTORYD_VERDICTS_TSV:-}"; touch "$FACTORYD_PROGRESS" || exit 1
              IFS=:; for p in $FACTORYD_TRIGGER_PATHS; do rm -f "$p"; done; exit 0;;
 esac
 mkdir -p auth

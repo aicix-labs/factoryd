@@ -16,7 +16,6 @@ import (
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/proc"
-	"github.com/aicix-labs/factoryd/internal/state"
 )
 
 // ExecRunner runs an agent turn as a subprocess.
@@ -237,6 +236,13 @@ type VerdictEnv struct {
 func (r *ExecRunner) env(t Turn) ([]string, error) {
 	var trigPaths []string
 	for _, tr := range t.Triggers {
+		// FACTORYD_TRIGGER_PATHS is split on the path list separator by
+		// every wrapper; a path containing it would be read as fragments,
+		// and a wrapper could submit while the real trigger stayed pending
+		// (#50 review). Config refuses such roots; this refuses the turn.
+		if strings.ContainsRune(tr.Path, os.PathListSeparator) {
+			return nil, fmt.Errorf("trigger path %q contains %q, the path list separator; FACTORYD_TRIGGER_PATHS cannot carry it", tr.Path, os.PathListSeparator)
+		}
 		trigPaths = append(trigPaths, tr.Path)
 	}
 	factoryd := map[string]string{
@@ -261,23 +267,39 @@ func (r *ExecRunner) env(t Turn) ([]string, error) {
 		// the first of several. All keys are always present, so the
 		// generated set is exact.
 		"FACTORYD_VERDICTS":      "[]",
+		"FACTORYD_VERDICTS_TSV":  "",
 		"FACTORYD_VERDICT":       "",
 		"FACTORYD_CHANGE_ID":     "",
 		"FACTORYD_CHANGE_BRANCH": "",
+	}
+	verified := make(map[string]VerifiedVerdict, len(t.Verdicts))
+	for _, v := range t.Verdicts {
+		if v.Path == "" || v.ChangeID == "" || v.Digest == "" {
+			return nil, fmt.Errorf("verified verdict snapshot is incomplete")
+		}
+		if _, exists := verified[v.Path]; exists {
+			return nil, fmt.Errorf("duplicate verified verdict snapshot for %s", v.Path)
+		}
+		verified[v.Path] = v
 	}
 	var verdicts []VerdictEnv
 	for _, tr := range t.Triggers {
 		if tr.Label != "verdict" {
 			continue
 		}
-		v, err := state.ReadVerdictFile(tr.Path)
-		if err != nil {
-			// A verdict the runner cannot read is not a turn to start with
-			// empty values: the agent would act on the trigger without the
-			// facts it carries. It is a runner error, said as such.
-			return nil, fmt.Errorf("verdict trigger %s: %w", tr.Path, err)
+		v, ok := verified[tr.Path]
+		if !ok {
+			// Never fall back to opening the handoff file here. Admission
+			// verified the bytes before BeforeTurn; reopening the
+			// producer-writable path would let a replacement change the
+			// family the agent acts on after that verification.
+			return nil, fmt.Errorf("verdict trigger %s has no verified snapshot", tr.Path)
 		}
+		delete(verified, tr.Path)
 		verdicts = append(verdicts, VerdictEnv{Path: tr.Path, ChangeID: v.ChangeID, Kind: v.Kind, SHA: v.SHA, Branch: v.Branch, DeclaredBranch: v.DeclaredBranch})
+	}
+	for path := range verified {
+		return nil, fmt.Errorf("verified verdict snapshot %s has no verdict trigger", path)
 	}
 	if len(verdicts) > 0 {
 		b, err := json.Marshal(verdicts)
@@ -285,6 +307,26 @@ func (r *ExecRunner) env(t Turn) ([]string, error) {
 			return nil, err
 		}
 		factoryd["FACTORYD_VERDICTS"] = string(b)
+		// The same verdicts pre-rendered for shells (#50 review): one line
+		// per verdict, fields tab-separated -- path, change_id, kind,
+		// branch, declared_branch. Git refuses control characters in
+		// refnames, so no field can contain a tab or a newline, and a
+		// wrapper needs no JSON parser to read this exactly. "{" and the
+		// like are ordinary in a family name and pass through untouched.
+		// Every field is checked, the path included: a path is not a
+		// refname, and a tab or newline in one would shift the fields and
+		// make a wrapper select the wrong verdict, or none, and consume it
+		// (#50 review). Refused, not escaped: the turn does not start.
+		var tsv strings.Builder
+		for _, v := range verdicts {
+			for _, f := range []struct{ name, val string }{{"path", v.Path}, {"change_id", v.ChangeID}, {"kind", v.Kind}, {"branch", v.Branch}, {"declared_branch", v.DeclaredBranch}} {
+				if strings.ContainsAny(f.val, "\t\n\r") {
+					return nil, fmt.Errorf("verdict %s: %s %q contains a tab or newline; FACTORYD_VERDICTS_TSV cannot carry it exactly", v.ChangeID, f.name, f.val)
+				}
+			}
+			fmt.Fprintf(&tsv, "%s\t%s\t%s\t%s\t%s\n", v.Path, v.ChangeID, v.Kind, v.Branch, v.DeclaredBranch)
+		}
+		factoryd["FACTORYD_VERDICTS_TSV"] = tsv.String()
 	}
 	if len(verdicts) == 1 {
 		factoryd["FACTORYD_VERDICT"] = verdicts[0].Kind

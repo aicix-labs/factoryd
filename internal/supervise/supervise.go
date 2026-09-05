@@ -19,6 +19,7 @@ import (
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/proc"
+	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/watch"
 )
 
@@ -27,8 +28,26 @@ type Turn struct {
 	ID       string
 	Role     string
 	Triggers []watch.Trigger
+	// Verdicts are the verified facts from the exact outbox bytes admission
+	// accepted. They are carried across BeforeTurn into the runner so an
+	// agent never learns its verdict facts by reopening a producer-writable
+	// handoff file.
+	Verdicts []VerifiedVerdict
 	// Deadline bounds the turn.
 	Deadline time.Time
+}
+
+// VerifiedVerdict is the immutable admission snapshot for one verdict
+// trigger. Digest identifies the registry entry that admitted it and lets the
+// post-turn state update tombstone precisely that issuance.
+type VerifiedVerdict struct {
+	Path           string
+	ChangeID       string
+	Kind           string
+	SHA            string
+	Branch         string
+	DeclaredBranch string
+	Digest         string
 }
 
 // TurnResult is what a turn did.
@@ -283,6 +302,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	if err := s.claim(); err != nil {
 		return err
 	}
+	if err := s.checkVerdictRegistry(); err != nil {
+		return err
+	}
 
 	mode := s.watcher.Mode()
 	if reason := s.watcher.ModeReason(); reason != "" {
@@ -317,7 +339,14 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return err
 		}
 
-		halted, err := s.oneTurn(ctx, triggers)
+		admitted, err := s.admitVerdicts(triggers)
+		if err != nil {
+			return err
+		}
+		if len(admitted.Triggers) == 0 {
+			continue // everything pending was quarantined; the watcher settles
+		}
+		halted, err := s.oneTurn(ctx, admitted)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil
@@ -328,4 +357,23 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return ErrHalted
 		}
 	}
+}
+
+// checkVerdictRegistry stops a producer before it observes or quarantines a
+// legacy outbox. A v1 file may be a real unresolved verdict, but its bytes
+// were producer-writable before a registry existed, so neither admission nor
+// automatic quarantine is safe. claim has already persisted the explicit
+// migration-required state at this point.
+func (s *Supervisor) checkVerdictRegistry() error {
+	if s.role != "producer" {
+		return nil
+	}
+	st, err := state.Load(s.cfg.StatePath(), s.cfg.Name)
+	if err != nil {
+		return err
+	}
+	if err := st.VerdictRegistry.MigrationError(); err != nil {
+		return fmt.Errorf("%w; run `factoryd migrate --config %s verdict-registry` before supervising the producer", err, s.cfg.Path())
+	}
+	return nil
 }

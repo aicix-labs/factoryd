@@ -83,6 +83,14 @@ func (f fakeProber) CanRead(_ context.Context, path string) (bool, error) {
 	return f.readable[path], nil
 }
 
+// CanWriteFile: writable files are those the test marked writable by path.
+func (f fakeProber) CanWriteFile(_ context.Context, path string) (bool, error) {
+	if f.err != nil {
+		return false, f.err
+	}
+	return f.writable[path], nil
+}
+
 // healthyDeps wires fakes for a healthy factory: the producer can write its
 // workdir and not the submit repo, git pushes as the producer, the local
 // config is clean. Tests mutate what they need.
@@ -115,6 +123,12 @@ func healthyDeps(cfg *config.Config, listErr error) doctor.Deps {
 			}
 			if ra != nil && ra.User == "reviewer-reads-nothing" {
 				return fakeProber{name: "fake-reviewer (uid 4444)", writable: map[string]bool{cfg.TurnWorkdir("reviewer"): true}, readable: map[string]bool{}}, nil
+			}
+			if ra != nil && ra.User == "writes-root" {
+				return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true, cfg.OutboxDir(): true, cfg.Paths.Root: true}, readable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
+			}
+			if ra != nil && ra.User == "writes-state" {
+				return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.InboxDir(): true, cfg.OutboxDir(): true, cfg.StatePath(): true}, readable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
 			}
 			if ra != nil && ra.User == "inbox-locked" {
 				return fakeProber{writable: map[string]bool{cfg.Paths.ProducerWorkdir: true, cfg.OutboxDir(): true}, readable: map[string]bool{cfg.Paths.ProducerWorkdir: true}}, nil
@@ -196,7 +210,8 @@ func fixture(t *testing.T) *config.Config {
 			Reviewer: config.RoleSpec{Command: []string{gate}, Env: map[string]string{"PATH": os.Getenv("PATH")}},
 		},
 		Supervisor: config.Supervisor{
-			SpinWarn: config.DefaultSpinWarn, SpinAbort: config.DefaultSpinAbort,
+			VerdictAttempts: 6,
+			SpinWarn:        config.DefaultSpinWarn, SpinAbort: config.DefaultSpinAbort,
 			FailAbort:           config.DefaultFailAbort,
 			PollIntervalSeconds: config.DefaultPollInterval,
 			BackoffSeconds:      config.DefaultBackoffSeconds,
@@ -348,6 +363,21 @@ func TestIndividualFailuresAreCaught(t *testing.T) {
 		{
 			// The credential the producer must never hold, readable by it: a
 			// networkless producer copies it into source and submit pushes it.
+			// The supervisor's record lives in the root: a producer that
+			// can write the root can replace state.json (#50 review).
+			name:     "producer can write the factory root",
+			mutate:   func(t *testing.T, c *config.Config) { c.Roles.Producer.RunAs = &config.RunAs{User: "writes-root"} },
+			wantName: "producer cannot write the factory root",
+		},
+		{
+			name: "producer can write state.json",
+			mutate: func(t *testing.T, c *config.Config) {
+				os.WriteFile(c.StatePath(), []byte(`{"schema_version":1,"factory":"widgets","roles":{}}`), 0o644)
+				c.Roles.Producer.RunAs = &config.RunAs{User: "writes-state"}
+			},
+			wantName: "producer cannot write state.json",
+		},
+		{
 			name: "producer can read the reviewer credential",
 			mutate: func(t *testing.T, c *config.Config) {
 				c.Roles.Producer.RunAs = &config.RunAs{User: "reads-reviewer-token"}

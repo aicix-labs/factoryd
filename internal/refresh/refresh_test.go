@@ -335,7 +335,7 @@ func newE2E(t *testing.T) *e2e {
 			Producer: config.RoleSpec{Command: []string{"true"}, Env: map[string]string{"PATH": os.Getenv("PATH")}, RunAs: &config.RunAs{User: u.Username}},
 			Reviewer: config.RoleSpec{Command: []string{"true"}, Env: map[string]string{"PATH": os.Getenv("PATH")}},
 		},
-		Supervisor: config.Supervisor{SpinWarn: 2, SpinAbort: 4, FailAbort: 3, PollIntervalSeconds: 1, BackoffSeconds: 1, ForcePoll: true},
+		Supervisor: config.Supervisor{SpinWarn: 2, SpinAbort: 4, FailAbort: 3, VerdictAttempts: 6, PollIntervalSeconds: 1, BackoffSeconds: 1, ForcePoll: true},
 		Alerts:     []config.Alert{{Kind: "file", Path: filepath.Join(root, "alerts.log")}},
 	}
 	if err := e.cfg.Validate(); err != nil {
@@ -471,11 +471,13 @@ func TestPartialProducerWorkSurvivesTheRetry(t *testing.T) {
 	}
 }
 
-// The upgrade case: a state document with no cycle record. Nothing is
-// refreshed, the turn runs on the tree as it is, and the record says why.
-func TestLegacyStateIsNeverRefreshed(t *testing.T) {
+// A registry-aware state document that predates the cycle record. Nothing is
+// refreshed, the turn runs on the tree as it is, and the record says why. A
+// schema-v1 document is a separate verdict-registry migration block and must
+// not reach a producer turn at all.
+func TestStateWithoutCycleIsNeverRefreshed(t *testing.T) {
 	e := newE2E(t)
-	legacy := `{"schema_version":1,"factory":"widgets","roles":{"producer":{"last_turn":{"id":"producer-1","exit_code":0}},"reviewer":{}}}`
+	legacy := `{"schema_version":2,"factory":"widgets","verdict_registry":{"status":"ready"},"roles":{"producer":{"last_turn":{"id":"producer-1","exit_code":0}},"reviewer":{}}}`
 	if err := os.WriteFile(e.cfg.StatePath(), []byte(legacy), 0o644); err != nil {
 		t.Fatal(err)
 	}

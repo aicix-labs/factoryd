@@ -394,7 +394,7 @@ func TestGeneratedTurnKeysMatchTheRunner(t *testing.T) {
 // there is exactly one; an unreadable or malformed verdict is a runner
 // error before the turn starts, never empty values.
 func TestVerdictTurnIsToldEveryVerdictExactly(t *testing.T) {
-	write := func(t *testing.T, dir, id, family string) string {
+	write := func(t *testing.T, dir, id, family string) (string, supervise.VerifiedVerdict) {
 		t.Helper()
 		p := filepath.Join(dir, id+".json")
 		v := state.Verdict{ChangeID: id, Kind: "changes-requested", SHA: "sha-" + id, Summary: "s", Branch: family + "-0123456789", DeclaredBranch: family}
@@ -402,14 +402,15 @@ func TestVerdictTurnIsToldEveryVerdictExactly(t *testing.T) {
 		if err := os.WriteFile(p, b, 0o644); err != nil {
 			t.Fatal(err)
 		}
-		return p
+		return p, supervise.VerifiedVerdict{Path: p, ChangeID: v.ChangeID, Kind: v.Kind, SHA: v.SHA, Branch: v.Branch, DeclaredBranch: v.DeclaredBranch, Digest: "test-" + id}
 	}
 	// Two verdicts at once.
 	fx, r, out := execFixture(t, []string{"sh", "-c", "env | grep '^FACTORYD_\\(VERDICT\\|CHANGE\\)'"}, 30)
-	p48 := write(t, fx.outbox, "48", "producer/ci-host")
-	p49 := write(t, fx.outbox, "49", "producer/auth-session")
+	p48, v48 := write(t, fx.outbox, "48", "producer/ci-host")
+	p49, v49 := write(t, fx.outbox, "49", "producer/auth-session")
 	tn := turn(fx, 0)
 	tn.Triggers = []watch.Trigger{{Label: "verdict", Path: p48}, {Label: "verdict", Path: p49}}
+	tn.Verdicts = []supervise.VerifiedVerdict{v48, v49}
 	if _, err := r.Run(context.Background(), tn, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -435,9 +436,10 @@ func TestVerdictTurnIsToldEveryVerdictExactly(t *testing.T) {
 	}
 	// Exactly one: the scalars name it.
 	fx1, r1, out1 := execFixture(t, []string{"sh", "-c", "env | grep '^FACTORYD_\\(VERDICT\\|CHANGE\\)'"}, 30)
-	p1 := write(t, fx1.outbox, "48", "producer/ci-host")
+	p1, v1 := write(t, fx1.outbox, "48", "producer/ci-host")
 	tn1 := turn(fx1, 0)
 	tn1.Triggers = []watch.Trigger{{Label: "verdict", Path: p1}}
+	tn1.Verdicts = []supervise.VerifiedVerdict{v1}
 	if _, err := r1.Run(context.Background(), tn1, nil); err != nil {
 		t.Fatal(err)
 	}
@@ -446,28 +448,28 @@ func TestVerdictTurnIsToldEveryVerdictExactly(t *testing.T) {
 			t.Fatalf("single verdict: not told %s\n%s", want, out1.String())
 		}
 	}
-	// Malformed: the turn does not start.
+	// A direct runner caller cannot bypass admission by supplying a path for
+	// the runner to reopen: every verdict trigger needs a verified snapshot.
 	fx2, r2, _ := execFixture(t, []string{"sh", "-c", "touch \"$FACTORYD_ROOT/started\""}, 30)
 	bad := filepath.Join(fx2.outbox, "50.json")
 	os.WriteFile(bad, []byte("{not json"), 0o644)
 	tn2 := turn(fx2, 0)
 	tn2.Triggers = []watch.Trigger{{Label: "verdict", Path: bad}}
-	if _, err := r2.Run(context.Background(), tn2, nil); err == nil || !strings.Contains(err.Error(), "verdict trigger") {
-		t.Fatalf("err=%v; a malformed verdict must be a runner error", err)
+	if _, err := r2.Run(context.Background(), tn2, nil); err == nil || !strings.Contains(err.Error(), "no verified snapshot") {
+		t.Fatalf("err=%v; a verdict without admission must be a runner error", err)
 	}
 	if _, err := os.Stat(filepath.Join(fx2.root, "started")); err == nil {
 		t.Fatal("the turn started on a verdict the runner could not read")
 	}
-	// The old document shape -- valid JSON, a change and a kind, no branch
-	// lineage -- is the exact input that reintroduces the stale-family
-	// failure. The turn does not start.
+	// An old document shape is likewise never parsed by the runner. Only
+	// admission may decode a document, after digest verification.
 	fx4, r4, _ := execFixture(t, []string{"sh", "-c", "touch \"$FACTORYD_ROOT/started\""}, 30)
 	oldShape := filepath.Join(fx4.outbox, "51.json")
 	os.WriteFile(oldShape, []byte(`{"change_id":"51","kind":"changes-requested","sha":"abc","summary":"s","at":"2026-09-04T00:00:00Z"}`), 0o644)
 	tn4 := turn(fx4, 0)
 	tn4.Triggers = []watch.Trigger{{Label: "verdict", Path: oldShape}}
-	if _, err := r4.Run(context.Background(), tn4, nil); err == nil || !strings.Contains(err.Error(), "lineage") {
-		t.Fatalf("err=%v; a pre-#31 verdict must be refused, not given to the turn with an empty family", err)
+	if _, err := r4.Run(context.Background(), tn4, nil); err == nil || !strings.Contains(err.Error(), "no verified snapshot") {
+		t.Fatalf("err=%v; a pre-#31 verdict must not reach the runner", err)
 	}
 	if _, err := os.Stat(filepath.Join(fx4.root, "started")); err == nil {
 		t.Fatal("the turn started on a verdict with no lineage")
@@ -495,5 +497,82 @@ func TestApplySandboxRefusesWithoutRootAndIsNoOpWithoutASandbox(t *testing.T) {
 	}
 	if err := supervise.ApplySandbox(config.RoleSpec{}, attr); err != nil {
 		t.Fatalf("no sandbox declared: %v", err)
+	}
+}
+
+// FACTORYD_VERDICTS_TSV is the same verdicts pre-rendered for shells (#50
+// review): one line per verdict, tab-separated path, change_id, kind,
+// branch, declared_branch. A family with "{" in it -- valid to git -- is
+// carried exactly; no shell needs a JSON parser to read it.
+func TestVerdictTurnIsGivenATabSeparatedRendering(t *testing.T) {
+	write := func(t *testing.T, dir, id, kind, family string) (string, supervise.VerifiedVerdict) {
+		t.Helper()
+		p := filepath.Join(dir, id+".json")
+		v := state.Verdict{ChangeID: id, Kind: kind, SHA: "sha-" + id, Summary: "s", Branch: family + "-0123456789", DeclaredBranch: family}
+		b, _ := json.Marshal(v)
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p, supervise.VerifiedVerdict{Path: p, ChangeID: v.ChangeID, Kind: v.Kind, SHA: v.SHA, Branch: v.Branch, DeclaredBranch: v.DeclaredBranch, Digest: "test-" + id}
+	}
+	fx, r, out := execFixture(t, []string{"sh", "-c", `printf '%s' "$FACTORYD_VERDICTS_TSV"`}, 30)
+	p48, v48 := write(t, fx.outbox, "48", "merged", "fix/{example}")
+	p49, v49 := write(t, fx.outbox, "49", "changes-requested", "fix/plain")
+	tn := turn(fx, 0)
+	tn.Triggers = []watch.Trigger{{Label: "verdict", Path: p48}, {Label: "verdict", Path: p49}}
+	tn.Verdicts = []supervise.VerifiedVerdict{v48, v49}
+	if _, err := r.Run(context.Background(), tn, nil); err != nil {
+		t.Fatal(err)
+	}
+	want := p48 + "\t48\tmerged\tfix/{example}-0123456789\tfix/{example}\n" + p49 + "\t49\tchanges-requested\tfix/plain-0123456789\tfix/plain\n"
+	if out.String() != want {
+		t.Fatalf("TSV:\n%q\nwant:\n%q", out.String(), want)
+	}
+	// And a turn with no verdict gets an empty value, present.
+	fx2, r2, out2 := execFixture(t, []string{"sh", "-c", `env | grep -c '^FACTORYD_VERDICTS_TSV=$'`}, 30)
+	if _, err := r2.Run(context.Background(), turn(fx2, 0), nil); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out2.String()) != "1" {
+		t.Fatalf("no-verdict turn: %q", out2.String())
+	}
+}
+
+// A verdict path with a tab in it cannot be carried exactly in the TSV;
+// the turn does not start (#50 review). Paths are not refnames.
+func TestVerdictPathWithATabRefusesTheTurn(t *testing.T) {
+	fx, r, _ := execFixture(t, []string{"true"}, 30)
+	dir := filepath.Join(fx.outbox, "odd\tdir")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "48.json")
+	v := state.Verdict{ChangeID: "48", Kind: "merged", SHA: "s", Summary: "s", Branch: "fix/a-0123456789", DeclaredBranch: "fix/a"}
+	b, _ := json.Marshal(v)
+	if err := os.WriteFile(p, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tn := turn(fx, 0)
+	tn.Triggers = []watch.Trigger{{Label: "verdict", Path: p}}
+	tn.Verdicts = []supervise.VerifiedVerdict{{Path: p, ChangeID: v.ChangeID, Kind: v.Kind, SHA: v.SHA, Branch: v.Branch, DeclaredBranch: v.DeclaredBranch, Digest: "test-48"}}
+	if _, err := r.Run(context.Background(), tn, nil); err == nil || !strings.Contains(err.Error(), "tab or newline") {
+		t.Fatalf("a verdict path with a tab started the turn: %v", err)
+	}
+}
+
+// A trigger path with the path list separator in it cannot be carried in
+// FACTORYD_TRIGGER_PATHS; the turn does not start (#50 review).
+func TestTriggerPathWithTheListSeparatorRefusesTheTurn(t *testing.T) {
+	fx, r, _ := execFixture(t, []string{"true"}, 30)
+	dir := filepath.Join(fx.inbox, "a"+string(os.PathListSeparator)+"b")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "wake")
+	os.WriteFile(p, []byte("x"), 0o644)
+	tn := turn(fx, 0)
+	tn.Triggers = []watch.Trigger{{Label: "wake", Path: p}}
+	if _, err := r.Run(context.Background(), tn, nil); err == nil || !strings.Contains(err.Error(), "path list separator") {
+		t.Fatalf("a trigger path with the separator started the turn: %v", err)
 	}
 }

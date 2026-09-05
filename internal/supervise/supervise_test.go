@@ -16,6 +16,7 @@ import (
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/proc"
+	"github.com/aicix-labs/factoryd/internal/signal"
 	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/supervise"
 )
@@ -110,7 +111,7 @@ func newFixture(t *testing.T) *fixture {
 			Reviewer: config.RoleSpec{Command: []string{"true"}, Env: map[string]string{"PATH": os.Getenv("PATH")}},
 		},
 		Supervisor: config.Supervisor{
-			SpinWarn: 2, SpinAbort: 4, FailAbort: 3, PollIntervalSeconds: 1, BackoffSeconds: 1,
+			SpinWarn: 2, SpinAbort: 4, FailAbort: 3, VerdictAttempts: 6, PollIntervalSeconds: 1, BackoffSeconds: 1,
 			ForcePoll: true,
 		},
 		Alerts: []config.Alert{{Kind: "file", Path: filepath.Join(root, "alerts.log")}},
@@ -1575,4 +1576,106 @@ func TestRetryMarkerWithoutAStepRerunsTheTurn(t *testing.T) {
 	if r.count() != 1 || after != 1 {
 		t.Fatalf("agent %d, after-turn %d; want 1 and 1", r.count(), after)
 	}
+}
+
+// A timed-out turn counts on the fail streak whatever the progress marker
+// says (#50 review): the turn was killed at its deadline, so nothing that
+// would have judged its work ran. Three timed-out turns that each touched
+// progress halt at fail_abort.
+func TestTimedOutTurnCountsOnTheFailStreakDespiteProgress(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		fx.progress(t)
+		return supervise.TurnResult{ExitCode: -1, TimedOut: true}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted: timed-out turns that touched progress never accumulated", err)
+	}
+	if r.count() != 3 {
+		t.Fatalf("ran %d turns, want fail_abort=3", r.count())
+	}
+	if rs := fx.roleState(t); !strings.Contains(rs.HaltReason, "fail_abort") {
+		t.Fatalf("halt reason %q", rs.HaltReason)
+	}
+}
+
+// The supervisor counts, per verdict trigger, the turns that leave it
+// pending, in its own state; past supervisor.verdict_attempts such a turn
+// is credited no progress, so the spin guard halts with the verdict kept.
+// Consumption resets the count (#50 review, round 9).
+func TestVerdictCarriedPastTheBoundIsCreditedNoProgress(t *testing.T) {
+	fx := newFixture(t)
+	fx.cfg.Supervisor.VerdictAttempts = 2
+	v := issueVerdict(t, fx, "48", "changes-requested", "fix/a")
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		fx.progressQuietFor("producer") // touches progress, never consumes the verdict
+		return supervise.TurnResult{}
+	}}
+	// Verdicts are the producer's triggers: run as the producer.
+	s, err := supervise.New(supervise.Options{
+		Config: fx.cfg, Role: "producer", Runner: r,
+		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Sleep:    func(ctx context.Context, d time.Duration) error { return nil },
+		MaxTurns: 50,
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted: a verdict carried forever with progress touches never halted", err)
+	}
+	if r.count() != 2+fx.cfg.Supervisor.SpinAbort {
+		t.Fatalf("ran %d turns, want verdict_attempts=2 credited + spin_abort=%d", r.count(), fx.cfg.Supervisor.SpinAbort)
+	}
+	st, _ := state.Load(fx.cfg.StatePath(), fx.cfg.Name)
+	rs := st.Role(state.RoleProducer)
+	if !strings.Contains(rs.HaltReason, "spin_abort") || rs.TriggerAttempts["48"] != r.count() {
+		t.Fatalf("halt %q attempts %v", rs.HaltReason, rs.TriggerAttempts)
+	}
+	if _, err := os.Stat(v); err != nil {
+		t.Fatal("the verdict was lost")
+	}
+
+	// Consumption resets the count.
+	fx2 := newFixture(t)
+	fx2.cfg.Supervisor.VerdictAttempts = 2
+	issueVerdict(t, fx2, "48", "changes-requested", "fix/a")
+	n := 0
+	r2 := &fakeRunner{act: func(_ int, tr supervise.Turn) supervise.TurnResult {
+		n++
+		if n == 2 {
+			for _, trig := range tr.Triggers {
+				os.Remove(trig.Path)
+			}
+		}
+		fx2.progressQuietFor("producer")
+		return supervise.TurnResult{}
+	}}
+	s2, _ := supervise.New(supervise.Options{Config: fx2.cfg, Role: "producer", Runner: r2, Log: slog.New(slog.NewTextHandler(io.Discard, nil)), Sleep: func(ctx context.Context, d time.Duration) error { return nil }, MaxTurns: 2})
+	defer s2.Close()
+	if err := s2.Run(ctx); err != nil && !errors.Is(err, context.DeadlineExceeded) {
+		t.Fatal(err)
+	}
+	st2, _ := state.Load(fx2.cfg.StatePath(), fx2.cfg.Name)
+	if len(st2.Role(state.RoleProducer).TriggerAttempts) != 0 {
+		t.Fatalf("attempts not reset on consumption: %v", st2.Role(state.RoleProducer).TriggerAttempts)
+	}
+}
+
+// issueVerdict writes AND registers a verdict, as the reviewer's signal
+// does; a file merely placed in the outbox is not a verdict.
+func issueVerdict(t *testing.T, fx *fixture, id, kind, family string) string {
+	t.Helper()
+	p, err := signal.Issue(fx.cfg, state.Verdict{ChangeID: id, Kind: kind, SHA: "s", Summary: "s", At: time.Now(), Branch: family + "-0123456789", DeclaredBranch: family})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
 }

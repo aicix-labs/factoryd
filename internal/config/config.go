@@ -262,6 +262,13 @@ type Supervisor struct {
 	// guard never sees it. Observed in production as a factory idle for 3.5h
 	// with completed work stranded and every signal green (issue #12).
 	FailAbort int `json:"fail_abort,omitempty"`
+	// VerdictAttempts bounds the turns a verdict trigger may be carried
+	// through without being consumed while still crediting progress.
+	// Past it, a turn that leaves the verdict pending is credited no
+	// progress whatever it did, so the spin guard halts with the verdict
+	// kept. The bound is the supervisor's, in its own state: a bound the
+	// bounded principal could rewrite is no bound (#50 review). Default 6.
+	VerdictAttempts int `json:"verdict_attempts,omitempty"`
 	// PollIntervalSeconds is the watcher poll period, and the periodic
 	// re-check interval even when inotify is in use.
 	PollIntervalSeconds int `json:"poll_interval_seconds,omitempty"`
@@ -275,13 +282,15 @@ type Supervisor struct {
 // Defaults, applied by Load. They are named rather than inlined so doctor and
 // the docs can quote the same numbers.
 const (
-	DefaultSpinWarn       = 3
-	DefaultSpinAbort      = 8
-	DefaultFailAbort      = 5
-	DefaultPollInterval   = 2
-	DefaultBackoffSeconds = 15
-	DefaultTurnTimeout    = 3600
-	DefaultGateTimeout    = 900
+	DefaultSpinWarn  = 3
+	DefaultSpinAbort = 8
+	DefaultFailAbort = 5
+	// DefaultVerdictAttempts: partial turns a verdict may be carried through.
+	DefaultVerdictAttempts = 6
+	DefaultPollInterval    = 2
+	DefaultBackoffSeconds  = 15
+	DefaultTurnTimeout     = 3600
+	DefaultGateTimeout     = 900
 
 	DefaultHealthInterval  = 60
 	DefaultAlertAfter      = 3
@@ -513,6 +522,9 @@ func (c *Config) applyDefaults() {
 	if c.Supervisor.SpinAbort == 0 {
 		c.Supervisor.SpinAbort = DefaultSpinAbort
 	}
+	if c.Supervisor.VerdictAttempts == 0 {
+		c.Supervisor.VerdictAttempts = DefaultVerdictAttempts
+	}
 	if c.Supervisor.FailAbort == 0 {
 		c.Supervisor.FailAbort = DefaultFailAbort
 	}
@@ -614,6 +626,22 @@ func (c *Config) Validate() error {
 	// --- cache root: the only place reclamation may delete ---
 	if len(c.Health.Caches) > 0 && c.Paths.CacheRoot == "" {
 		add("health.caches declared but paths.cache_root is empty; reclamation deletes, and only inside a dedicated cache root")
+	}
+	// A configured path with a control character in it is a path that
+	// cannot be carried exactly in any line- or tab-delimited handoff (#50
+	// review), and no deployment means one; one with the platform's path
+	// list separator in it cannot be carried in FACTORYD_TRIGGER_PATHS,
+	// which a wrapper splits on it. Both refused at load.
+	for _, p := range []struct{ name, path string }{
+		{"paths.root", c.Paths.Root}, {"paths.producer_workdir", c.Paths.ProducerWorkdir},
+		{"paths.submit_repo", c.Paths.SubmitRepo}, {"paths.cache_root", c.Paths.CacheRoot},
+	} {
+		if strings.ContainsAny(p.path, "\t\n\r") {
+			add("%s %q contains a control character", p.name, p.path)
+		}
+		if strings.ContainsRune(p.path, os.PathListSeparator) {
+			add("%s %q contains %q, the path list separator; FACTORYD_TRIGGER_PATHS could not carry a path under it", p.name, p.path, os.PathListSeparator)
+		}
 	}
 	if cr := c.Paths.CacheRoot; cr != "" {
 		switch {
@@ -772,6 +800,9 @@ func (c *Config) Validate() error {
 	}
 	if sv.FailAbort <= 0 {
 		add("supervisor.fail_abort must be positive")
+	}
+	if sv.VerdictAttempts <= 0 {
+		add("supervisor.verdict_attempts must be positive")
 	}
 	if sv.PollIntervalSeconds <= 0 {
 		add("supervisor.poll_interval_seconds must be positive")
@@ -1107,7 +1138,7 @@ var GeneratedTurnKeys = []string{
 	"FACTORYD_FACTORY", "FACTORYD_ROLE", "FACTORYD_TURN", "FACTORYD_ROOT",
 	"FACTORYD_INBOX", "FACTORYD_OUTBOX", "FACTORYD_WORKDIR", "FACTORYD_TARGET_BRANCH",
 	"FACTORYD_PROGRESS", "FACTORYD_TRIGGERS", "FACTORYD_TRIGGER_PATHS", "FACTORYD_CONFIG",
-	"FACTORYD_VERDICTS", "FACTORYD_VERDICT", "FACTORYD_CHANGE_ID", "FACTORYD_CHANGE_BRANCH",
+	"FACTORYD_VERDICTS", "FACTORYD_VERDICTS_TSV", "FACTORYD_VERDICT", "FACTORYD_CHANGE_ID", "FACTORYD_CHANGE_BRANCH",
 }
 
 // IsGeneratedTurnKey reports whether name is one the supervisor generates.

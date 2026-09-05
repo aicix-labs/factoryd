@@ -5,6 +5,8 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -175,15 +177,26 @@ func consumed(acted []watch.Trigger, remaining []watch.Trigger) bool {
 	return true
 }
 
+// admittedTurn is the supervisor-owned result of admitting filesystem
+// triggers. Verdict facts here were decoded from the exact bytes whose digest
+// matched the registry; keeping them beside the trigger prevents a later
+// producer-side replacement from changing what the runner tells the agent.
+type admittedTurn struct {
+	Triggers []watch.Trigger
+	Verdicts []VerifiedVerdict
+}
+
 // oneTurn runs exactly one agent turn and applies the spin guard. It reports
 // whether the supervisor halted.
-func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (bool, error) {
+func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, error) {
+	triggers := admitted.Triggers
 	s.turnSeq++
 	now := s.now()
 	turn := Turn{
 		ID:       fmt.Sprintf("%s-%s-%d", s.role, now.Format("20060102T150405"), s.turnSeq),
 		Role:     s.role,
 		Triggers: triggers,
+		Verdicts: admitted.Verdicts,
 	}
 	if spec, ok := s.cfg.RoleSpec(s.role); ok && spec.TimeoutSeconds > 0 {
 		turn.Deadline = now.Add(time.Duration(spec.TimeoutSeconds) * time.Second)
@@ -312,9 +325,11 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 	// After a clean turn, the supervisor's own follow-up (submit, for the
 	// producer). Its failure is the turn's failure.
 	afterTurnDisposition := DispositionTransient
+	afterTurnSucceeded := runErr == nil && res.ExitCode == 0 && !res.TimedOut
 	if runErr == nil && res.ExitCode == 0 && !res.TimedOut && s.afterTurn != nil {
 		msg, err := s.afterTurn(ctx, turn, res)
 		if err != nil {
+			afterTurnSucceeded = false
 			afterTurnDisposition = DispositionOf(err)
 			s.log.Error("after-turn step failed; counting the turn as failed", "turn", turn.ID, "disposition", string(afterTurnDisposition), "err", err)
 			res.ExitCode = ExitAfterTurnFailed
@@ -340,6 +355,105 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 	// "achieving nothing" halts real work, which it did in the first
 	// implementation of this rule.
 	progressed := after.After(before)
+
+	// A verdict carried through too many turns without being consumed is
+	// credited no progress from then on, whatever the turn did (#50
+	// review): the count lives in state, the supervisor's, and resets when
+	// the trigger is consumed. Past the bound the spin guard halts with
+	// the verdict kept -- the loop this closes was a producer that kept
+	// its verdict pending and kept touching, or churning, forever.
+	overdrawn := ""
+	verdictReceiptLost := false
+	if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		rs := st.Role(state.Role(s.role))
+		if rs.TriggerAttempts == nil {
+			rs.TriggerAttempts = map[string]int{}
+		}
+		still := map[string]bool{}
+		for _, t := range remaining {
+			still[t.Path] = true
+		}
+		// Keyed by the verdict's registry identity -- its change id -- not
+		// by the file's path: a producer that deletes and recreates the
+		// file has not been issued a new verdict (#50 review).
+		stillIDs := map[string]bool{}
+		for p := range still {
+			stillIDs[strings.TrimSuffix(filepath.Base(p), ".json")] = true
+		}
+		for _, t := range real {
+			if t.Label != "verdict" {
+				continue
+			}
+			id := strings.TrimSuffix(filepath.Base(t.Path), ".json")
+			var verified *VerifiedVerdict
+			for i := range turn.Verdicts {
+				if turn.Verdicts[i].Path == t.Path && turn.Verdicts[i].ChangeID == id {
+					verified = &turn.Verdicts[i]
+					break
+				}
+			}
+			if verified == nil {
+				continue // impossible for an admitted producer turn; fail closed elsewhere
+			}
+			iv, ok := st.Issued[id]
+			if !ok || iv.Digest != verified.Digest {
+				continue // a concurrent fresh signal owns its own lifecycle
+			}
+
+			switch verified.Kind {
+			case state.VerdictChangesRequested:
+				// The producer removing a handoff file is never a receipt. A
+				// matching root-side submit writes ConsumedAt in submit; when
+				// no such submit is in flight, disappearance is a visible
+				// block rather than a discarded changes request.
+				if !still[t.Path] && iv.ConsumedAt == nil && iv.PendingSubmission == nil {
+					verdictReceiptLost = true
+					if rs.Blocked == nil {
+						rs.Blocked = &state.Block{
+							Disposition: "blocked",
+							Reason:      fmt.Sprintf("changes-requested verdict %s disappeared from the producer-writable outbox before a matching root-side submission succeeded; the verdict remains unconsumed and must be reissued or reconciled by an operator", id),
+							Turn:        turn.ID,
+							Family:      verified.DeclaredBranch,
+							Digest:      verified.Digest,
+							At:          ended,
+						}
+					}
+				}
+			case state.VerdictMerged, state.VerdictOperatorGated:
+				// These verdicts need no producer declaration. The supervisor
+				// itself records their acknowledgement only after a clean turn
+				// (and its root-side after-turn step, if any) has completed.
+				if afterTurnSucceeded && iv.ConsumedAt == nil {
+					at := ended
+					iv.ConsumedAt = &at
+					iv.ConsumedByTurn = turn.ID
+					st.Issued[id] = iv
+				}
+			}
+			if !still[t.Path] {
+				continue // no attempt is charged after a source file disappeared
+			}
+			rs.TriggerAttempts[id]++
+			if rs.TriggerAttempts[id] > s.cfg.Supervisor.VerdictAttempts {
+				overdrawn = fmt.Sprintf("verdict %s carried through %d turns without being consumed (verdict_attempts=%d)", id, rs.TriggerAttempts[id], s.cfg.Supervisor.VerdictAttempts)
+			}
+		}
+		for id := range rs.TriggerAttempts {
+			if !stillIDs[id] {
+				delete(rs.TriggerAttempts, id)
+			}
+		}
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	if overdrawn != "" && progressed {
+		s.log.Warn("progress not credited: "+overdrawn, "turn", turn.ID)
+		progressed = false
+	}
+	if verdictReceiptLost {
+		s.log.Error("changes-requested verdict disappeared without a root-side submission receipt; blocking instead of treating producer deletion as consumption", "turn", turn.ID)
+	}
 
 	// A non-zero exit or a timeout is a failed turn whatever happened to the
 	// trigger. The spin guard cannot see a turn that consumed its trigger and
@@ -374,8 +488,12 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 		}
 		spin = rs.SpinCount
 
-		// Progress resets this one too; consumption does not.
-		if failed && !progressed {
+		// Progress resets this one too; consumption does not. A TIMED-OUT
+		// turn counts whatever the marker says (#50 review): the turn was
+		// killed at its deadline, so nothing that would have judged its
+		// work ran -- a wrapper that touched progress and then hung would
+		// otherwise reset this streak on every deadline and retry forever.
+		if failed && (!progressed || res.TimedOut) {
 			rs.FailStreak++
 		} else {
 			rs.FailStreak = 0
@@ -622,4 +740,108 @@ func (s *Supervisor) writeInterruptedMarker(turn Turn, res TurnResult, at time.T
 			"The supervisor was stopped after this turn consumed its trigger. This is a recovery turn, not a failure.\n",
 		s.cfg.Supervisor.FailAbort, labels(real), turn.ID, res.ExitCode, at.Format(time.RFC3339))
 	return os.WriteFile(s.cfg.RetryPath(s.role), []byte(body), 0o644)
+}
+
+// admitVerdicts is the factoryd-owned boundary between the outbox and a
+// producer turn (#50 review). The outbox is the producer's to write, so a
+// file is a trigger only when its exact bytes match a current, unconsumed
+// registry entry. The decoded facts from those same bytes are carried to the
+// runner; no later phase reopens this producer-writable path. The supervisor,
+// not the wrapper, selects at most one changes-requested verdict per turn.
+func (s *Supervisor) admitVerdicts(triggers []watch.Trigger) (admittedTurn, error) {
+	if s.role != "producer" {
+		return admittedTurn{Triggers: triggers}, nil
+	}
+	st, err := state.Load(s.cfg.StatePath(), s.cfg.Name)
+	if err != nil {
+		return admittedTurn{}, err
+	}
+	if err := st.VerdictRegistry.MigrationError(); err != nil {
+		return admittedTurn{}, err
+	}
+
+	var out admittedTurn
+	type candidate struct {
+		t  watch.Trigger
+		v  VerifiedVerdict
+		at time.Time
+	}
+	var cr []candidate
+	add := func(c candidate) {
+		out.Triggers = append(out.Triggers, c.t)
+		out.Verdicts = append(out.Verdicts, c.v)
+	}
+	for _, t := range triggers {
+		if t.Label != "verdict" {
+			out.Triggers = append(out.Triggers, t)
+			continue
+		}
+		id := strings.TrimSuffix(filepath.Base(t.Path), ".json")
+		iv, ok := st.Issued[id]
+		body, rerr := os.ReadFile(t.Path)
+		if !ok || rerr != nil || state.DigestOf(body) != iv.Digest {
+			why := "no registry entry"
+			switch {
+			case rerr != nil:
+				why = rerr.Error()
+			case ok:
+				why = "digest does not match the registered verdict"
+			}
+			if err := s.quarantineVerdict(t.Path, "unregistered", why); err != nil {
+				return admittedTurn{}, err
+			}
+			continue
+		}
+		if iv.ConsumedAt != nil {
+			why := fmt.Sprintf("registered verdict was already consumed by turn %s at %s", iv.ConsumedByTurn, iv.ConsumedAt.Format(time.RFC3339))
+			if err := s.quarantineVerdict(t.Path, "replayed", why); err != nil {
+				return admittedTurn{}, err
+			}
+			continue
+		}
+		v, err := state.ParseVerdict(body, t.Path)
+		if err != nil {
+			if qerr := s.quarantineVerdict(t.Path, "unregistered", err.Error()); qerr != nil {
+				return admittedTurn{}, qerr
+			}
+			continue
+		}
+		if v.Kind != iv.Kind || v.Branch != iv.Branch || v.DeclaredBranch != iv.DeclaredBranch {
+			if err := s.quarantineVerdict(t.Path, "unregistered", "decoded verdict facts do not match the registry entry"); err != nil {
+				return admittedTurn{}, err
+			}
+			continue
+		}
+		c := candidate{t: t, at: iv.IssuedAt, v: VerifiedVerdict{
+			Path: t.Path, ChangeID: v.ChangeID, Kind: v.Kind, SHA: v.SHA,
+			Branch: v.Branch, DeclaredBranch: v.DeclaredBranch, Digest: iv.Digest,
+		}}
+		if iv.Kind == state.VerdictChangesRequested {
+			cr = append(cr, c)
+			continue
+		}
+		add(c)
+	}
+	if len(cr) > 0 {
+		sort.Slice(cr, func(i, j int) bool {
+			if cr[i].at.Equal(cr[j].at) {
+				return cr[i].t.Path < cr[j].t.Path
+			}
+			return cr[i].at.Before(cr[j].at)
+		})
+		add(cr[0])
+		if len(cr) > 1 {
+			s.log.Info("one changes-requested verdict per turn; the rest wait", "active", filepath.Base(cr[0].t.Path), "waiting", len(cr)-1)
+		}
+	}
+	return out, nil
+}
+
+func (s *Supervisor) quarantineVerdict(path, suffix, reason string) error {
+	q := path + "." + suffix
+	if err := os.Rename(path, q); err != nil && !os.IsNotExist(err) {
+		return fmt.Errorf("quarantining a %s verdict file %s: %w", suffix, path, err)
+	}
+	s.log.Error("outbox file is not an admissible verdict; quarantined, not a trigger", "path", path, "reason", reason, "moved_to", q)
+	return nil
 }
