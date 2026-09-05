@@ -205,6 +205,9 @@ var ErrRefused = errors.New("refresh refused")
 // decision taken outside the lock is a decision about a tree someone else
 // may be editing by the time it is acted on (#41 review). With force the
 // cycle is not consulted; the previous phase is returned for the operator.
+// Force never overrides a live producer-worktree lease: it is a repair for an
+// unknown cycle record, not authority to reset a tree while submit copies or
+// gates it.
 func Guarded(ctx context.Context, cfg *config.Config, deps Deps, force bool) (Result, string, error) {
 	var r Result
 	var prev string
@@ -213,6 +216,12 @@ func Guarded(ctx context.Context, cfg *config.Config, deps Deps, force bool) (Re
 		prev = state.CycleUnknown
 		if st.Cycle != nil {
 			prev = st.Cycle.Phase
+		}
+		if err := st.PermitProducerWorktreeUse(); err != nil {
+			if force {
+				return fmt.Errorf("%w: --force overrides cycle eligibility, not an active producer-worktree lease: %w", ErrRefused, err)
+			}
+			return fmt.Errorf("%w: producer worktree is in use: %w", ErrRefused, err)
 		}
 		if changed, note := Reconcile(ctx, cfg, st, deps.Lookup, deps.Ancestor, time.Now()); changed || note != "" {
 			reconciled = note

@@ -3,6 +3,7 @@ package refresh_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -931,6 +932,49 @@ func TestBeforeTurnDefersWhileSubmissionLeaseIsLive(t *testing.T) {
 	}
 	if st.Cycle == nil || st.Cycle.Phase != state.CycleNew {
 		t.Fatalf("BeforeTurn changed cycle despite the live submission lease: %+v", st.Cycle)
+	}
+}
+
+// An operator refresh is another root-side write to the producer worktree.
+// Neither ordinary eligibility nor --force authorizes it to reset the tree
+// while submit owns the copy/gate window, and the refusal happens before any
+// fetch, bundle, or producer-side apply.
+func TestGuardedRefreshDoesNotUseTheWorktreeWhileSubmissionLeaseIsLive(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		t.Run(fmt.Sprintf("force=%v", force), func(t *testing.T) {
+			cfg := cfgFor(t)
+			holder, err := proc.Self("submit-test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+				st.SetCycle(state.CycleNew, time.Now())
+				return st.AcquireProducerWorktreeLease(holder, time.Now())
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var fetches, bundles, applies int
+			_, prev, err := refresh.Guarded(context.Background(), cfg, refresh.Deps{
+				Fetch: func(context.Context, string) error {
+					fetches++
+					return nil
+				},
+				Bundle: func(context.Context, string, string) (string, error) {
+					bundles++
+					return "abc123", nil
+				},
+				Apply: func(context.Context, string, string) (string, error) {
+					applies++
+					return "abc123", nil
+				},
+			}, force)
+			if !errors.Is(err, refresh.ErrRefused) || prev != state.CycleNew {
+				t.Fatalf("force=%v Guarded result prev=%q err=%v, want live-lease refusal", force, prev, err)
+			}
+			if fetches != 0 || bundles != 0 || applies != 0 {
+				t.Fatalf("force=%v refresh used worktree fetch=%d bundle=%d apply=%d while submit lease was live", force, fetches, bundles, applies)
+			}
+		})
 	}
 }
 
