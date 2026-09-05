@@ -179,6 +179,47 @@ func TestNonMergeVerdictsRecordWithoutMerging(t *testing.T) {
 	}
 }
 
+// A provider-confirmed CI refusal is not a reviewer verdict. It must leave a
+// durable, self-clearing retry record and no outbox handoff for the producer;
+// once CI clears, the ordinary merged verdict retires that wait.
+func TestPipelineRefusalSchedulesReviewerRetryInsteadOfAnOperatorGate(t *testing.T) {
+	l := newLab(t)
+	l.drv.merge = scm.RefusedByProvider(scm.RefusedPipeline, "GitLab detailed_merge_status=ci_must_pass")
+	res, err := l.run(t, "merged", "auto", "clean")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PipelineWait == nil || res.PipelineWait.ChangeID != "42" || res.PipelineWait.SHA != "abc123" || res.Verdict.Kind != "" {
+		t.Fatalf("result=%+v, want a pipeline wait and no verdict", res)
+	}
+	if v := l.verdictFile(t); v != nil {
+		t.Fatalf("pipeline wait wrote a producer verdict: %+v", v)
+	}
+	st, err := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if err != nil || st.Role(state.RoleReviewer).PipelineWait == nil {
+		t.Fatalf("pipeline wait was not durable: state=%+v err=%v", st.Role(state.RoleReviewer), err)
+	}
+	if st.LastVerdict != nil || len(l.drv.comments) != 0 {
+		t.Fatalf("pipeline wait became an observable verdict/comment: verdict=%+v comments=%v", st.LastVerdict, l.drv.comments)
+	}
+	retry, err := os.ReadFile(l.cfg.RetryPath(string(state.RoleReviewer)))
+	if err != nil || !strings.Contains(string(retry), "origin: provider pipeline\n") || !strings.Contains(string(retry), "change: 42\n") {
+		t.Fatalf("pipeline wait did not wake an idle reviewer supervisor: retry=%q err=%v", retry, err)
+	}
+
+	l.drv.merge = scm.ProviderMerged("m3rge")
+	if _, err := l.run(t, "merged", "auto", "clean after CI"); err != nil {
+		t.Fatal(err)
+	}
+	st, err = state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if err != nil || st.Role(state.RoleReviewer).PipelineWait != nil || st.LastVerdict == nil || st.LastVerdict.Kind != state.VerdictMerged {
+		t.Fatalf("successful retry did not clear the wait: state=%+v err=%v", st, err)
+	}
+	if _, err := os.Stat(l.cfg.RetryPath(string(state.RoleReviewer))); !os.IsNotExist(err) {
+		t.Fatalf("conclusive signal left its pipeline retry armed: %v", err)
+	}
+}
+
 func TestRefusals(t *testing.T) {
 	cases := map[string]struct {
 		mutate  func(l *lab)

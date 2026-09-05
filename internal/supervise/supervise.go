@@ -380,6 +380,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		if err := s.recoverQueuedReservation(); err != nil {
 			return err
 		}
+		if err := s.recoverReviewerPipelineWait(); err != nil {
+			return err
+		}
 
 		triggers, err := s.watcher.Wait(ctx)
 		if err != nil {
@@ -426,6 +429,29 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return ErrHalted
 		}
 	}
+}
+
+// recoverReviewerPipelineWait recreates the supervisor-owned retry marker for
+// a durable CI wait after a crash. The reviewer command may have consumed its
+// ordinary wake before the supervisor wrote the marker, so state -- not a
+// producer/reviewer-writable handoff file -- is the restart authority.
+func (s *Supervisor) recoverReviewerPipelineWait() error {
+	if s.role != string(state.RoleReviewer) {
+		return nil
+	}
+	st, err := state.Load(s.cfg.StatePath(), s.cfg.Name)
+	if err != nil {
+		return err
+	}
+	if st.Role(state.RoleReviewer).PipelineWait == nil {
+		return nil
+	}
+	if _, err := os.Lstat(s.cfg.RetryPath(s.role)); err == nil {
+		return nil
+	} else if !os.IsNotExist(err) {
+		return fmt.Errorf("examining reviewer pipeline retry marker: %w", err)
+	}
+	return s.writePipelineRetry(*st.Role(state.RoleReviewer).PipelineWait, s.now())
 }
 
 // recoverQueuedReservation closes the two crash windows around an ordered

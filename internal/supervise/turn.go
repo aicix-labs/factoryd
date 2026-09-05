@@ -584,6 +584,7 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	var halted bool
 	var haltReason string
 	spin, fails := 0, 0
+	pipelineWaiting := false
 
 	if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
 		rs := st.Role(state.Role(s.role))
@@ -602,6 +603,14 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 			rs.QueueReservation = nil
 		}
 		rs.SetPending(toPending(remaining, ended))
+		// A clean reviewer turn that recorded a provider-confirmed pipeline
+		// wait made durable progress even when its wrapper has no separate
+		// progress touch. Credit the record, not a vanished trigger, so the
+		// spin guard cannot turn a self-clearing CI condition into a halt.
+		if s.role == string(state.RoleReviewer) && !failed && rs.PipelineWait != nil {
+			pipelineWaiting = true
+			progressed = true
+		}
 
 		if didConsume || progressed {
 			rs.SpinCount = 0
@@ -662,6 +671,30 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 			return true, s.haltNow(ended, fmt.Sprintf("could not write an after-turn retry before restarting for a failed submission-lease release (%v)", err))
 		}
 		return false, restartAfterTurn
+	}
+	if pipelineWaiting && !halted {
+		wait, err := s.reviewerPipelineWait()
+		if err != nil {
+			return true, s.haltNow(ended, fmt.Sprintf("could not read the durable reviewer pipeline wait after finalizing the turn (%v)", err))
+		}
+		if wait == nil {
+			// A concurrent, conclusive verdict can clear the wait after this
+			// turn recorded it but before we get the next state lock. That is
+			// success, not a broken handoff: its verdict's normal wake/retry
+			// path now owns the next review decision.
+			return false, nil
+		}
+		if err := s.writePipelineRetry(*wait, ended); err != nil {
+			return true, s.haltNow(ended, fmt.Sprintf("could not re-arm the reviewer after a pipeline wait (%v)", err))
+		}
+		s.log.Info("reviewer merge is waiting on CI; re-arming a review retry", "turn", turn.ID, "change", wait.ChangeID, "sha", wait.SHA, "retry", s.cfg.RetryPath(s.role))
+		if err := s.sleep(ctx, time.Minute); err != nil {
+			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+				return false, err
+			}
+			return false, err
+		}
+		return false, nil
 	}
 
 	if failed && didConsume && !halted && res.ExitCode == ExitAfterTurnFailed && afterTurnDisposition != DispositionTransient {
@@ -963,6 +996,34 @@ func (s *Supervisor) writeRetry(turn Turn, res TurnResult, fails int, at time.Ti
 			"The previous turn consumed its trigger and then failed. Nothing else is pending.\n",
 		fails, s.cfg.Supervisor.FailAbort, origin, step, briefLine, turn.ID, res.ExitCode, res.TimedOut, at.Format(time.RFC3339))
 	return os.WriteFile(path, []byte(body), 0o644)
+}
+
+// reviewerPipelineWait reads the durable wait after normal turn finalization.
+// It deliberately returns a copy: the state lock is released before the retry
+// marker is written, and another verdict may clear the wait in between.
+func (s *Supervisor) reviewerPipelineWait() (*state.PipelineWait, error) {
+	st, err := state.Load(s.cfg.StatePath(), s.cfg.Name)
+	if err != nil {
+		return nil, err
+	}
+	wait := st.Role(state.RoleReviewer).PipelineWait
+	if wait == nil {
+		return nil, nil
+	}
+	copy := *wait
+	return &copy, nil
+}
+
+// writePipelineRetry is the reviewer counterpart to writeRetry. Its authority
+// is the state record, so the marker carries explanatory continuity only; it
+// must be safe to recreate after a crash or after the agent deletes its own
+// trigger paths.
+func (s *Supervisor) writePipelineRetry(wait state.PipelineWait, at time.Time) error {
+	body := fmt.Sprintf(
+		"reviewer pipeline wait\norigin: provider pipeline\nstep: %s\nchange: %s\nsha: %s\nat: %s\n\n"+
+			"GitLab explicitly reported that CI or mergeability is still pending. Re-run the reviewer turn; do not convert this self-clearing condition into an operator-gated verdict.\n",
+		RetryStepTurn, wait.ChangeID, wait.SHA, at.Format(time.RFC3339))
+	return os.WriteFile(s.cfg.RetryPath(s.role), []byte(body), 0o644)
 }
 
 // Retry steps: what the retry marker re-arms. RetryStepTurn reruns the

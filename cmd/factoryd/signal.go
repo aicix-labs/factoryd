@@ -75,6 +75,10 @@ func runSignal(args []string) int {
 		}
 		return exitConfig
 	}
+	if res.PipelineWait != nil {
+		fmt.Printf("waiting for CI on %s at %s; reviewer retry scheduled: %s\n", res.PipelineWait.ChangeID, res.PipelineWait.SHA, res.PipelineWait.Reason)
+		return signal.ExitDone
+	}
 	fmt.Printf("%s %s at %s", res.Verdict.Kind, res.Verdict.ChangeID, res.Verdict.SHA)
 	if res.Verdict.MergeCommit != "" {
 		fmt.Printf(" merged as %s (verified)", res.Verdict.MergeCommit)

@@ -276,6 +276,29 @@ func TestNeedsMeNamesEachCondition(t *testing.T) {
 	}
 }
 
+// A provider-confirmed CI wait is work factoryd will resume itself. It must be
+// visible, but never masquerade as an operator-owned block or an unhealthy
+// factory.
+func TestPipelineWaitIsVisibleWithoutBecomingAnOperatorNeed(t *testing.T) {
+	l := newLab(t)
+	l.state(t, func(s *state.State) {
+		s.Role(state.RoleReviewer).PipelineWait = &state.PipelineWait{
+			ChangeID: "7", SHA: "abc123", Reason: "ci_must_pass", At: l.now,
+		}
+	})
+
+	s := l.collect()
+	if !s.Working || s.PipelineWait == nil {
+		t.Fatalf("working=%v pipeline_wait=%+v", s.Working, s.PipelineWait)
+	}
+	if len(s.NeedsMe) != 0 {
+		t.Fatalf("pipeline wait became an operator need: %v", s.NeedsMe)
+	}
+	if text := status.Text(s); !strings.Contains(text, "waiting on CI for 7 at abc123") {
+		t.Fatalf("text did not expose the CI wait:\n%s", text)
+	}
+}
+
 func TestTurnAndPendingAges(t *testing.T) {
 	l := newLab(t)
 	l.state(t, func(s *state.State) {

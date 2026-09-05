@@ -1619,6 +1619,105 @@ func TestRetryMarkerWithoutAStepRerunsTheTurn(t *testing.T) {
 	}
 }
 
+// A CI wait is not a failed review and not an operator obligation. The
+// reviewer may consume its ordinary wake, but the supervisor recreates its own
+// retry marker after the turn and re-runs the reviewer until a later verdict
+// clears the durable wait.
+func TestReviewerPipelineWaitRearmsAfterTheAgentConsumesItsWake(t *testing.T) {
+	fx := newFixture(t)
+	wake := fx.wake(t)
+	r := &fakeRunner{act: func(n int, tr supervise.Turn) supervise.TurnResult {
+		for _, trigger := range tr.Triggers {
+			_ = os.Remove(trigger.Path)
+		}
+		if n == 1 {
+			_, err := state.Update(fx.cfg.StatePath(), fx.cfg.Name, func(st *state.State) error {
+				return st.SetReviewerPipelineWait(state.PipelineWait{ChangeID: "42", SHA: "abc", Reason: "ci_must_pass", At: time.Now()})
+			})
+			if err != nil {
+				t.Errorf("recording pipeline wait: %v", err)
+			}
+			_ = os.Remove(wake)
+		} else {
+			_, err := state.Update(fx.cfg.StatePath(), fx.cfg.Name, func(st *state.State) error {
+				st.ClearReviewerPipelineWait("42")
+				return nil
+			})
+			if err != nil {
+				t.Errorf("clearing pipeline wait: %v", err)
+			}
+		}
+		return supervise.TurnResult{}
+	}}
+	s := fx.newSupervisor(t, r, 2)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r.count() != 2 {
+		t.Fatalf("reviewer ran %d turns, want pipeline retry", r.count())
+	}
+	if len(fx.slept) != 1 || fx.slept[0] != time.Minute {
+		t.Fatalf("pipeline wait sleeps=%v, want one one-minute retry delay", fx.slept)
+	}
+	rs := fx.roleState(t)
+	if rs.PipelineWait != nil || rs.CurrentTurn != nil || rs.LastTurn == nil || rs.Halted {
+		t.Fatalf("pipeline retry did not finalize/clear cleanly: %+v", rs)
+	}
+	if _, err := os.Stat(fx.cfg.RetryPath("reviewer")); !os.IsNotExist(err) {
+		t.Fatalf("pipeline retry marker survived a conclusive retry: %v", err)
+	}
+}
+
+// The ordinary wake can be gone when a supervisor is killed between a
+// successful `signal merged` pipeline response and its after-turn re-arm. The
+// durable state record, not that reviewer-writable wake, must resume the
+// review after restart.
+func TestReviewerPipelineWaitRecoversAfterSupervisorRestart(t *testing.T) {
+	fx := newFixture(t)
+	if _, err := state.Update(fx.cfg.StatePath(), fx.cfg.Name, func(st *state.State) error {
+		if err := st.SetReviewerPipelineWait(state.PipelineWait{ChangeID: "42", SHA: "abc", Reason: "ci_still_running", At: time.Now()}); err != nil {
+			return err
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	r := &fakeRunner{act: func(_ int, tr supervise.Turn) supervise.TurnResult {
+		if len(tr.Triggers) != 1 || tr.Triggers[0].Label != supervise.RetryLabel {
+			t.Errorf("recovered triggers=%+v, want one reviewer retry", tr.Triggers)
+		}
+		for _, trigger := range tr.Triggers {
+			_ = os.Remove(trigger.Path)
+		}
+		_, err := state.Update(fx.cfg.StatePath(), fx.cfg.Name, func(st *state.State) error {
+			st.ClearReviewerPipelineWait("42") // the resumed review completed.
+			return nil
+		})
+		if err != nil {
+			t.Errorf("clearing recovered pipeline wait: %v", err)
+		}
+		return supervise.TurnResult{}
+	}}
+	s := fx.newSupervisor(t, r, 1)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r.count() != 1 {
+		t.Fatalf("reviewer ran %d recovered turns, want 1", r.count())
+	}
+	rs := fx.roleState(t)
+	if rs.PipelineWait != nil || rs.CurrentTurn != nil || rs.LastTurn == nil || rs.Halted {
+		t.Fatalf("recovered pipeline retry did not finalize cleanly: %+v", rs)
+	}
+	if _, err := os.Stat(fx.cfg.RetryPath("reviewer")); !os.IsNotExist(err) {
+		t.Fatalf("recovered pipeline retry marker survived a conclusive retry: %v", err)
+	}
+}
+
 // A timed-out turn counts on the fail streak whatever the progress marker
 // says (#50 review): the turn was killed at its deadline, so nothing that
 // would have judged its work ran. Three timed-out turns that each touched

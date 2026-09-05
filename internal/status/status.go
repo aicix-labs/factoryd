@@ -49,6 +49,10 @@ type Snapshot struct {
 	// the active cycle when the operator has allowed the brief queue to keep
 	// moving, so an operator-owned wait never looks like producer rework.
 	OperatorGates []state.OperatorGate `json:"operator_gates,omitempty"`
+	// PipelineWait is a reviewer merge that GitLab explicitly deferred for CI.
+	// It is visible separately from NeedsMe because factoryd, not an operator,
+	// will re-attempt it.
+	PipelineWait *state.PipelineWait `json:"pipeline_wait,omitempty"`
 	// Errors are things the page could not read. They are shown, not
 	// hidden: a page that could not read the state document must not look
 	// like a page for an idle factory.
@@ -197,6 +201,10 @@ func (c *Collector) Collect(ctx context.Context) Snapshot {
 	s.Verdict = st.LastVerdict
 	s.VerdictRegistry = st.VerdictRegistry
 	s.OperatorGates = append(s.OperatorGates, st.OperatorGates...)
+	if wait := st.Role(state.RoleReviewer).PipelineWait; wait != nil {
+		copy := *wait
+		s.PipelineWait = &copy
+	}
 
 	for _, r := range state.Roles {
 		rs := st.Role(r)

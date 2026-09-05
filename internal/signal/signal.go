@@ -65,6 +65,10 @@ type Result struct {
 	// Audits are the audits found on the head, when the class required them.
 	Audits []scm.Audit
 	Path   string // the verdict file written
+	// PipelineWait is set instead of Verdict when the provider explicitly says
+	// CI/merge computation is the only reason a merge could not proceed. It is
+	// a successful, durable scheduling decision, not an operator-gated verdict.
+	PipelineWait *state.PipelineWait
 }
 
 // Run records a verdict. For "merged" it is the merge gate: it classifies
@@ -188,6 +192,24 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 			res.Verdict = v
 		case scm.MergeUnknown:
 			return res, &Error{Exit: ExitUnknown, Err: fmt.Errorf("merge of %s is UNKNOWN: %s", req.ID, mr.Reason)}
+		case scm.RefusedPipeline:
+			wait := state.PipelineWait{ChangeID: string(req.ID), SHA: sha, Reason: mr.Reason, At: now()}
+			if _, err := state.Update(cfg.StatePath(), cfg.Name, func(s *state.State) error {
+				return s.SetReviewerPipelineWait(wait)
+			}); err != nil {
+				return res, failed("recording the pipeline wait: %w", err)
+			}
+			// The durable state record is the authority if a supervisor crashes.
+			// This marker also wakes an already-idle reviewer supervisor when
+			// `factoryd signal` was run directly rather than from a current
+			// reviewer turn; without it, that supervisor would remain asleep in
+			// Watch and the truthful wait would not be self-resuming.
+			if err := writeReviewerPipelineRetry(cfg, wait); err != nil {
+				return res, failed("arming the reviewer pipeline retry: %w", err)
+			}
+			res.Verdict = state.Verdict{}
+			res.PipelineWait = &wait
+			return res, nil
 		default:
 			return res, refuse("provider refused to merge %s: %s (%s)", req.ID, mr.Reason, mr.Outcome)
 		}
@@ -203,6 +225,7 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 	res.Path = path
 	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(s *state.State) error {
 		s.LastVerdict = &v
+		s.ClearReviewerPipelineWait(v.ChangeID)
 		if err := s.RecordCycleReview(&v); err != nil {
 			return err
 		}
@@ -224,6 +247,9 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 		return nil
 	}); err != nil {
 		return res, failed("recording the verdict in state: %w", err)
+	}
+	if err := clearReviewerPipelineRetry(cfg, v.ChangeID); err != nil {
+		return res, failed("clearing the resolved reviewer pipeline retry: %w", err)
 	}
 	if err := deps.Driver.Comment(ctx, req.ID, commentFor(v, deps.Reviewer)); err != nil {
 		// The handoff is done and recorded; the comment is a courtesy to
@@ -381,6 +407,7 @@ func RecordMerged(ctx context.Context, cfg *config.Config, d scm.Driver, id scm.
 	}
 	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(s *state.State) error {
 		s.LastVerdict = &v
+		s.ClearReviewerPipelineWait(v.ChangeID)
 		s.ClearOperatorGate(v.ChangeID)
 		if c := s.Cycle; c != nil && ((c.Phase == state.CycleOpen && c.ChangeID == v.ChangeID) ||
 			(c.Phase == state.CycleSubmitting && v.Branch != "" && c.Digest == v.Branch)) {
@@ -391,5 +418,50 @@ func RecordMerged(ctx context.Context, cfg *config.Config, d scm.Driver, id scm.
 	}); err != nil {
 		return state.Verdict{}, "", fmt.Errorf("recording the verdict in state: %w", err)
 	}
+	if err := clearReviewerPipelineRetry(cfg, v.ChangeID); err != nil {
+		return state.Verdict{}, "", fmt.Errorf("clearing the resolved reviewer pipeline retry: %w", err)
+	}
 	return v, path, nil
+}
+
+// writeReviewerPipelineRetry gives an idle reviewer supervisor a watched
+// event after a direct signal. State remains the authority: supervise
+// recreates this marker if a crash occurs between recording the wait and this
+// write, and an agent cannot make a missing marker mean that CI cleared.
+func writeReviewerPipelineRetry(cfg *config.Config, wait state.PipelineWait) error {
+	body := fmt.Sprintf(
+		"reviewer pipeline wait\norigin: provider pipeline\nstep: turn\nchange: %s\nsha: %s\nat: %s\n\n"+
+			"GitLab explicitly reported that CI or mergeability is still pending. Re-run the reviewer turn; do not convert this self-clearing condition into an operator-gated verdict.\n",
+		wait.ChangeID, wait.SHA, wait.At.Format(time.RFC3339))
+	return os.WriteFile(cfg.RetryPath(string(state.RoleReviewer)), []byte(body), 0o644)
+}
+
+// clearReviewerPipelineRetry removes only the matching pipeline marker. A
+// normal retry may use the same filename, and a wait for another change must
+// never be mistaken for proof that this verdict resolved it.
+func clearReviewerPipelineRetry(cfg *config.Config, changeID string) error {
+	path := cfg.RetryPath(string(state.RoleReviewer))
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	origin, change := "", ""
+	for _, line := range strings.Split(string(raw), "\n") {
+		switch {
+		case strings.HasPrefix(line, "origin: "):
+			origin = strings.TrimPrefix(line, "origin: ")
+		case strings.HasPrefix(line, "change: "):
+			change = strings.TrimPrefix(line, "change: ")
+		}
+	}
+	if origin != "provider pipeline" || change != changeID {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
