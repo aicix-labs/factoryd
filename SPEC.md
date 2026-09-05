@@ -1143,7 +1143,11 @@ reads as a clean turn that achieved nothing — the spin counter moves, the fail
 streak does not (canary issue #27). The outcome must be derived from the
 observable effect: `examples/turn-wrapper.sh` runs the agent, and exits non-zero
 when `$FACTORYD_PROGRESS` did not move, passing the agent's own non-zero exit
-through unchanged. Wire agent CLIs through it, or an equivalent, never bare.
+through unchanged. It starts the agent in an isolated session and reaps helpers
+in that session before returning, so a leaked helper cannot contend with the
+next agent for shared state such as an OAuth refresh (`setsid` must be on the
+role's `PATH`). Wire agent CLIs through it, or an equivalent with both the
+progress and pre-return cleanup contracts, never bare.
 
 **Superseded drafts are retired by the reviewer** (#36). `submit` leaves what
 it supersedes open — a read is stale by the time a write lands, and no provider

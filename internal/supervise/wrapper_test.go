@@ -4,6 +4,8 @@ import (
 	"os"
 	"os/exec"
 	"path/filepath"
+	"strconv"
+	"syscall"
 	"testing"
 	"time"
 )
@@ -20,6 +22,9 @@ func TestTurnWrapperDerivesTheExitCodeFromProgress(t *testing.T) {
 	}
 	if _, err := exec.LookPath("sh"); err != nil {
 		t.Skip("no sh")
+	}
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("no setsid")
 	}
 	progress := filepath.Join(t.TempDir(), "producer-progress")
 	os.WriteFile(progress, nil, 0o644)
@@ -57,5 +62,47 @@ func TestTurnWrapperDerivesTheExitCodeFromProgress(t *testing.T) {
 	cmd.Env = []string{"PATH=" + os.Getenv("PATH")}
 	if err := cmd.Run(); err == nil {
 		t.Fatal("outside a supervisor (no FACTORYD_PROGRESS) the wrapper must refuse")
+	}
+}
+
+// The wrapped leader can exit cleanly while an agent helper keeps running.
+// Reaping that helper before the wrapper returns is different from the
+// runner's post-return containment: the next agent must never get a window to
+// contend with its predecessor for shared state such as an OAuth refresh.
+func TestTurnWrapperReapsAgentHelpersBeforeReturning(t *testing.T) {
+	wrapper, err := filepath.Abs(filepath.Join("..", "..", "examples", "turn-wrapper.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := exec.LookPath("sh"); err != nil {
+		t.Skip("no sh")
+	}
+	if _, err := exec.LookPath("setsid"); err != nil {
+		t.Skip("no setsid")
+	}
+	progress := filepath.Join(t.TempDir(), "progress")
+	childPID := filepath.Join(t.TempDir(), "helper-pid")
+	if err := os.WriteFile(progress, nil, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	cmd := exec.Command("sh", wrapper, "sh", "-c", `sleep 60 & echo "$!" > "$HELPER_PID"; touch "$FACTORYD_PROGRESS"`)
+	cmd.Env = []string{
+		"PATH=" + os.Getenv("PATH"),
+		"FACTORYD_PROGRESS=" + progress,
+		"HELPER_PID=" + childPID,
+	}
+	if out, err := cmd.CombinedOutput(); err != nil {
+		t.Fatalf("wrapper exited %v: %s", err, out)
+	}
+	b, err := os.ReadFile(childPID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	pid, err := strconv.Atoi(string(b[:len(b)-1]))
+	if err != nil {
+		t.Fatalf("helper pid %q: %v", b, err)
+	}
+	if err := syscall.Kill(pid, 0); err != syscall.ESRCH {
+		t.Fatalf("agent helper pid %d still exists after the wrapper returned: %v", pid, err)
 	}
 }

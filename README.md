@@ -61,6 +61,10 @@ files, the gate, no SCM remote or provider credential, the progress marker, and
 on a verdict what to do by kind: nothing for merged or operator-gated, the exact
 family for one changes-requested verdict per turn, the rest kept for their own
 turns — so a brief only describes work (SPEC §6.2).
+Its `turn-wrapper.sh` runs the agent in an isolated session and reaps any
+helpers it leaves behind before the next turn can start; `setsid` must be on
+the role's `PATH`. An equivalent wrapper must preserve both that cleanup and
+the progress-derived exit-code contract.
 
 `inbox/brief.md` remains the one-item compatibility channel. For sustained
 work, an operator can place lexical work orders in `inbox/briefs/` (for example

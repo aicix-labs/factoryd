@@ -431,9 +431,9 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	if runErr == nil && res.Leftover {
 		if s.progressMTime().After(before) {
 			hygiene = true
-			s.log.Error("turn left processes running after its leader exited; killed. The turn recorded progress, so it stands and is not retried", "turn", turn.ID)
+			s.log.Error("turn left processes running after its leader exited; killed. Leaked agent helpers can hold shared credential/OAuth refresh state; run the agent through the shipped turn-wrapper so it reaps helpers before returning. The turn recorded progress, so it stands and is not retried", "turn", turn.ID)
 		} else {
-			s.log.Error("turn left processes running after its leader exited and recorded no progress; killed, and counting the turn as failed", "turn", turn.ID)
+			s.log.Error("turn left processes running after its leader exited and recorded no progress; killed, and counting the turn as failed. Leaked agent helpers can hold shared credential/OAuth refresh state; run the agent through the shipped turn-wrapper so it reaps helpers before returning", "turn", turn.ID)
 			res.ExitCode = ExitLeftover
 		}
 	}
