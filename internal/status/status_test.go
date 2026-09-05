@@ -225,6 +225,11 @@ func TestNeedsMeNamesEachCondition(t *testing.T) {
 				s.LastVerdict = &state.Verdict{ChangeID: "7", Kind: state.VerdictOperatorGated, Summary: "touches auth"}
 			})
 		}, "change 7 is operator-gated: touches auth", true},
+		"operator-gated queue continuing": {func(l *lab, t *testing.T) {
+			l.state(t, func(s *state.State) {
+				s.OperatorGates = []state.OperatorGate{{ChangeID: "7", Branch: "producer/fix-abc", Family: "producer/fix", SHA: "abc", Summary: "CI host issue", GatedAt: l.now}}
+			})
+		}, "operator-gated change 7 awaits you: CI host issue", true},
 		"question waiting": {func(l *lab, t *testing.T) {
 			os.WriteFile(filepath.Join(l.cfg.InboxDir(), "question.md"), []byte("?"), 0o644)
 		}, "a question is waiting", true},

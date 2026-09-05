@@ -12,7 +12,7 @@ import (
 // runMigrate makes a legacy trust boundary explicit. A v1 verdict handoff was
 // writable by the producer, so migration cannot manufacture registry entries
 // from those bytes. Likewise, a pre-service-registry state cannot prove that
-// old long-running factoryd processes were stopped after an install.
+// old long-running factoryd processes were stopped before a state upgrade.
 func runMigrate(args []string) int {
 	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "factory config file")
@@ -45,7 +45,7 @@ func runMigrate(args []string) int {
 			fmt.Fprintf(os.Stderr, "factoryd migrate: service registry: %v\n", err)
 			return exitConfig
 		}
-		fmt.Fprintln(os.Stdout, "service registry ready; the operator attested that every pre-registry factoryd process, including supervisors and status/health services, was stopped or restarted")
+		fmt.Fprintln(os.Stdout, "service registry and state schema ready; the operator attested that every pre-upgrade factoryd process, including supervisors and status/health services, was stopped or restarted")
 		return exitOK
 	default:
 		fmt.Fprintln(os.Stderr, "usage: factoryd migrate --config <f> <verdict-registry|service-registry>")

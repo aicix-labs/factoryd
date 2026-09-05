@@ -45,6 +45,10 @@ type Snapshot struct {
 	// VerdictRegistry is explicit during an upgrade: a producer must not
 	// look idle when legacy outbox verdicts are blocked pending migration.
 	VerdictRegistry *state.VerdictRegistry `json:"verdict_registry,omitempty"`
+	// OperatorGates are open changes awaiting a human. They are separate from
+	// the active cycle when the operator has allowed the brief queue to keep
+	// moving, so an operator-owned wait never looks like producer rework.
+	OperatorGates []state.OperatorGate `json:"operator_gates,omitempty"`
 	// Errors are things the page could not read. They are shown, not
 	// hidden: a page that could not read the state document must not look
 	// like a page for an idle factory.
@@ -192,6 +196,7 @@ func (c *Collector) Collect(ctx context.Context) Snapshot {
 	}
 	s.Verdict = st.LastVerdict
 	s.VerdictRegistry = st.VerdictRegistry
+	s.OperatorGates = append(s.OperatorGates, st.OperatorGates...)
 
 	for _, r := range state.Roles {
 		rs := st.Role(r)
@@ -348,7 +353,14 @@ func needsMe(cfg *config.Config, s Snapshot, st *state.State) []string {
 			out = append(out, fmt.Sprintf("%s supervisor pid %d is dead and did not halt", r, v.Supervisor.PID))
 		}
 	}
-	if s.Verdict != nil && s.Verdict.Kind == state.VerdictOperatorGated {
+	for _, gate := range s.OperatorGates {
+		summary := gate.Summary
+		if summary == "" {
+			summary = "reviewer declared the producer finished"
+		}
+		out = append(out, fmt.Sprintf("operator-gated change %s awaits you: %s -- the brief queue is continuing by operator policy; merge or resolve it independently", gate.ChangeID, summary))
+	}
+	if s.Verdict != nil && s.Verdict.Kind == state.VerdictOperatorGated && !hasOperatorGate(s.OperatorGates, s.Verdict.ChangeID) {
 		out = append(out, fmt.Sprintf("change %s is operator-gated: %s", s.Verdict.ChangeID, s.Verdict.Summary))
 	}
 	if _, err := os.Lstat(filepath.Join(cfg.InboxDir(), "question.md")); err == nil {
@@ -370,6 +382,15 @@ func needsMe(cfg *config.Config, s Snapshot, st *state.State) []string {
 		out = append(out, "open changes are unknown: "+s.Changes.Err)
 	}
 	return out
+}
+
+func hasOperatorGate(gates []state.OperatorGate, changeID string) bool {
+	for _, gate := range gates {
+		if gate.ChangeID == changeID {
+			return true
+		}
+	}
+	return false
 }
 
 func working(s Snapshot) bool {

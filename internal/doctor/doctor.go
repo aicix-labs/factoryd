@@ -538,6 +538,11 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 
 	add("spin guard", nil, fmt.Sprintf("warn at %d turns with no progress, halt at %d; backoff %ds",
 		cfg.Supervisor.SpinWarn, cfg.Supervisor.SpinAbort, cfg.Supervisor.BackoffSeconds))
+	if cfg.Queue.ContinueWhileGated {
+		add("brief queue policy", nil, "continues after an exact operator-gated verdict; two open changes may conflict when merged")
+	} else {
+		add("brief queue policy", nil, "waits behind every open draft (default conservative policy)")
+	}
 
 	// An install replaces the path's inode but not a process that already has
 	// it mapped. systemd then truthfully says the old process is active, while

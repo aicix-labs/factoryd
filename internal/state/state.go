@@ -32,8 +32,9 @@ import (
 // for long-running status and health services, so an older binary cannot
 // silently erase the record that doctor uses to detect a replaced executable.
 // v4 refuses to mistake an empty v3 service map for proof that no pre-registry
-// status or health process remains alive.
-const SchemaVersion = 4
+// status or health process remains alive. v5 records open changes deliberately
+// left to the operator while the opt-in brief queue starts independent work.
+const SchemaVersion = 5
 
 var (
 	// ErrProducerLifecycleBusy means a queued handoff or admitted producer
@@ -51,6 +52,10 @@ var (
 	// service handles, so an operator must complete the restart sweep before
 	// doctor or a new long-running service can trust the registry.
 	ErrServiceRegistryMigrationRequired = errors.New("service registry migration required")
+	// ErrSchemaMigrationRequired prevents an old state writer from being
+	// stranded by a new schema before the operator has completed the required
+	// all-process restart sweep.
+	ErrSchemaMigrationRequired = errors.New("state schema migration required")
 )
 
 // Role is one of the two agent roles.
@@ -529,6 +534,19 @@ type Cycle struct {
 	UpdatedAt time.Time `json:"updated_at"`
 }
 
+// OperatorGate is an open change the reviewer declared complete from the
+// producer's perspective, but which a human still has to merge or otherwise
+// resolve. It is retained separately from Cycle when the operator has opted
+// into starting a later queued brief beside it.
+type OperatorGate struct {
+	ChangeID string    `json:"change_id"`
+	Branch   string    `json:"branch"`
+	Family   string    `json:"family"`
+	SHA      string    `json:"sha"`
+	Summary  string    `json:"summary"`
+	GatedAt  time.Time `json:"gated_at"`
+}
+
 // SetCycle moves the cycle to phase, keeping identifiers unless the phase
 // starts over.
 func (s *State) SetCycle(phase string, now time.Time) *Cycle {
@@ -727,6 +745,15 @@ type State struct {
 	// only its own handle on exit. This lets doctor distinguish a stopped
 	// service from one still executing an inode an install replaced.
 	Services map[Service]*proc.Ref `json:"services,omitempty"`
+	// OperatorGates are open changes that the producer no longer owes work on.
+	// They stay visible while an explicitly opted-in queue advances to another
+	// brief, so the active Cycle never overwrites an operator obligation.
+	OperatorGates []OperatorGate `json:"operator_gates,omitempty"`
+
+	// schemaMigrationFrom is runtime-only. Load sets it for a state written by
+	// an older binary; Save refuses to promote that document until the explicit
+	// migration has proved all old state writers are stopped.
+	schemaMigrationFrom int
 }
 
 // Condition is one standing health condition.
@@ -821,6 +848,54 @@ func (s *State) ReleaseService(service Service, holder proc.Ref) {
 	}
 }
 
+// DeferOperatorGatedCycle records an open cycle as owned by the operator. The
+// verdict must be the reviewer decision for that exact open change; a stale
+// operator-gated verdict is never authority to start another draft.
+func (s *State) DeferOperatorGatedCycle(v *Verdict, now time.Time) error {
+	if v == nil || v.Kind != VerdictOperatorGated {
+		return errors.New("state: no operator-gated verdict authorizes queue continuation")
+	}
+	c := s.Cycle
+	if c == nil || c.Phase != CycleOpen || c.ChangeID == "" || c.ChangeID != v.ChangeID {
+		return errors.New("state: operator-gated verdict does not name the open cycle")
+	}
+	if v.Branch == "" || v.DeclaredBranch == "" || v.SHA == "" {
+		return errors.New("state: operator-gated verdict has incomplete lineage")
+	}
+	if c.Family == "" || c.Digest == "" || c.Family != v.DeclaredBranch || c.Digest != v.Branch {
+		return errors.New("state: operator-gated verdict lineage does not match the open cycle")
+	}
+	for _, gate := range s.OperatorGates {
+		if gate.ChangeID == v.ChangeID {
+			return nil
+		}
+	}
+	s.OperatorGates = append(s.OperatorGates, OperatorGate{
+		ChangeID: v.ChangeID,
+		Branch:   v.Branch,
+		Family:   v.DeclaredBranch,
+		SHA:      v.SHA,
+		Summary:  v.Summary,
+		GatedAt:  now,
+	})
+	return nil
+}
+
+// ClearOperatorGate removes a human obligation after factoryd has verified
+// the operator merged that specific change.
+func (s *State) ClearOperatorGate(changeID string) {
+	for i := range s.OperatorGates {
+		if s.OperatorGates[i].ChangeID == changeID {
+			s.OperatorGates = append(s.OperatorGates[:i], s.OperatorGates[i+1:]...)
+			return
+		}
+	}
+}
+
+// schemaMigrationAllowed lets the explicit migration save a state in the
+// current schema after it has established that no old process can write it.
+func (s *State) schemaMigrationAllowed() { s.schemaMigrationFrom = 0 }
+
 // VerdictsReady reports whether this state can admit a producer outbox
 // verdict. A nil registry is never ready; nil is only possible for a corrupt
 // current-schema document because v1 is converted to an explicit blocked
@@ -903,6 +978,16 @@ func (s *State) Validate() error {
 			return fmt.Errorf("state: service %s has an incomplete process handle", service)
 		}
 	}
+	seenGates := map[string]bool{}
+	for i, gate := range s.OperatorGates {
+		if gate.ChangeID == "" || gate.Branch == "" || gate.Family == "" || gate.SHA == "" || gate.GatedAt.IsZero() {
+			return fmt.Errorf("state: operator gate[%d] is incomplete", i)
+		}
+		if seenGates[gate.ChangeID] {
+			return fmt.Errorf("state: operator gate %q is recorded more than once", gate.ChangeID)
+		}
+		seenGates[gate.ChangeID] = true
+	}
 	if c := s.Cycle; c != nil {
 		switch c.Phase {
 		case CycleNew, CycleWorking, CycleSubmitting, CycleOpen, CycleFinished, CycleClean, CycleUnknown:
@@ -954,18 +1039,22 @@ func Load(path, factory string) (*State, error) {
 	}
 	legacyVerdictRegistry := false
 	legacyServiceRegistry := false
+	legacySchema := 0
 	switch probe.SchemaVersion {
 	case SchemaVersion:
-	case 3, 2:
-		// Neither v2 nor v3 can inventory pre-registry status/health services.
+	case 4, 3, 2:
+		// Neither older schema can inventory every current long-running
+		// process or preserve the operator-gated queue records v5 adds.
 		// Their empty Services maps prove nothing: a process started by an old
 		// binary has no handle to put there. Preserve that uncertainty as a
 		// durable blocked record rather than promoting it to an empty trusted
 		// registry.
 		legacyServiceRegistry = true
+		legacySchema = probe.SchemaVersion
 	case 1:
 		legacyVerdictRegistry = true
 		legacyServiceRegistry = true
+		legacySchema = probe.SchemaVersion
 	case 0:
 		return nil, fmt.Errorf("%s: no schema_version; refusing to guess which schema this is", path)
 	default:
@@ -984,7 +1073,7 @@ func Load(path, factory string) (*State, error) {
 		s.SchemaVersion = SchemaVersion
 		s.ServiceRegistry = &ServiceRegistry{
 			Status:    ServiceRegistryMigrationRequired,
-			Reason:    "state predates the long-running service registry; stop or restart every pre-registry factoryd process, including producer/reviewer supervisors and `factoryd status --serve`/`factoryd health --loop`, then have the operator run `factoryd migrate --config <file> service-registry`",
+			Reason:    "state predates the complete long-running process and operator-gated queue registries; stop or restart every pre-upgrade factoryd process, including producer/reviewer supervisors and `factoryd status --serve`/`factoryd health --loop`, then have the operator run `factoryd migrate --config <file> service-registry`",
 			BlockedAt: time.Now().UTC(),
 		}
 	}
@@ -1012,6 +1101,7 @@ func Load(path, factory string) (*State, error) {
 	for _, r := range Roles {
 		s.Role(r)
 	}
+	s.schemaMigrationFrom = legacySchema
 	return &s, nil
 }
 
@@ -1019,6 +1109,9 @@ func Load(path, factory string) (*State, error) {
 // fsynced, then renamed over the target. A reader either sees the previous
 // document or the new one, never a half-written one.
 func (s *State) Save(path string) error {
+	if s.schemaMigrationFrom != 0 {
+		return fmt.Errorf("%w: state schema v%d cannot be promoted to v%d until `factoryd migrate --config <file> service-registry` completes the all-process restart sweep", ErrSchemaMigrationRequired, s.schemaMigrationFrom, SchemaVersion)
+	}
 	s.SchemaVersion = SchemaVersion
 	s.UpdatedAt = time.Now().UTC()
 	if err := s.Validate(); err != nil {
@@ -1071,6 +1164,15 @@ func (s *State) Save(path string) error {
 // The lock matters because the document is shared between both roles'"'"'
 // supervisors. Load-then-Save without it loses whichever update landed first.
 func Update(path, factory string, fn func(*State) error) (*State, error) {
+	return update(path, factory, false, fn)
+}
+
+// update runs a state mutation under the document lock. A state from an older
+// schema is refused before fn runs: some callers perform a guarded refresh or
+// another external action inside fn, and discovering the schema barrier only
+// at Save would leave that action applied without its write-ahead record.
+// Only the explicit migration path is allowed to cross this boundary.
+func update(path, factory string, allowSchemaMigration bool, fn func(*State) error) (*State, error) {
 	unlock, err := lock(path)
 	if err != nil {
 		return nil, err
@@ -1081,6 +1183,9 @@ func Update(path, factory string, fn func(*State) error) (*State, error) {
 	if err != nil {
 		return nil, err
 	}
+	if s.schemaMigrationFrom != 0 && !allowSchemaMigration {
+		return nil, fmt.Errorf("%w: state schema v%d cannot be changed until `factoryd migrate --config <file> service-registry` completes the all-process restart sweep", ErrSchemaMigrationRequired, s.schemaMigrationFrom)
+	}
 	if err := fn(s); err != nil {
 		return nil, err
 	}
@@ -1090,6 +1195,10 @@ func Update(path, factory string, fn func(*State) error) (*State, error) {
 	return s, nil
 }
 
+func updateForSchemaMigration(path, factory string, fn func(*State) error) (*State, error) {
+	return update(path, factory, true, fn)
+}
+
 // MigrateVerdictRegistry explicitly retires every pre-registry verdict file
 // before allowing a v1 state to become registry-aware. The files are retained
 // as .legacy-untrusted evidence; they are never registered from their old
@@ -1097,7 +1206,13 @@ func Update(path, factory string, fn func(*State) error) (*State, error) {
 // factoryd after this returns.
 func MigrateVerdictRegistry(path, factory, outbox string) ([]string, error) {
 	var moved []string
-	_, err := Update(path, factory, func(s *State) error {
+	_, err := updateForSchemaMigration(path, factory, func(s *State) error {
+		if s.schemaMigrationFrom != 0 {
+			if err := requireAllFactorydProcessesStopped(s); err != nil {
+				return err
+			}
+			s.schemaMigrationAllowed()
+		}
 		if s.VerdictRegistry.Ready() {
 			return nil
 		}
@@ -1149,8 +1264,8 @@ func MigrateVerdictRegistry(path, factory, outbox string) ([]string, error) {
 // supervisor cannot load. After the attestation only services started by this
 // build may claim a fresh exact handle.
 func MigrateServiceRegistry(path, factory string) error {
-	_, err := Update(path, factory, func(s *State) error {
-		if s.ServiceRegistry.Ready() {
+	_, err := updateForSchemaMigration(path, factory, func(s *State) error {
+		if s.ServiceRegistry.Ready() && s.schemaMigrationFrom == 0 {
 			return nil
 		}
 		if err := s.ServiceRegistry.MigrationError(); err != nil {
@@ -1171,15 +1286,8 @@ func MigrateServiceRegistry(path, factory string) error {
 			}
 			return nil
 		}
-		for _, role := range Roles {
-			if err := requireStopped(string(role)+" supervisor", s.Role(role).Supervisor); err != nil {
-				return err
-			}
-		}
-		for _, service := range Services {
-			if err := requireStopped(string(service)+" service", s.Service(service)); err != nil {
-				return err
-			}
+		if err := requireAllFactorydProcessesStoppedWith(s, requireStopped); err != nil {
+			return err
 		}
 		// Any remaining handles name dead processes. The post-attestation
 		// inventory begins empty and is populated only by fresh claims.
@@ -1189,9 +1297,44 @@ func MigrateServiceRegistry(path, factory string) error {
 			AttestedAt:  time.Now().UTC(),
 			Attestation: "operator attested that every pre-registry factoryd process, including supervisors and status/health services, was stopped or restarted",
 		}
+		s.schemaMigrationAllowed()
 		return nil
 	})
 	return err
+}
+
+// requireAllFactorydProcessesStopped is the schema-upgrade barrier. A
+// previous binary can write state too, so a newer schema is safe only after
+// every exact process handle is dead; otherwise its next update would stall
+// against an unreadable document.
+func requireAllFactorydProcessesStopped(s *State) error {
+	return requireAllFactorydProcessesStoppedWith(s, func(label string, ref *proc.Ref) error {
+		if ref == nil {
+			return nil
+		}
+		alive, err := ref.Alive()
+		if err != nil {
+			return fmt.Errorf("cannot prove recorded %s %s is gone: %w", label, ref, err)
+		}
+		if alive {
+			return fmt.Errorf("recorded %s %s is still live; stop it before the all-process restart sweep", label, ref)
+		}
+		return nil
+	})
+}
+
+func requireAllFactorydProcessesStoppedWith(s *State, requireStopped func(string, *proc.Ref) error) error {
+	for _, role := range Roles {
+		if err := requireStopped(string(role)+" supervisor", s.Role(role).Supervisor); err != nil {
+			return err
+		}
+	}
+	for _, service := range Services {
+		if err := requireStopped(string(service)+" service", s.Service(service)); err != nil {
+			return err
+		}
+	}
+	return nil
 }
 
 func legacyVerdictPath(src string) (string, error) {

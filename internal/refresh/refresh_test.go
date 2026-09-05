@@ -484,6 +484,9 @@ func TestStateWithoutCycleIsNeverRefreshed(t *testing.T) {
 	if err := os.WriteFile(e.cfg.StatePath(), []byte(legacy), 0o644); err != nil {
 		t.Fatal(err)
 	}
+	if err := state.MigrateServiceRegistry(e.cfg.StatePath(), e.cfg.Name); err != nil {
+		t.Fatal(err)
+	}
 	e.edit(t, "in-flight.go", "a draft the old binary opened")
 	e.wake(t)
 	r := &scriptedRunner{act: func(int, supervise.Turn) supervise.TurnResult { e.progress(t); return supervise.TurnResult{} }}
@@ -860,6 +863,104 @@ func TestQueueStartReconcilesAndReservesAnOperatorMergedCycle(t *testing.T) {
 	q := st.Role(state.RoleProducer).QueueReservation
 	if st.Cycle == nil || st.Cycle.Phase != state.CycleWorking || st.Cycle.Base != "abc123" || q == nil || q.Source != filepath.Join(cfg.BriefsDir(), "010-next.md") || q.Taken || f.calls != 1 || f.ancCalls != 1 {
 		t.Fatalf("cycle=%+v lookup=%d ancestor=%d", st.Cycle, f.calls, f.ancCalls)
+	}
+}
+
+// The queue only moves beside a draft when the operator explicitly enables
+// the policy AND the reviewer has declared this exact open change
+// operator-gated. The old change is retained as an operator obligation before
+// the active cycle is reset for the next immutable brief.
+func TestQueueStartContinuesBesideAnOperatorGatedCycleWhenEnabled(t *testing.T) {
+	cfg := cfgFor(t)
+	cfg.Queue.ContinueWhileGated = true
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.ChangeID, c.Family, c.Digest = "55", "feat/x", "feat/x-abc"
+		st.LastVerdict = &state.Verdict{ChangeID: "55", Kind: state.VerdictOperatorGated, Branch: "feat/x-abc", DeclaredBranch: "feat/x", SHA: "abc", Summary: "CI host needs an operator"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f := &lookupFake{state: scm.StateOpen}
+	started, note, err := refresh.QueueStart(cfg, func(context.Context) (refresh.Deps, error) {
+		return refresh.Deps{
+			Fetch:    func(context.Context, string) error { return nil },
+			Bundle:   func(context.Context, string, string) (string, error) { return "next-base", nil },
+			Apply:    func(context.Context, string, string) (string, error) { return "next-base", nil },
+			Lookup:   f.get,
+			Ancestor: f.ancestor,
+		}, nil
+	})(context.Background(), supervise.Turn{ID: "queue-gated", Role: "producer", Triggers: []watch.Trigger{{
+		Label: brief.Label, Path: filepath.Join(cfg.BriefsDir(), "010-next.md"),
+	}}})
+	if err != nil || !started || !strings.Contains(note, "workdir refreshed") {
+		t.Fatalf("started=%v note=%q err=%v", started, note, err)
+	}
+	st, err := state.Load(cfg.StatePath(), cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Cycle == nil || st.Cycle.Phase != state.CycleWorking || st.Cycle.Base != "next-base" || st.Role(state.RoleProducer).QueueReservation == nil {
+		t.Fatalf("queue continuation did not reserve the next cycle: cycle=%+v role=%+v", st.Cycle, st.Role(state.RoleProducer))
+	}
+	if len(st.OperatorGates) != 1 || st.OperatorGates[0].ChangeID != "55" || st.OperatorGates[0].Summary != "CI host needs an operator" {
+		t.Fatalf("operator-gated change was not retained: %+v", st.OperatorGates)
+	}
+}
+
+func TestQueueStartDefersOperatorGatedCycleByDefault(t *testing.T) {
+	cfg := cfgFor(t) // ContinueWhileGated is intentionally false by default.
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.ChangeID, c.Family, c.Digest = "55", "feat/x", "feat/x-abc"
+		st.LastVerdict = &state.Verdict{ChangeID: "55", Kind: state.VerdictOperatorGated, Branch: "feat/x-abc", DeclaredBranch: "feat/x", SHA: "abc"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f := &lookupFake{state: scm.StateOpen}
+	var fetched bool
+	started, note, err := refresh.QueueStart(cfg, func(context.Context) (refresh.Deps, error) {
+		return refresh.Deps{Fetch: func(context.Context, string) error { fetched = true; return nil }, Lookup: f.get, Ancestor: f.ancestor}, nil
+	})(context.Background(), supervise.Turn{ID: "queue-default", Role: "producer", Triggers: []watch.Trigger{{
+		Label: brief.Label, Path: filepath.Join(cfg.BriefsDir(), "010-next.md"),
+	}}})
+	if err != nil || started || !strings.Contains(note, "cycle is open") {
+		t.Fatalf("started=%v note=%q err=%v, want conservative deferral", started, note, err)
+	}
+	if fetched {
+		t.Fatal("default queue policy refreshed beside an operator-gated draft")
+	}
+}
+
+func TestQueueStartNeverContinuesChangesRequestedEvenWhenEnabled(t *testing.T) {
+	cfg := cfgFor(t)
+	cfg.Queue.ContinueWhileGated = true
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.ChangeID, c.Family, c.Digest = "55", "feat/x", "feat/x-abc"
+		st.LastVerdict = &state.Verdict{ChangeID: "55", Kind: state.VerdictChangesRequested, Branch: "feat/x-abc", DeclaredBranch: "feat/x", SHA: "abc"}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f := &lookupFake{state: scm.StateOpen}
+	var fetched, bundled, applied bool
+	started, note, err := refresh.QueueStart(cfg, func(context.Context) (refresh.Deps, error) {
+		return refresh.Deps{
+			Fetch:  func(context.Context, string) error { fetched = true; return nil },
+			Bundle: func(context.Context, string, string) (string, error) { bundled = true; return "", nil },
+			Apply:  func(context.Context, string, string) (string, error) { applied = true; return "", nil },
+			Lookup: f.get, Ancestor: f.ancestor,
+		}, nil
+	})(context.Background(), supervise.Turn{ID: "queue-changes-requested", Role: "producer", Triggers: []watch.Trigger{{
+		Label: brief.Label, Path: filepath.Join(cfg.BriefsDir(), "010-next.md"),
+	}}})
+	if err != nil || started || !strings.Contains(note, "cycle is open") {
+		t.Fatalf("started=%v note=%q err=%v, want changes-requested deferral", started, note, err)
+	}
+	if fetched || bundled || applied {
+		t.Fatalf("queue refreshed beside changes-requested work: fetch=%v bundle=%v apply=%v", fetched, bundled, applied)
 	}
 }
 

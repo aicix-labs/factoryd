@@ -358,6 +358,16 @@ func QueueStart(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 			}
 			var why string
 			canStart, why := Decide(st)
+			continueWhileGated := false
+			if !canStart && cfg.Queue.ContinueWhileGated && isOperatorGatedOpenCycle(st) {
+				// The reviewer said the producer owes no more work on this
+				// change. The operator explicitly chose the throughput tradeoff:
+				// preserve that change as an operator obligation, then refresh
+				// from target for the next independent queued brief.
+				canStart = true
+				continueWhileGated = true
+				why = ""
+			}
 			if !canStart {
 				if note != "" {
 					note += "; "
@@ -375,6 +385,11 @@ func QueueStart(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 			r, err := Run(ctx, cfg, deps)
 			if err != nil {
 				return err
+			}
+			if continueWhileGated {
+				if err := st.DeferOperatorGatedCycle(st.LastVerdict, time.Now()); err != nil {
+					return err
+				}
 			}
 			st.SetCycle(state.CycleNew, time.Now()).Base = r.SHA
 			// The current turn was recorded before entering QueueStart. Keep the
@@ -395,6 +410,21 @@ func QueueStart(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 		}
 		return started, note, nil
 	}
+}
+
+// isOperatorGatedOpenCycle is deliberately stricter than LastVerdict's kind:
+// only the review decision for this exact open cycle can authorize independent
+// queued work. A stale decision on a prior change must not turn a live draft
+// into a refreshable worktree.
+func isOperatorGatedOpenCycle(st *state.State) bool {
+	if st == nil || st.Cycle == nil || st.Cycle.Phase != state.CycleOpen || st.Cycle.ChangeID == "" || st.LastVerdict == nil {
+		return false
+	}
+	v := st.LastVerdict
+	return v.Kind == state.VerdictOperatorGated &&
+		v.ChangeID == st.Cycle.ChangeID &&
+		v.Branch != "" && v.DeclaredBranch != "" && v.SHA != "" &&
+		st.Cycle.Family == v.DeclaredBranch && st.Cycle.Digest == v.Branch
 }
 
 func queuedBriefPaths(cfg *config.Config, triggers []watch.Trigger) (source, done string, err error) {
