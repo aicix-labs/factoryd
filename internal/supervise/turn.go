@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aicix-labs/factoryd/internal/brief"
 	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/watch"
@@ -184,7 +185,20 @@ func consumed(acted []watch.Trigger, remaining []watch.Trigger) bool {
 type admittedTurn struct {
 	Triggers []watch.Trigger
 	Verdicts []VerifiedVerdict
+	// QueueTaken is a durable queue reservation recovered after a restart. Its
+	// source no longer exists because factoryd had already moved it to done/;
+	// oneTurn resumes the same handoff rather than waiting forever for a file
+	// that correctly will not reappear.
+	QueueTaken bool
 }
+
+// turnDeferredError means producer-worktree admission was refused. It is not
+// a failed agent turn: Run sleeps and waits for a real state change after
+// oneTurn has cleared (or avoided creating) a provisional CurrentTurn record.
+// It covers queued briefs and every legacy producer trigger alike.
+type turnDeferredError struct{ reason string }
+
+func (e *turnDeferredError) Error() string { return "producer turn deferred: " + e.reason }
 
 // oneTurn runs exactly one agent turn and applies the spin guard. It reports
 // whether the supervisor halted.
@@ -204,13 +218,39 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 
 	// Record the pending triggers and the turn before running anything, so a
 	// supervisor killed mid-turn leaves evidence of what it was doing.
+	deferredReason := ""
 	if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		if s.role == "producer" {
+			if err := st.PermitProducerWorktreeUse(); err != nil {
+				deferredReason = err.Error()
+				return nil
+			}
+		}
 		rs := st.Role(state.Role(s.role))
 		rs.SetPending(toPending(triggers, now))
 		rs.CurrentTurn = &state.Turn{ID: turn.ID, StartedAt: now, Trigger: labels(triggers)}
 		return nil
 	}); err != nil {
 		return false, err
+	}
+	if deferredReason != "" {
+		s.turnSeq-- // an admission deferral is not a turn
+		return false, &turnDeferredError{reason: deferredReason}
+	}
+
+	queuedSource, queuedDone, queued := queuedBriefPaths(s.cfg, triggers)
+	if queued && !admitted.QueueTaken {
+		started, reason, err := s.startQueuedCycle(ctx, turn)
+		if err != nil {
+			return false, err
+		}
+		if !started {
+			if err := s.clearDeferredTurn(turn, triggers); err != nil {
+				return false, err
+			}
+			s.turnSeq-- // it was an admission check, not an agent turn
+			return false, &turnDeferredError{reason: reason}
+		}
 	}
 
 	before := s.progressMTime()
@@ -228,8 +268,66 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 		skipped = true
 		s.log.Info("retry resumes the after-turn step; the agent does not rerun", "turn", turn.ID)
 	}
-	if s.beforeTurn != nil && !resumeAfterTurn {
+	// A queue entry is factoryd-taken, never producer-deleted. The lifecycle
+	// reservation check and the filesystem move are one state-locked action;
+	// a root-side transition cannot open the cycle in the old check/take gap.
+	if queued && !resumeAfterTurn {
+		if !admitted.QueueTaken {
+			var taken bool
+			var reason string
+			var err error
+			queuedDone, taken, reason, err = s.takeQueuedBrief(turn, queuedSource)
+			if err != nil {
+				return false, err
+			}
+			if !taken {
+				s.log.Warn("queued brief was not taken because its lifecycle reservation was lost", "turn", turn.ID, "reason", reason)
+				res, skipped = TurnResult{ExitCode: ExitBeforeTurnFailed}, true
+			}
+		}
+		if !skipped {
+			if s.afterQueuedTake != nil {
+				s.afterQueuedTake()
+			}
+			// The post-handoff confirmation catches a root operation that began
+			// immediately after the atomic move. If it won the next lock, put
+			// the file back and refuse rather than launch beside its draft.
+			confirmed, reason, err := s.confirmQueuedBriefHandoff(turn, queuedSource, queuedDone)
+			if err != nil {
+				return false, err
+			}
+			if !confirmed {
+				s.log.Warn("queued brief restored because its lifecycle changed after handoff", "turn", turn.ID, "reason", reason)
+				res, skipped = TurnResult{ExitCode: ExitBeforeTurnFailed}, true
+			} else if s.afterQueuedConfirm != nil {
+				s.afterQueuedConfirm()
+			}
+		}
+	}
+	// QueueStart already refreshed and reserved the cycle under the state lock.
+	// Calling BeforeTurn again would only inspect the expected working state;
+	// more importantly, it would reintroduce a lifecycle decision after the
+	// queue entry was selected.
+	if s.beforeTurn != nil && !queued && !resumeAfterTurn && !skipped {
 		msg, err := s.beforeTurn(ctx, turn)
+		if err != nil && errors.Is(err, state.ErrProducerWorktreeBusy) {
+			// Submit may have acquired the worktree lease after the generic
+			// admission check but before BeforeTurn took its state lock. Do
+			// not turn that race into a failed agent turn; no refresh or agent
+			// command has run, so clear the provisional record and wait.
+			if clearErr := s.clearDeferredTurn(turn, triggers); clearErr != nil {
+				return false, clearErr
+			}
+			s.turnSeq--
+			return false, &turnDeferredError{reason: err.Error()}
+		}
+		if err != nil && queuedDone != "" {
+			if restoreErr := brief.Restore(s.cfg, queuedSource, queuedDone); restoreErr != nil {
+				s.log.Error("could not restore queued brief after preparation failed", "turn", turn.ID, "err", restoreErr)
+			} else {
+				queuedDone = ""
+			}
+		}
 		if err != nil && ctx.Err() == nil {
 			// The agent does not run over a tree the step could not prepare.
 			// A failed turn, on the streak, with the triggers left pending.
@@ -240,16 +338,30 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 		}
 	}
 	if !skipped {
+		if queued {
+			if err := s.markQueuedProcessLaunching(turn); err != nil {
+				return false, err
+			}
+		}
 		res, runErr = s.runner.Run(ctx, turn, func(p proc.Ref) {
 			if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
-				if t := st.Role(state.Role(s.role)).CurrentTurn; t != nil && t.ID == turn.ID {
+				rs := st.Role(state.Role(s.role))
+				if t := rs.CurrentTurn; t != nil && t.ID == turn.ID {
 					t.Process = &p
+				}
+				if q := rs.QueueReservation; q != nil && q.Turn == turn.ID {
+					q.ProcessStarted = true
 				}
 				return nil
 			}); err != nil {
 				s.log.Warn("could not record the turn's process", "turn", turn.ID, "err", err)
 			}
 		})
+		if queued {
+			if err := s.markQueuedProcessFinished(turn); err != nil {
+				s.log.Warn("could not record queued producer process completion", "turn", turn.ID, "err", err)
+			}
+		}
 	}
 
 	ended := s.now()
@@ -271,6 +383,9 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 			}
 			rs.LastTurn = &t
 			rs.CurrentTurn = nil
+			if q := rs.QueueReservation; q != nil && q.Turn == turn.ID {
+				rs.QueueReservation = nil
+			}
 			return nil
 		}); err != nil {
 			s.log.Warn("could not record the interrupted turn", "turn", turn.ID, "err", err)
@@ -326,11 +441,15 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	// producer). Its failure is the turn's failure.
 	afterTurnDisposition := DispositionTransient
 	afterTurnSucceeded := runErr == nil && res.ExitCode == 0 && !res.TimedOut
+	var restartAfterTurn error
 	if runErr == nil && res.ExitCode == 0 && !res.TimedOut && s.afterTurn != nil {
 		msg, err := s.afterTurn(ctx, turn, res)
 		if err != nil {
 			afterTurnSucceeded = false
 			afterTurnDisposition = DispositionOf(err)
+			if RequiresRestart(err) {
+				restartAfterTurn = err
+			}
 			s.log.Error("after-turn step failed; counting the turn as failed", "turn", turn.ID, "disposition", string(afterTurnDisposition), "err", err)
 			res.ExitCode = ExitAfterTurnFailed
 		} else if msg != "" {
@@ -479,6 +598,9 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 		}
 		rs.LastTurn = &t
 		rs.CurrentTurn = nil
+		if q := rs.QueueReservation; q != nil && q.Turn == turn.ID {
+			rs.QueueReservation = nil
+		}
 		rs.SetPending(toPending(remaining, ended))
 
 		if didConsume || progressed {
@@ -529,6 +651,18 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	s.log.Info("turn finished",
 		"turn", turn.ID, "exit", res.ExitCode, "timed_out", res.TimedOut,
 		"consumed", didConsume, "progressed", progressed, "spin", spin, "fail_streak", fails)
+	if restartAfterTurn != nil {
+		// The final state write above cleared CurrentTurn and recorded LastTurn
+		// before this return. Exiting now makes a failed submission-lease
+		// release recoverable by liveness on the next supervisor start. Re-arm
+		// the root-side step first: the agent already completed, but a restart
+		// after a consumed trigger must not idle with its declared intent
+		// stranded.
+		if err := s.writeRetry(turn, res, fails, ended, RetryStepAfterTurn); err != nil {
+			return true, s.haltNow(ended, fmt.Sprintf("could not write an after-turn retry before restarting for a failed submission-lease release (%v)", err))
+		}
+		return false, restartAfterTurn
+	}
 
 	if failed && didConsume && !halted && res.ExitCode == ExitAfterTurnFailed && afterTurnDisposition != DispositionTransient {
 		// A blocked or unknown after-turn failure arms nothing: blocked
@@ -615,6 +749,139 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	}
 }
 
+// clearDeferredTurn removes the provisional CurrentTurn created before a
+// producer-worktree admission check. A deferred brief, answer, verdict, or
+// retry is not a failed agent turn: it leaves neither a running turn nor guard
+// history, only its pending source trigger.
+func (s *Supervisor) clearDeferredTurn(turn Turn, triggers []watch.Trigger) error {
+	_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		rs := st.Role(state.Role(s.role))
+		if rs.CurrentTurn != nil && rs.CurrentTurn.ID == turn.ID {
+			rs.CurrentTurn = nil
+		}
+		rs.SetPending(toPending(triggers, s.now()))
+		return nil
+	})
+	return err
+}
+
+// markQueuedProcessFinished is written before AfterTurn may submit or clean a
+// cycle. Root lifecycle mutations use it to distinguish a queued handoff that
+// is still about to run (or running) from one whose agent has actually exited.
+func (s *Supervisor) markQueuedProcessFinished(turn Turn) error {
+	_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		if q := st.Role(state.Role(s.role)).QueueReservation; q != nil && q.Turn == turn.ID && q.ProcessStarted {
+			q.ProcessFinished = true
+		}
+		return nil
+	})
+	return err
+}
+
+// markQueuedProcessLaunching is the last durable step before Runner.Run. If
+// factoryd dies after this point but before it records the child handle, a
+// restart blocks rather than guessing that no agent exists. That conservative
+// state is what binds the final handoff confirmation to process launch.
+func (s *Supervisor) markQueuedProcessLaunching(turn Turn) error {
+	_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		if q := st.Role(state.Role(s.role)).QueueReservation; q != nil && q.Turn == turn.ID {
+			q.ProcessStarted = true
+		}
+		return nil
+	})
+	return err
+}
+
+// takeQueuedBrief checks the durable reservation and moves the handoff while
+// holding the state lock. A root-side lifecycle operation obtains this same
+// lock, so it cannot turn the cycle open between the check and the rename.
+func (s *Supervisor) takeQueuedBrief(turn Turn, source string) (done string, taken bool, reason string, err error) {
+	var takeErr error
+	_, err = state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		rs := st.Role(state.Role(s.role))
+		q := rs.QueueReservation
+		if q == nil || q.Turn != turn.ID || q.Source != source {
+			reason = "queued brief reservation is absent or belongs to another turn"
+			return nil
+		}
+		if st.Cycle == nil || st.Cycle.Phase != state.CycleWorking {
+			if st.Cycle == nil {
+				reason = "no cycle record"
+			} else {
+				reason = "cycle is " + st.Cycle.Phase
+			}
+			return nil
+		}
+		if q.Taken {
+			done, taken = q.Done, true
+			return nil
+		}
+		done, takeErr = brief.Take(s.cfg, source)
+		if takeErr != nil {
+			return nil
+		}
+		q.Done, q.Taken = done, true
+		taken = true
+		return nil
+	})
+	if err != nil {
+		return "", false, "", err
+	}
+	if takeErr != nil {
+		if releaseErr := s.releaseQueuedReservation(turn); releaseErr != nil {
+			return "", false, "", fmt.Errorf("taking queued brief: %v; releasing reservation: %w", takeErr, releaseErr)
+		}
+		return "", false, takeErr.Error(), nil
+	}
+	return done, taken, reason, nil
+}
+
+// confirmQueuedBriefHandoff is the check immediately before Runner.Run. It
+// restores the source under the state lock if another lifecycle operation won
+// after the atomic check-and-take action, so no producer command sees a brief
+// beside an open draft.
+func (s *Supervisor) confirmQueuedBriefHandoff(turn Turn, source, done string) (confirmed bool, reason string, err error) {
+	_, err = state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		rs := st.Role(state.Role(s.role))
+		q := rs.QueueReservation
+		if q != nil && q.Turn == turn.ID && q.Source == source && q.Done == done && q.Taken && st.Cycle != nil && st.Cycle.Phase == state.CycleWorking {
+			confirmed = true
+			return nil
+		}
+		if st.Cycle == nil {
+			reason = "no cycle record"
+		} else {
+			reason = "cycle is " + st.Cycle.Phase
+		}
+		if q != nil && q.Turn == turn.ID && q.Taken {
+			if restoreErr := brief.Restore(s.cfg, q.Source, q.Done); restoreErr != nil {
+				return fmt.Errorf("restoring queued brief after lifecycle change: %w", restoreErr)
+			}
+			rs.QueueReservation = nil
+		}
+		return nil
+	})
+	return confirmed, reason, err
+}
+
+// releaseQueuedReservation gives a source that could not be moved a chance to
+// be selected again. It releases only this turn's reservation and never
+// rewrites a root-side transition that already changed the cycle.
+func (s *Supervisor) releaseQueuedReservation(turn Turn) error {
+	_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		rs := st.Role(state.Role(s.role))
+		if q := rs.QueueReservation; q != nil && q.Turn == turn.ID {
+			rs.QueueReservation = nil
+			if st.Cycle != nil && st.Cycle.Phase == state.CycleWorking {
+				base := st.Cycle.Base
+				st.SetCycle(state.CycleNew, s.now()).Base = base
+			}
+		}
+		return nil
+	})
+	return err
+}
+
 // backoff scales with the spin count and is capped, so a stuck factory slows
 // down without ever going quiet for so long that a recovery goes unnoticed.
 func (s *Supervisor) backoff(spin int) time.Duration {
@@ -671,10 +938,30 @@ func (s *Supervisor) writeRetry(turn Turn, res TurnResult, fails int, at time.Ti
 	if origin == "" {
 		origin = "unknown"
 	}
+	// A queued brief was moved to done/ before the failed turn. Carry that
+	// factory-selected path through the supervisor-owned retry marker so the
+	// retry gets the same work order instead of an empty prompt. A retry of a
+	// retry keeps the original path.
+	briefPath := ""
+	for _, trigger := range real {
+		if trigger.Label != brief.Label {
+			continue
+		}
+		if p, err := brief.DonePath(s.cfg, trigger.Path); err == nil {
+			briefPath = p
+		}
+	}
+	if briefPath == "" && onRetry {
+		briefPath = readRetryLine(path, "brief: ")
+	}
+	briefLine := ""
+	if briefPath != "" {
+		briefLine = "brief: " + briefPath + "\n"
+	}
 	body := fmt.Sprintf(
-		"retry %d of %d\norigin: %s\nstep: %s\nafter turn: %s\nexit: %d\ntimed out: %v\nat: %s\n\n"+
+		"retry %d of %d\norigin: %s\nstep: %s\n%safter turn: %s\nexit: %d\ntimed out: %v\nat: %s\n\n"+
 			"The previous turn consumed its trigger and then failed. Nothing else is pending.\n",
-		fails, s.cfg.Supervisor.FailAbort, origin, step, turn.ID, res.ExitCode, res.TimedOut, at.Format(time.RFC3339))
+		fails, s.cfg.Supervisor.FailAbort, origin, step, briefLine, turn.ID, res.ExitCode, res.TimedOut, at.Format(time.RFC3339))
 	return os.WriteFile(path, []byte(body), 0o644)
 }
 

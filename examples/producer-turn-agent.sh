@@ -101,7 +101,7 @@ VERDICT
       fi
       ;;
   esac
-  brief="${FACTORYD_INBOX:-}/brief.md"
+  brief="${FACTORYD_BRIEF:-${FACTORYD_INBOX:-}/brief.md}"
   if [ -r "$brief" ]; then
     printf '\nTHE WORK (from the operator):\n\n'
     cat "$brief"

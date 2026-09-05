@@ -25,6 +25,7 @@ import (
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/gittransport"
+	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/scm"
 	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/supervise"
@@ -192,7 +193,7 @@ type Deps struct {
 
 // Run performs a submission. Every early return carries an *Error with the
 // exit code the CLI must use.
-func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
+func Run(ctx context.Context, cfg *config.Config, deps Deps) (result Result, retErr error) {
 	log := deps.Log
 	if log == nil {
 		log = io.Discard
@@ -204,9 +205,25 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		return Result{}, fail(ExitConfig, "submit: missing a dependency")
 	}
 
+	// A queued brief has been handed to a producer before its process begins.
+	// That handoff owns the producer worktree, so a root-side submit must stop
+	// before it can read that worktree, prepare a branch, run a gate, or wake
+	// the reviewer about the agent's partial work. Keep the write-ahead check
+	// below as well: the handoff may become active while this invocation is
+	// materialising a submission.
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		return st.PermitProducerCycleMutation()
+	}); err != nil {
+		if errors.Is(err, state.ErrProducerLifecycleBusy) {
+			return Result{}, blocked(wrap(ExitConfig, err, "refusing to submit while a queued producer handoff is active"))
+		}
+		return Result{}, transient(wrap(ExitConfig, err, "checking for an active queued producer handoff"))
+	}
+
 	// 1. Identity. Fail closed: the producer must be someone, and not the
-	// reviewer. This runs before anything is read or written, because every
-	// later step acts as the producer and must not act as anyone else.
+	// reviewer. This runs before producer-owned input is read or acted upon,
+	// because every later step acts as the producer and must not act as anyone
+	// else.
 	if deps.Producer.ID == "" {
 		return Result{}, fail(ExitConfig, "the producer credential did not resolve to an identity")
 	}
@@ -275,6 +292,51 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	if err := deps.Git.Checkout(ctx, declared, "refs/remotes/factoryd/"+cfg.TargetBranch); err != nil {
 		return Result{}, transient(wrap(ExitConfig, err, "creating %s from %s", declared, cfg.TargetBranch))
 	}
+	// The early check above reports an already-active queued handoff before
+	// any submission work starts. This is the durable barrier for the opposite
+	// order: after fetching but before the first producer-worktree copy, claim
+	// exclusive use through CopyTree and the gate outcome. Queue admission uses
+	// the same state lock, so it either wins before this point (and we refuse
+	// before CopyTree) or waits until the gate result is complete.
+	leaseHolder, err := proc.Self("submit")
+	if err != nil {
+		return Result{}, transient(wrap(ExitConfig, err, "identifying the submission process for the producer-worktree lease"))
+	}
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		return st.AcquireProducerWorktreeLease(leaseHolder, deps.Now())
+	}); err != nil {
+		if errors.Is(err, state.ErrProducerLifecycleBusy) || errors.Is(err, state.ErrProducerWorktreeBusy) {
+			return Result{}, blocked(wrap(ExitConfig, err, "refusing to use the producer worktree while a queued handoff or submission owns it"))
+		}
+		return Result{}, transient(wrap(ExitConfig, err, "leasing the producer worktree before submission"))
+	}
+	leaseHeld := true
+	leaseReleaseFailure := func(err error) error {
+		return supervise.RestartRequired(transient(wrap(ExitConfig, err, "releasing the producer-worktree submission lease")))
+	}
+	releaseWorktreeLease := func() error {
+		if !leaseHeld {
+			return nil
+		}
+		if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+			return st.ReleaseProducerWorktreeLease(leaseHolder)
+		}); err != nil {
+			return err
+		}
+		leaseHeld = false
+		return nil
+	}
+	defer func() {
+		if err := releaseWorktreeLease(); err != nil {
+			// This may be the producer supervisor itself (AfterTurn), so merely
+			// logging would leave a live holder that defers every future turn.
+			// Propagate a restart request after the return values are set; the
+			// supervisor finalizes this turn and exits, allowing liveness-based
+			// recovery to reclaim the durable lease on restart.
+			result = Result{}
+			retErr = leaseReleaseFailure(err)
+		}
+	}()
 	if err := gittransport.CopyTree(work, cfg.Paths.SubmitRepo); err != nil {
 		return Result{}, transient(wrap(ExitConfig, err, "copying the producer's tree into the submit repository"))
 	}
@@ -448,11 +510,22 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	// between the draft's creation and the record of it leaves a phase that
 	// forbids a refresh, never an absence that permits one (#35 review).
 	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		if err := st.PermitProducerCycleMutation(); err != nil {
+			return err
+		}
 		c := st.SetCycle(state.CycleSubmitting, deps.Now())
 		c.Family, c.Digest = declared, branch
 		return nil
 	}); err != nil {
+		if errors.Is(err, state.ErrProducerLifecycleBusy) {
+			return Result{}, blocked(wrap(ExitConfig, err, "refusing to submit while a queued producer handoff is active"))
+		}
 		return Result{}, transient(wrap(ExitConfig, err, "recording the submission before the push"))
+	}
+	// CycleSubmitting is its own queue barrier, so the worktree lease is no
+	// longer needed once the green gate has been durably recorded.
+	if err := releaseWorktreeLease(); err != nil {
+		return Result{}, leaseReleaseFailure(err)
 	}
 
 	// Non-force: a branch that somehow already exists with different content
@@ -770,6 +843,9 @@ func quarantineIntent(work, turnID string) []string {
 // here, so either ordering converges.
 func recordOpen(cfg *config.Config, now time.Time, declared, branch, changeID string) error {
 	_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		if err := st.PermitProducerCycleMutation(); err != nil {
+			return err
+		}
 		phase := state.CycleOpen
 		if v := st.LastVerdict; v != nil && v.Kind == state.VerdictMerged && v.ChangeID == changeID {
 			phase = state.CycleFinished
@@ -790,6 +866,9 @@ func recordOpen(cfg *config.Config, now time.Time, declared, branch, changeID st
 // as it is: "nothing new this turn" says nothing about a draft in flight.
 func RecordNoWork(cfg *config.Config, now time.Time) error {
 	_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		if err := st.PermitProducerCycleMutation(); err != nil {
+			return err
+		}
 		if c := st.Cycle; c != nil && (c.Phase == state.CycleNew || c.Phase == state.CycleWorking) {
 			st.SetCycle(state.CycleClean, now)
 		}

@@ -3,6 +3,7 @@ package refresh_test
 import (
 	"context"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"os"
@@ -14,6 +15,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aicix-labs/factoryd/internal/brief"
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/refresh"
@@ -21,6 +23,7 @@ import (
 	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/submit"
 	"github.com/aicix-labs/factoryd/internal/supervise"
+	"github.com/aicix-labs/factoryd/internal/watch"
 )
 
 func cfgFor(t *testing.T) *config.Config {
@@ -818,6 +821,198 @@ func TestReconcileFinishesAnOpenCycleOnlyForAMergeIntoTheConfiguredTarget(t *tes
 		if changed, _ := refresh.Reconcile(context.Background(), cfg, st, f.get, f.ancestor, time.Now()); changed || f.calls != 0 {
 			t.Fatalf("phase %s: looked up (%d) or changed (%v)", phase, f.calls, changed)
 		}
+	}
+}
+
+// A queued brief is a reason to reconcile an operator-merged draft, but not
+// a reason to launch a failed producer turn while it remains open. Once the
+// provider proves the merge landed, the queue refreshes and atomically marks
+// its next work item working before the selected file is taken.
+func TestQueueStartReconcilesAndReservesAnOperatorMergedCycle(t *testing.T) {
+	cfg := cfgFor(t)
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		c := st.SetCycle(state.CycleOpen, time.Now())
+		c.ChangeID, c.Family, c.Digest = "55", "feat/x", "feat/x-abc"
+		st.LastVerdict = &state.Verdict{ChangeID: "55", Kind: state.VerdictOperatorGated}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	f := &lookupFake{state: scm.StateMerged, onTarget: true}
+	started, note, err := refresh.QueueStart(cfg, func(context.Context) (refresh.Deps, error) {
+		return refresh.Deps{
+			Fetch:    func(context.Context, string) error { return nil },
+			Bundle:   func(context.Context, string, string) (string, error) { return "abc123", nil },
+			Apply:    func(context.Context, string, string) (string, error) { return "abc123", nil },
+			Lookup:   f.get,
+			Ancestor: f.ancestor,
+		}, nil
+	})(context.Background(), supervise.Turn{ID: "queue-1", Role: "producer", Triggers: []watch.Trigger{{
+		Label: brief.Label, Path: filepath.Join(cfg.BriefsDir(), "010-next.md"),
+	}}})
+	if err != nil || !started || !strings.Contains(note, "cycle finished") || !strings.Contains(note, "workdir refreshed") {
+		t.Fatalf("started=%v note=%q err=%v", started, note, err)
+	}
+	st, err := state.Load(cfg.StatePath(), cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	q := st.Role(state.RoleProducer).QueueReservation
+	if st.Cycle == nil || st.Cycle.Phase != state.CycleWorking || st.Cycle.Base != "abc123" || q == nil || q.Source != filepath.Join(cfg.BriefsDir(), "010-next.md") || q.Taken || f.calls != 1 || f.ancCalls != 1 {
+		t.Fatalf("cycle=%+v lookup=%d ancestor=%d", st.Cycle, f.calls, f.ancCalls)
+	}
+}
+
+// A submit that won the producer-worktree barrier must finish copying and
+// gating before a queued brief can refresh and launch an agent beside it.
+func TestQueueStartDefersWhileSubmissionLeaseIsLive(t *testing.T) {
+	cfg := cfgFor(t)
+	holder, err := proc.Self("submit-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		st.SetCycle(state.CycleNew, time.Now())
+		return st.AcquireProducerWorktreeLease(holder, time.Now())
+	}); err != nil {
+		t.Fatal(err)
+	}
+	depsBuilt := 0
+	started, note, err := refresh.QueueStart(cfg, func(context.Context) (refresh.Deps, error) {
+		depsBuilt++
+		return refresh.Deps{}, nil
+	})(context.Background(), supervise.Turn{ID: "queue-lease", Role: "producer", Triggers: []watch.Trigger{{
+		Label: brief.Label, Path: filepath.Join(cfg.BriefsDir(), "010-next.md"),
+	}}})
+	if err != nil || started || !strings.Contains(note, state.ErrProducerWorktreeBusy.Error()) {
+		t.Fatalf("started=%v note=%q err=%v, want queue deferral for the live submission lease", started, note, err)
+	}
+	if depsBuilt != 0 {
+		t.Fatalf("queue built refresh dependencies %d times while a submit held the worktree", depsBuilt)
+	}
+	st, err := state.Load(cfg.StatePath(), cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := st.Role(state.RoleProducer)
+	if rs.SubmissionLease == nil || rs.QueueReservation != nil {
+		t.Fatalf("queue changed active submission lease state: %+v", rs)
+	}
+}
+
+// BeforeTurn is also reached by legacy inbox briefs, answers, verdicts, and
+// retries. It must reject the same live submit lease before it builds refresh
+// dependencies or touches the producer worktree.
+func TestBeforeTurnDefersWhileSubmissionLeaseIsLive(t *testing.T) {
+	cfg := cfgFor(t)
+	holder, err := proc.Self("submit-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		st.SetCycle(state.CycleNew, time.Now())
+		return st.AcquireProducerWorktreeLease(holder, time.Now())
+	}); err != nil {
+		t.Fatal(err)
+	}
+	depsBuilt := 0
+	_, err = refresh.BeforeTurn(cfg, func(context.Context) (refresh.Deps, error) {
+		depsBuilt++
+		return refresh.Deps{}, nil
+	})(context.Background(), supervise.Turn{ID: "legacy-brief", Role: "producer"})
+	if !errors.Is(err, state.ErrProducerWorktreeBusy) {
+		t.Fatalf("BeforeTurn error=%v, want live submission lease refusal", err)
+	}
+	if depsBuilt != 0 {
+		t.Fatalf("BeforeTurn built refresh dependencies %d times beside a submission lease", depsBuilt)
+	}
+	st, err := state.Load(cfg.StatePath(), cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Cycle == nil || st.Cycle.Phase != state.CycleNew {
+		t.Fatalf("BeforeTurn changed cycle despite the live submission lease: %+v", st.Cycle)
+	}
+}
+
+// An operator refresh is another root-side write to the producer worktree.
+// Neither ordinary eligibility nor --force authorizes it to reset the tree
+// while submit owns the copy/gate window, and the refusal happens before any
+// fetch, bundle, or producer-side apply.
+func TestGuardedRefreshDoesNotUseTheWorktreeWhileSubmissionLeaseIsLive(t *testing.T) {
+	for _, force := range []bool{false, true} {
+		t.Run(fmt.Sprintf("force=%v", force), func(t *testing.T) {
+			cfg := cfgFor(t)
+			holder, err := proc.Self("submit-test")
+			if err != nil {
+				t.Fatal(err)
+			}
+			if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+				st.SetCycle(state.CycleNew, time.Now())
+				return st.AcquireProducerWorktreeLease(holder, time.Now())
+			}); err != nil {
+				t.Fatal(err)
+			}
+			var fetches, bundles, applies int
+			_, prev, err := refresh.Guarded(context.Background(), cfg, refresh.Deps{
+				Fetch: func(context.Context, string) error {
+					fetches++
+					return nil
+				},
+				Bundle: func(context.Context, string, string) (string, error) {
+					bundles++
+					return "abc123", nil
+				},
+				Apply: func(context.Context, string, string) (string, error) {
+					applies++
+					return "abc123", nil
+				},
+			}, force)
+			if !errors.Is(err, refresh.ErrRefused) || prev != state.CycleNew {
+				t.Fatalf("force=%v Guarded result prev=%q err=%v, want live-lease refusal", force, prev, err)
+			}
+			if fetches != 0 || bundles != 0 || applies != 0 {
+				t.Fatalf("force=%v refresh used worktree fetch=%d bundle=%d apply=%d while submit lease was live", force, fetches, bundles, applies)
+			}
+		})
+	}
+}
+
+// The durable submission barrier carries an exact process reference rather
+// than a timeout. Once that submit process has died, the next admission
+// reclaims the stale lease inside its locked decision and does not strand the
+// first queued brief.
+func TestQueueStartReclaimsADeadSubmissionLease(t *testing.T) {
+	cfg := cfgFor(t)
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		st.SetCycle(state.CycleNew, time.Now())
+		st.Role(state.RoleProducer).SubmissionLease = &state.ProducerWorktreeLease{
+			Holder:     proc.Ref{PID: os.Getpid(), StartToken: "not-this-process"},
+			AcquiredAt: time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	started, note, err := refresh.QueueStart(cfg, func(context.Context) (refresh.Deps, error) {
+		return refresh.Deps{
+			Fetch:  func(context.Context, string) error { return nil },
+			Bundle: func(context.Context, string, string) (string, error) { return "abc123", nil },
+			Apply:  func(context.Context, string, string) (string, error) { return "abc123", nil },
+		}, nil
+	})(context.Background(), supervise.Turn{ID: "queue-after-crash", Role: "producer", Triggers: []watch.Trigger{{
+		Label: brief.Label, Path: filepath.Join(cfg.BriefsDir(), "010-next.md"),
+	}}})
+	if err != nil || !started {
+		t.Fatalf("started=%v note=%q err=%v, want dead submission lease reclaimed", started, note, err)
+	}
+	st, err := state.Load(cfg.StatePath(), cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := st.Role(state.RoleProducer)
+	if rs.SubmissionLease != nil || rs.QueueReservation == nil {
+		t.Fatalf("dead submission lease did not become a queue reservation: %+v", rs)
 	}
 }
 

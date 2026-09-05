@@ -918,6 +918,14 @@ func (c *Config) HealthPath() string { return filepath.Join(c.Paths.Root, "healt
 func (c *Config) InboxDir() string  { return filepath.Join(c.Paths.Root, "inbox") }
 func (c *Config) OutboxDir() string { return filepath.Join(c.Paths.Root, "outbox") }
 
+// BriefsDir is the operator-managed, lexical producer backlog. brief.md
+// remains the compatibility one-item channel; entries here are moved to done/
+// by the producer supervisor when they are taken.
+func (c *Config) BriefsDir() string { return filepath.Join(c.InboxDir(), "briefs") }
+
+// BriefsDoneDir holds the audit trail of queued briefs that factoryd took.
+func (c *Config) BriefsDoneDir() string { return filepath.Join(c.BriefsDir(), "done") }
+
 // ProgressPath is where a role touches to say "I advanced". The producer's is
 // named by SPEC.md §6.3; the reviewer gets the symmetric one.
 func (c *Config) ProgressPath(role string) string {
@@ -1136,7 +1144,7 @@ func (c *Config) GateWorkdir() string { return c.Paths.SubmitRepo }
 // two together; Validate refuses a credential named after any of them.
 var GeneratedTurnKeys = []string{
 	"FACTORYD_FACTORY", "FACTORYD_ROLE", "FACTORYD_TURN", "FACTORYD_ROOT",
-	"FACTORYD_INBOX", "FACTORYD_OUTBOX", "FACTORYD_WORKDIR", "FACTORYD_TARGET_BRANCH",
+	"FACTORYD_INBOX", "FACTORYD_OUTBOX", "FACTORYD_BRIEF", "FACTORYD_WORKDIR", "FACTORYD_TARGET_BRANCH",
 	"FACTORYD_PROGRESS", "FACTORYD_TRIGGERS", "FACTORYD_TRIGGER_PATHS", "FACTORYD_CONFIG",
 	"FACTORYD_VERDICTS", "FACTORYD_VERDICTS_TSV", "FACTORYD_VERDICT", "FACTORYD_CHANGE_ID", "FACTORYD_CHANGE_BRANCH",
 }

@@ -72,6 +72,13 @@ func producerBeforeTurn(cfg *config.Config) func(ctx context.Context, t supervis
 	return refresh.BeforeTurn(cfg, func(ctx context.Context) (refresh.Deps, error) { return refreshDeps(ctx, cfg) })
 }
 
+// producerQueueStart keeps queued briefs behind a live draft, while using the
+// same provider reconciliation and locked refresh as a real producer start to
+// reserve the next item after an operator merge.
+func producerQueueStart(cfg *config.Config) func(ctx context.Context, t supervise.Turn) (bool, string, error) {
+	return refresh.QueueStart(cfg, func(ctx context.Context) (refresh.Deps, error) { return refreshDeps(ctx, cfg) })
+}
+
 // refreshDeps: the transport for the fetch (factoryd's credential, factoryd's
 // clone), git in the submit repository for the bundle, and this binary's
 // _refresh verb started as the producer for the apply.

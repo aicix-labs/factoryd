@@ -60,6 +60,12 @@ func runSupervise(args []string) int {
 			}
 			return nil
 		}(),
+		QueueStart: func() func(context.Context, supervise.Turn) (bool, string, error) {
+			if *role == "producer" {
+				return producerQueueStart(cfg)
+			}
+			return nil
+		}(),
 	})
 	if err != nil {
 		fmt.Fprintf(os.Stderr, "factoryd supervise: %v\n", err)

@@ -4,9 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/aicix-labs/factoryd/internal/signal"
-	"github.com/aicix-labs/factoryd/internal/state"
-	"github.com/aicix-labs/factoryd/internal/supervise"
 	"io"
 	"os"
 	"os/exec"
@@ -16,10 +13,17 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aicix-labs/factoryd/internal/brief"
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/gittransport"
+	"github.com/aicix-labs/factoryd/internal/proc"
+	"github.com/aicix-labs/factoryd/internal/refresh"
 	"github.com/aicix-labs/factoryd/internal/scm"
+	"github.com/aicix-labs/factoryd/internal/signal"
+	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/submit"
+	"github.com/aicix-labs/factoryd/internal/supervise"
+	"github.com/aicix-labs/factoryd/internal/watch"
 )
 
 // ---------- fakes ----------
@@ -61,14 +65,20 @@ func (f *fakeTransport) Push(_ context.Context, r string) error {
 }
 
 type fakeGit struct {
-	tree     string // what Tree returns
-	calls    []string
-	nothing  bool // Commit reports nothing to commit
-	commitOK string
+	tree          string // what Tree returns
+	calls         []string
+	nothing       bool // Commit reports nothing to commit
+	commitOK      string
+	afterCheckout func()
 }
 
 func (g *fakeGit) Checkout(_ context.Context, branch, start string) error {
 	g.calls = append(g.calls, "checkout "+branch+" from "+start)
+	if g.afterCheckout != nil {
+		after := g.afterCheckout
+		g.afterCheckout = nil
+		after()
+	}
 	return nil
 }
 func (g *fakeGit) Commit(_ context.Context, msg, name, email string) (string, bool, error) {
@@ -1266,6 +1276,221 @@ func TestCycleIsRecordedAsSubmittingBeforeThePush(t *testing.T) {
 	st, _ := state.Load(l.cfg.StatePath(), l.cfg.Name)
 	if st.Cycle == nil || st.Cycle.Phase != state.CycleSubmitting {
 		t.Fatalf("after the crash the cycle is %+v, want submitting", st.Cycle)
+	}
+}
+
+// A queued handoff reserves the cycle until the producer command exits. An
+// external/root-side submit in the gap after handoff confirmation but before
+// process start must not turn that reservation into submitting and create work
+// beside the queued agent.
+func TestSubmitRefusesAnUnfinishedQueuedHandoff(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "gate: queued lifecycle\n\nbody")
+	if _, err := state.Update(l.cfg.StatePath(), l.cfg.Name, func(st *state.State) error {
+		st.SetCycle(state.CycleWorking, time.Now())
+		st.Role(state.RoleProducer).QueueReservation = &state.QueueReservation{
+			Source:          filepath.Join(l.cfg.BriefsDir(), "010-next.md"),
+			Done:            filepath.Join(l.cfg.BriefsDoneDir(), "010-next.md"),
+			Turn:            "producer-queued",
+			ReservedAt:      time.Now(),
+			Taken:           true,
+			ProcessStarted:  false,
+			ProcessFinished: false,
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	var got *submit.Error
+	if !errors.As(err, &got) || got.Kind != supervise.DispositionBlocked || !errors.Is(err, state.ErrProducerLifecycleBusy) {
+		t.Fatalf("submit error=%v, want blocked active queued-handoff refusal", err)
+	}
+	if len(l.tr.pushed) != 0 {
+		t.Fatalf("submit pushed beside an unfinished queued handoff: %v", l.tr.pushed)
+	}
+	st, err := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Cycle == nil || st.Cycle.Phase != state.CycleWorking {
+		t.Fatalf("submit changed active queued cycle: %+v", st.Cycle)
+	}
+}
+
+// The initial handoff fence is deliberately before even a red gate: running
+// one against the queued producer's partial worktree would create a false
+// reviewer workflow. In particular, it must not leave question.md or wake
+// behind for a reviewer to mistake for the queued turn's result.
+func TestSubmitDoesNotRunOrReportARedGateBesideAnUnfinishedQueuedHandoff(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "gate: queued lifecycle\n\nbody")
+	l.gate.exit = 1
+	if _, err := state.Update(l.cfg.StatePath(), l.cfg.Name, func(st *state.State) error {
+		st.SetCycle(state.CycleWorking, time.Now())
+		st.Role(state.RoleProducer).QueueReservation = &state.QueueReservation{
+			Source:          filepath.Join(l.cfg.BriefsDir(), "010-next.md"),
+			Done:            filepath.Join(l.cfg.BriefsDoneDir(), "010-next.md"),
+			Turn:            "producer-queued",
+			ReservedAt:      time.Now(),
+			Taken:           true,
+			ProcessStarted:  false,
+			ProcessFinished: false,
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	var got *submit.Error
+	if !errors.As(err, &got) || got.Kind != supervise.DispositionBlocked || !errors.Is(err, state.ErrProducerLifecycleBusy) {
+		t.Fatalf("submit error=%v, want blocked active queued-handoff refusal", err)
+	}
+	if l.gate.ran {
+		t.Fatal("submit ran a red gate beside an active queued handoff")
+	}
+	for _, name := range []string{"question.md", "wake"} {
+		if exists(filepath.Join(l.cfg.InboxDir(), name)) {
+			t.Fatalf("submit wrote inbox/%s beside an active queued handoff", name)
+		}
+	}
+}
+
+// The early preflight is deliberately not the barrier: a queue admission can
+// win the state lock after it, while submit is fetching. The durable lease is
+// acquired immediately before CopyTree, sees that admitted handoff, and stops
+// before it can gate the newly changing producer worktree or wake a reviewer.
+func TestQueueAdmissionBetweenSubmitPreflightAndGatePreventsGateAndWake(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "gate: queued lifecycle\n\nbody")
+	l.gate.exit = 1
+	var admissionErr error
+	var admitted bool
+	l.git.afterCheckout = func() {
+		admitted, _, admissionErr = refresh.QueueStart(l.cfg, func(context.Context) (refresh.Deps, error) {
+			return refresh.Deps{
+				Fetch:  func(context.Context, string) error { return nil },
+				Bundle: func(context.Context, string, string) (string, error) { return "abc123", nil },
+				Apply:  func(context.Context, string, string) (string, error) { return "abc123", nil },
+			}, nil
+		})(context.Background(), supervise.Turn{ID: "producer-queued", Role: "producer", Triggers: []watch.Trigger{{
+			Label: brief.Label, Path: filepath.Join(l.cfg.BriefsDir(), "010-next.md"),
+		}}})
+	}
+
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if admissionErr != nil {
+		t.Fatalf("queue admission after submit preflight: %v", admissionErr)
+	}
+	if !admitted {
+		t.Fatal("queue admission did not win the barrier after submit's preflight")
+	}
+	var got *submit.Error
+	if !errors.As(err, &got) || got.Kind != supervise.DispositionBlocked || !errors.Is(err, state.ErrProducerLifecycleBusy) {
+		t.Fatalf("submit error=%v, want blocked queued-handoff refusal", err)
+	}
+	if l.gate.ran {
+		t.Fatal("submit ran a gate after queue admission won the worktree barrier")
+	}
+	for _, name := range []string{"question.md", "wake"} {
+		if exists(filepath.Join(l.cfg.InboxDir(), name)) {
+			t.Fatalf("submit wrote inbox/%s after queue admission won the barrier", name)
+		}
+	}
+	st, loadErr := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if st.Role(state.RoleProducer).QueueReservation == nil {
+		t.Fatal("queue admission was not durably recorded")
+	}
+}
+
+// Queue work is not the only producer-worktree owner. A legacy inbox brief
+// can be admitted after submit's early preflight; its recorded live turn must
+// win the same barrier before CopyTree and gate execution.
+func TestLegacyProducerTurnAfterSubmitPreflightPreventsCopyGateAndWake(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "gate: legacy turn\n\nbody")
+	turnProcess, err := proc.Self("legacy-producer-turn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var admitErr error
+	l.git.afterCheckout = func() {
+		_, admitErr = state.Update(l.cfg.StatePath(), l.cfg.Name, func(st *state.State) error {
+			st.Role(state.RoleProducer).CurrentTurn = &state.Turn{
+				ID: "producer-legacy-brief", StartedAt: time.Now(), Trigger: "brief", Process: &turnProcess,
+			}
+			return nil
+		})
+	}
+
+	_, err = submit.Run(context.Background(), l.cfg, l.deps)
+	if admitErr != nil {
+		t.Fatalf("admitting legacy producer turn: %v", admitErr)
+	}
+	var got *submit.Error
+	if !errors.As(err, &got) || got.Kind != supervise.DispositionBlocked || !errors.Is(err, state.ErrProducerLifecycleBusy) {
+		t.Fatalf("submit error=%v, want blocked live legacy-turn refusal", err)
+	}
+	if l.gate.ran || len(l.tr.pushed) != 0 {
+		t.Fatalf("submit used the worktree beside a live legacy turn: gate=%v pushes=%v", l.gate.ran, l.tr.pushed)
+	}
+	if exists(filepath.Join(l.cfg.Paths.SubmitRepo, "src", "a.go")) {
+		t.Fatal("submit copied the producer worktree beside a live legacy turn")
+	}
+	for _, name := range []string{"question.md", "wake"} {
+		if exists(filepath.Join(l.cfg.InboxDir(), name)) {
+			t.Fatalf("submit wrote inbox/%s beside a live legacy turn", name)
+		}
+	}
+}
+
+// The lease holder can be the producer supervisor during AfterTurn. A failed
+// release must therefore be surfaced as a restart request, never merely
+// logged: a live supervisor process would otherwise keep its own queue
+// deferred forever.
+func TestSubmitPropagatesAProducerWorktreeLeaseReleaseFailure(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "gate: release lease\n\nbody")
+	var corruptErr error
+	l.gate.during = func() {
+		_, corruptErr = state.Update(l.cfg.StatePath(), l.cfg.Name, func(st *state.State) error {
+			lease := st.Role(state.RoleProducer).SubmissionLease
+			if lease == nil {
+				return errors.New("gate ran without a producer-worktree lease")
+			}
+			lease.Holder.StartToken = "different-process-instance"
+			return nil
+		})
+	}
+
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if corruptErr != nil {
+		t.Fatalf("forcing lease-release failure: %v", corruptErr)
+	}
+	if !supervise.RequiresRestart(err) {
+		t.Fatalf("submit error=%v, want a supervisor restart request after lease release failed", err)
+	}
+	if exitOf(t, err) != submit.ExitConfig {
+		t.Fatalf("exit=%d, want %d", exitOf(t, err), submit.ExitConfig)
+	}
+	if len(l.tr.pushed) != 0 {
+		t.Fatalf("submit pushed after the producer-worktree lease could not be released: %v", l.tr.pushed)
+	}
+	st, loadErr := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if st.Role(state.RoleProducer).SubmissionLease == nil {
+		t.Fatal("failed release silently discarded the durable lease")
 	}
 }
 

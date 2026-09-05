@@ -110,6 +110,19 @@ func TestHealthyFactoryIsWorking(t *testing.T) {
 	}
 }
 
+func TestStatusNamesAnIntentionallyEmptyBriefQueue(t *testing.T) {
+	l := newLab(t)
+	l.health(t, health.Report{Factory: "widgets", At: l.now.Add(-30 * time.Second), Healthy: true,
+		BriefQueue: &health.BriefQueueReport{Empty: true}, Volumes: []health.Volume{{Path: l.root, FreePercent: 42}}})
+	s := l.collect()
+	if !s.Working {
+		t.Fatalf("an empty queue made the factory not working: %+v", s)
+	}
+	if !strings.Contains(status.Text(s), "brief queue empty; waiting for work") {
+		t.Fatalf("status did not name intentional idle:\n%s", status.Text(s))
+	}
+}
+
 type fileState struct {
 	content string
 	mtime   time.Time

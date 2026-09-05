@@ -9,11 +9,13 @@ import (
 	"os"
 	"os/exec"
 	"os/user"
+	"path/filepath"
 	"strconv"
 	"strings"
 	"syscall"
 	"time"
 
+	"github.com/aicix-labs/factoryd/internal/brief"
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/proc"
 )
@@ -235,6 +237,7 @@ type VerdictEnv struct {
 
 func (r *ExecRunner) env(t Turn) ([]string, error) {
 	var trigPaths []string
+	briefPath := filepath.Join(r.Config.InboxDir(), "brief.md")
 	for _, tr := range t.Triggers {
 		// FACTORYD_TRIGGER_PATHS is split on the path list separator by
 		// every wrapper; a path containing it would be read as fragments,
@@ -244,6 +247,28 @@ func (r *ExecRunner) env(t Turn) ([]string, error) {
 			return nil, fmt.Errorf("trigger path %q contains %q, the path list separator; FACTORYD_TRIGGER_PATHS cannot carry it", tr.Path, os.PathListSeparator)
 		}
 		trigPaths = append(trigPaths, tr.Path)
+		if tr.Label == brief.Label {
+			var err error
+			briefPath, err = brief.DonePath(r.Config, tr.Path)
+			if err != nil {
+				return nil, err
+			}
+		}
+	}
+	// A failed queued-brief turn is retried from the same done/ record. The
+	// retry marker is supervisor-authored continuity; the queue source was
+	// deliberately moved before the first attempt and no longer exists.
+	if briefPath == filepath.Join(r.Config.InboxDir(), "brief.md") {
+		for _, tr := range t.Triggers {
+			if tr.Label == RetryLabel {
+				if p := readRetryLine(r.Config.RetryPath(r.Role), "brief: "); p != "" {
+					if !brief.ValidDonePath(r.Config, p) {
+						return nil, fmt.Errorf("retry marker names brief %q outside the completed brief queue", p)
+					}
+					briefPath = p
+				}
+			}
+		}
 	}
 	factoryd := map[string]string{
 		"FACTORYD_FACTORY":       r.Config.Name,
@@ -252,6 +277,7 @@ func (r *ExecRunner) env(t Turn) ([]string, error) {
 		"FACTORYD_ROOT":          r.Config.Paths.Root,
 		"FACTORYD_INBOX":         r.Config.InboxDir(),
 		"FACTORYD_OUTBOX":        r.Config.OutboxDir(),
+		"FACTORYD_BRIEF":         briefPath,
 		"FACTORYD_WORKDIR":       r.Config.TurnWorkdir(r.Role),
 		"FACTORYD_TARGET_BRANCH": r.Config.TargetBranch,
 		"FACTORYD_PROGRESS":      r.Config.ProgressPath(r.Role),

@@ -25,10 +25,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aicix-labs/factoryd/internal/brief"
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/scm"
 	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/supervise"
+	"github.com/aicix-labs/factoryd/internal/watch"
 )
 
 // Deps are the three sides of the crossing. Each is faked in tests.
@@ -203,6 +205,9 @@ var ErrRefused = errors.New("refresh refused")
 // decision taken outside the lock is a decision about a tree someone else
 // may be editing by the time it is acted on (#41 review). With force the
 // cycle is not consulted; the previous phase is returned for the operator.
+// Force never overrides a live producer-worktree lease: it is a repair for an
+// unknown cycle record, not authority to reset a tree while submit copies or
+// gates it.
 func Guarded(ctx context.Context, cfg *config.Config, deps Deps, force bool) (Result, string, error) {
 	var r Result
 	var prev string
@@ -211,6 +216,12 @@ func Guarded(ctx context.Context, cfg *config.Config, deps Deps, force bool) (Re
 		prev = state.CycleUnknown
 		if st.Cycle != nil {
 			prev = st.Cycle.Phase
+		}
+		if err := st.PermitProducerWorktreeUse(); err != nil {
+			if force {
+				return fmt.Errorf("%w: --force overrides cycle eligibility, not an active producer-worktree lease: %w", ErrRefused, err)
+			}
+			return fmt.Errorf("%w: producer worktree is in use: %w", ErrRefused, err)
 		}
 		if changed, note := Reconcile(ctx, cfg, st, deps.Lookup, deps.Ancestor, time.Now()); changed || note != "" {
 			reconciled = note
@@ -243,6 +254,13 @@ func BeforeTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 	return func(ctx context.Context, t supervise.Turn) (string, error) {
 		var msg string
 		_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+			// A manual/root-side submit may be copying this worktree into the
+			// protected repository or running its gate. This is every producer
+			// trigger's barrier, not just the queued-brief path: legacy briefs,
+			// answers, verdicts, and retries must not refresh or launch beside it.
+			if err := st.PermitProducerWorktreeUse(); err != nil {
+				return err
+			}
 			// An open cycle is checked against the provider once before
 			// the decision (#43): the deps are built for that read, and
 			// reused for the refresh if one follows.
@@ -286,4 +304,115 @@ func BeforeTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 		}
 		return msg, nil
 	}
+}
+
+// QueueStart decides, refreshes, and reserves a queued producer cycle in one
+// state-locked operation. It is intentionally separate from BeforeTurn: a
+// queued brief behind an open draft must not create a synthetic failed turn
+// merely to learn that it has to wait. More importantly, returning ready from
+// a read-only check would leave a gap in which another root-side operation
+// could open the cycle before factoryd takes the brief. The successful path
+// therefore refreshes and records CycleWorking before it releases the lock.
+// An open draft is reconciled at this boundary, so an operator merge releases
+// the next queued brief without a new manual wake.
+func QueueStart(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, error)) func(ctx context.Context, t supervise.Turn) (bool, string, error) {
+	return func(ctx context.Context, t supervise.Turn) (bool, string, error) {
+		source, done, err := queuedBriefPaths(cfg, t.Triggers)
+		if err != nil {
+			return false, "", err
+		}
+		started := false
+		var note string
+		_, err = state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+			rs := st.Role(state.RoleProducer)
+			if q := rs.QueueReservation; q != nil {
+				if q.Source == source && q.Done == done && !q.Taken && st.Cycle != nil && st.Cycle.Phase == state.CycleWorking {
+					// The supervisor crashed after reserving this source but before
+					// taking it. The replacement supervisor owns the same durable
+					// handoff and can finish the atomically checked move.
+					q.Turn = t.ID
+					started = true
+					return nil
+				}
+				note = "brief queue waiting: another queued brief reservation is still active"
+				return nil
+			}
+			if err := st.PermitProducerWorktreeUse(); err != nil {
+				note = "brief queue waiting: " + err.Error()
+				return nil
+			}
+			// An open cycle may have landed since the previous turn. Build the
+			// dependencies once and reuse them for the refresh after a proved
+			// merge, matching BeforeTurn's locked sequence.
+			var deps Deps
+			var built bool
+			if c := st.Cycle; c != nil && c.Phase == state.CycleOpen {
+				d, err := mkDeps(ctx)
+				if err != nil {
+					return err
+				}
+				deps, built = d, true
+				if _, n := Reconcile(ctx, cfg, st, deps.Lookup, deps.Ancestor, time.Now()); n != "" {
+					note = n
+				}
+			}
+			var why string
+			canStart, why := Decide(st)
+			if !canStart {
+				if note != "" {
+					note += "; "
+				}
+				note += "brief queue waiting: " + why
+				return nil
+			}
+			if !built {
+				d, err := mkDeps(ctx)
+				if err != nil {
+					return err
+				}
+				deps = d
+			}
+			r, err := Run(ctx, cfg, deps)
+			if err != nil {
+				return err
+			}
+			st.SetCycle(state.CycleNew, time.Now()).Base = r.SHA
+			// The current turn was recorded before entering QueueStart. Keep the
+			// source and planned done path in root-owned state with CycleWorking,
+			// so a crash before the rename is recoverable rather than a permanent
+			// queue stall.
+			st.SetCycle(state.CycleWorking, time.Now())
+			rs.QueueReservation = &state.QueueReservation{Source: source, Done: done, Turn: t.ID, ReservedAt: time.Now()}
+			started = true
+			if note != "" {
+				note += "; "
+			}
+			note += fmt.Sprintf("workdir refreshed to %s at %s", cfg.TargetBranch, short(r.SHA))
+			return nil
+		})
+		if err != nil {
+			return false, "", fmt.Errorf("refresh: starting the brief queue: %w", err)
+		}
+		return started, note, nil
+	}
+}
+
+func queuedBriefPaths(cfg *config.Config, triggers []watch.Trigger) (source, done string, err error) {
+	for _, trigger := range triggers {
+		if trigger.Label != brief.Label {
+			continue
+		}
+		if source != "" {
+			return "", "", errors.New("refresh: queued cycle has more than one brief")
+		}
+		p, pathErr := brief.DonePath(cfg, trigger.Path)
+		if pathErr != nil {
+			return "", "", fmt.Errorf("refresh: queued brief path: %w", pathErr)
+		}
+		source, done = trigger.Path, p
+	}
+	if source == "" {
+		return "", "", errors.New("refresh: queued cycle has no brief")
+	}
+	return source, done, nil
 }
