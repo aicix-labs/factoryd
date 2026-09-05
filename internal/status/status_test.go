@@ -284,6 +284,7 @@ func TestPipelineWaitIsVisibleWithoutBecomingAnOperatorNeed(t *testing.T) {
 	l.state(t, func(s *state.State) {
 		s.Role(state.RoleReviewer).PipelineWait = &state.PipelineWait{
 			ChangeID: "7", SHA: "abc123", Reason: "ci_must_pass", At: l.now,
+			AttemptLimit: 6, Deadline: l.now.Add(time.Hour),
 		}
 	})
 
@@ -296,6 +297,28 @@ func TestPipelineWaitIsVisibleWithoutBecomingAnOperatorNeed(t *testing.T) {
 	}
 	if text := status.Text(s); !strings.Contains(text, "waiting on CI for 7 at abc123") {
 		t.Fatalf("text did not expose the CI wait:\n%s", text)
+	}
+}
+
+func TestExhaustedPipelineWaitIsAnOperatorNeed(t *testing.T) {
+	l := newLab(t)
+	l.state(t, func(s *state.State) {
+		at := l.now.Add(-time.Hour)
+		wait := &state.PipelineWait{ChangeID: "7", SHA: "abc123", Reason: "ci_must_pass", At: at, Attempts: 2, AttemptLimit: 2, Deadline: l.now.Add(-time.Minute)}
+		s.Role(state.RoleReviewer).PipelineWait = wait
+		if b := s.ExhaustReviewerPipelineWait(l.now); b == nil {
+			t.Fatal("did not create an exhausted pipeline block")
+		}
+	})
+	s := l.collect()
+	if s.Working || s.PipelineWait == nil || s.PipelineWait.ExhaustedAt == nil {
+		t.Fatalf("exhausted wait was not shown as not working: %+v", s)
+	}
+	if !strings.Contains(strings.Join(s.NeedsMe, "\n"), "CI wait exhausted and is not retried") {
+		t.Fatalf("operator is not told that CI retry stopped: %v", s.NeedsMe)
+	}
+	if text := status.Text(s); !strings.Contains(text, "CI wait for 7 at abc123 exhausted") {
+		t.Fatalf("status does not name the exhausted CI wait:\n%s", text)
 	}
 }
 

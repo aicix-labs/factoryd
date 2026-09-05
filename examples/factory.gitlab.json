@@ -78,6 +78,8 @@
   "supervisor": {
     "spin_warn": 3,
     "spin_abort": 8,
+    "pipeline_attempts": 6,
+    "pipeline_timeout_seconds": 3600,
     "poll_interval_seconds": 2,
     "backoff_seconds": 15
   },

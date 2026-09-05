@@ -233,8 +233,13 @@ type Supervisor struct {
 	afterQueuedConfirm func()
 }
 
-// RetryLabel names the supervisor-owned retry trigger.
+// RetryLabel names the supervisor-owned retry trigger for a failed turn.
 const RetryLabel = "retry"
+
+// PipelineRetryLabel names the separate reviewer trigger for a
+// provider-confirmed CI wait. It must never share RetryPath: a direct signal
+// about CI cannot overwrite the only durable record of ordinary failed work.
+const PipelineRetryLabel = "pipeline-retry"
 
 // TriggersFor returns the trigger specs a role waits on (SPEC.md §6.2).
 //
@@ -259,6 +264,7 @@ func TriggersFor(cfg *config.Config, role string) ([]watch.Spec, error) {
 			{Label: "wake", Dir: cfg.InboxDir(), Pattern: "wake"},
 			{Label: "question", Dir: cfg.InboxDir(), Pattern: "question.md"},
 			retry,
+			{Label: PipelineRetryLabel, Dir: cfg.InboxDir(), Pattern: "reviewer-pipeline-retry"},
 		}, nil
 	default:
 		return nil, fmt.Errorf("supervise: role %q is not producer or reviewer", role)
@@ -443,15 +449,33 @@ func (s *Supervisor) recoverReviewerPipelineWait() error {
 	if err != nil {
 		return err
 	}
-	if st.Role(state.RoleReviewer).PipelineWait == nil {
+	wait := st.Role(state.RoleReviewer).PipelineWait
+	if wait == nil {
 		return nil
 	}
-	if _, err := os.Lstat(s.cfg.RetryPath(s.role)); err == nil {
+	if wait.Exhausted(s.now()) {
+		var exhausted *state.Block
+		_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(current *state.State) error {
+			exhausted = current.ExhaustReviewerPipelineWait(s.now())
+			return nil
+		})
+		if err != nil {
+			return err
+		}
+		if exhausted != nil {
+			if err := s.removePipelineRetry(*wait); err != nil {
+				return fmt.Errorf("removing exhausted reviewer pipeline retry: %w", err)
+			}
+			s.log.Error("reviewer pipeline wait exhausted; automatic review retries stopped", "change", wait.ChangeID, "sha", wait.SHA, "reason", exhausted.Reason)
+		}
+		return nil
+	}
+	if _, err := os.Lstat(s.cfg.PipelineRetryPath()); err == nil {
 		return nil
 	} else if !os.IsNotExist(err) {
 		return fmt.Errorf("examining reviewer pipeline retry marker: %w", err)
 	}
-	return s.writePipelineRetry(*st.Role(state.RoleReviewer).PipelineWait, s.now())
+	return s.writePipelineRetry(*wait, s.now())
 }
 
 // recoverQueuedReservation closes the two crash windows around an ordered

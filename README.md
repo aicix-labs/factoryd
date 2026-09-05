@@ -56,9 +56,12 @@ and the gate never marks a draft ready.
 When GitLab explicitly reports that a reviewed merge is waiting only on CI or
 mergeability computation, `signal merged` records no terminal verdict. It
 returns success with a durable reviewer pipeline wait; the reviewer supervisor
-re-arms a later review attempt, and status says “waiting on CI.” A conflict,
-scope refusal, or missing audit remains a refusal for the reviewer to resolve
-or explicitly operator-gate.
+re-arms a later review attempt, and status says “waiting on CI.” Automatic
+retries are bounded by `supervisor.pipeline_attempts` (default 6) and
+`supervisor.pipeline_timeout_seconds` (default 3600); exhaustion is a visible
+operator condition, never an indefinitely healthy loop. A conflict, scope
+refusal, or missing audit remains a refusal for the reviewer to resolve or
+explicitly operator-gate.
 
 ## What works today
 

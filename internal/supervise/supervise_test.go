@@ -1632,7 +1632,8 @@ func TestReviewerPipelineWaitRearmsAfterTheAgentConsumesItsWake(t *testing.T) {
 		}
 		if n == 1 {
 			_, err := state.Update(fx.cfg.StatePath(), fx.cfg.Name, func(st *state.State) error {
-				return st.SetReviewerPipelineWait(state.PipelineWait{ChangeID: "42", SHA: "abc", Reason: "ci_must_pass", At: time.Now()})
+				at := time.Now()
+				return st.SetReviewerPipelineWait(state.PipelineWait{ChangeID: "42", SHA: "abc", Reason: "ci_must_pass", At: at, AttemptLimit: 6, Deadline: at.Add(time.Hour)})
 			})
 			if err != nil {
 				t.Errorf("recording pipeline wait: %v", err)
@@ -1665,7 +1666,7 @@ func TestReviewerPipelineWaitRearmsAfterTheAgentConsumesItsWake(t *testing.T) {
 	if rs.PipelineWait != nil || rs.CurrentTurn != nil || rs.LastTurn == nil || rs.Halted {
 		t.Fatalf("pipeline retry did not finalize/clear cleanly: %+v", rs)
 	}
-	if _, err := os.Stat(fx.cfg.RetryPath("reviewer")); !os.IsNotExist(err) {
+	if _, err := os.Stat(fx.cfg.PipelineRetryPath()); !os.IsNotExist(err) {
 		t.Fatalf("pipeline retry marker survived a conclusive retry: %v", err)
 	}
 }
@@ -1677,7 +1678,8 @@ func TestReviewerPipelineWaitRearmsAfterTheAgentConsumesItsWake(t *testing.T) {
 func TestReviewerPipelineWaitRecoversAfterSupervisorRestart(t *testing.T) {
 	fx := newFixture(t)
 	if _, err := state.Update(fx.cfg.StatePath(), fx.cfg.Name, func(st *state.State) error {
-		if err := st.SetReviewerPipelineWait(state.PipelineWait{ChangeID: "42", SHA: "abc", Reason: "ci_still_running", At: time.Now()}); err != nil {
+		at := time.Now()
+		if err := st.SetReviewerPipelineWait(state.PipelineWait{ChangeID: "42", SHA: "abc", Reason: "ci_still_running", At: at, AttemptLimit: 6, Deadline: at.Add(time.Hour)}); err != nil {
 			return err
 		}
 		return nil
@@ -1685,7 +1687,7 @@ func TestReviewerPipelineWaitRecoversAfterSupervisorRestart(t *testing.T) {
 		t.Fatal(err)
 	}
 	r := &fakeRunner{act: func(_ int, tr supervise.Turn) supervise.TurnResult {
-		if len(tr.Triggers) != 1 || tr.Triggers[0].Label != supervise.RetryLabel {
+		if len(tr.Triggers) != 1 || tr.Triggers[0].Label != supervise.PipelineRetryLabel {
 			t.Errorf("recovered triggers=%+v, want one reviewer retry", tr.Triggers)
 		}
 		for _, trigger := range tr.Triggers {
@@ -1713,8 +1715,55 @@ func TestReviewerPipelineWaitRecoversAfterSupervisorRestart(t *testing.T) {
 	if rs.PipelineWait != nil || rs.CurrentTurn != nil || rs.LastTurn == nil || rs.Halted {
 		t.Fatalf("recovered pipeline retry did not finalize cleanly: %+v", rs)
 	}
-	if _, err := os.Stat(fx.cfg.RetryPath("reviewer")); !os.IsNotExist(err) {
+	if _, err := os.Stat(fx.cfg.PipelineRetryPath()); !os.IsNotExist(err) {
 		t.Fatalf("recovered pipeline retry marker survived a conclusive retry: %v", err)
+	}
+}
+
+// Progress from a CI wait is real only inside its own durable budget. A
+// permanently red pipeline must become an operator-visible condition instead
+// of resetting the normal guards forever and keeping status green.
+func TestReviewerPipelineWaitExhaustsItsDurableAttemptBudget(t *testing.T) {
+	fx := newFixture(t)
+	fx.cfg.Supervisor.PipelineAttempts = 2
+	fx.cfg.Supervisor.PipelineTimeoutSeconds = 3600
+	fx.wake(t)
+	r := &fakeRunner{act: func(n int, tr supervise.Turn) supervise.TurnResult {
+		for _, trigger := range tr.Triggers {
+			_ = os.Remove(trigger.Path)
+		}
+		if n == 1 {
+			_, err := state.Update(fx.cfg.StatePath(), fx.cfg.Name, func(st *state.State) error {
+				at := time.Now()
+				return st.SetReviewerPipelineWait(state.PipelineWait{ChangeID: "42", SHA: "abc", Reason: "ci_must_pass", At: at, AttemptLimit: 2, Deadline: at.Add(time.Hour)})
+			})
+			if err != nil {
+				t.Errorf("recording pipeline wait: %v", err)
+			}
+		}
+		return supervise.TurnResult{}
+	}}
+	s := fx.newSupervisor(t, r, 2)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); err != nil {
+		t.Fatal(err)
+	}
+	if r.count() != 2 {
+		t.Fatalf("reviewer ran %d turns, want exactly the attempt budget", r.count())
+	}
+	rs := fx.roleState(t)
+	if rs.PipelineWait == nil || rs.PipelineWait.Attempts != 2 || rs.PipelineWait.ExhaustedAt == nil {
+		t.Fatalf("pipeline wait was not durably exhausted: %+v", rs.PipelineWait)
+	}
+	if rs.Blocked == nil || rs.Blocked.Disposition != state.PipelineWaitExhausted {
+		t.Fatalf("exhausted pipeline wait is not visible as a block: %+v", rs.Blocked)
+	}
+	if rs.Halted {
+		t.Fatalf("budget exhaustion should wait visibly for an operator, not halt: %+v", rs)
+	}
+	if _, err := os.Stat(fx.cfg.PipelineRetryPath()); !os.IsNotExist(err) {
+		t.Fatalf("exhausted pipeline wait left a retry armed: %v", err)
 	}
 }
 

@@ -69,6 +69,10 @@ type Result struct {
 	// CI/merge computation is the only reason a merge could not proceed. It is
 	// a successful, durable scheduling decision, not an operator-gated verdict.
 	PipelineWait *state.PipelineWait
+	// PipelineBlocked is set with PipelineWait when that wait spent its durable
+	// automatic retry budget. The condition is visible to an operator and no
+	// reviewer retry is armed.
+	PipelineBlocked *state.Block
 }
 
 // Run records a verdict. For "merged" it is the merge gate: it classifies
@@ -193,11 +197,43 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 		case scm.MergeUnknown:
 			return res, &Error{Exit: ExitUnknown, Err: fmt.Errorf("merge of %s is UNKNOWN: %s", req.ID, mr.Reason)}
 		case scm.RefusedPipeline:
-			wait := state.PipelineWait{ChangeID: string(req.ID), SHA: sha, Reason: mr.Reason, At: now()}
+			at := now()
+			limit, timeout := pipelineBudget(cfg)
+			wait := state.PipelineWait{
+				ChangeID: string(req.ID), SHA: sha, Reason: mr.Reason, At: at,
+				AttemptLimit: limit, Deadline: at.Add(timeout),
+			}
+			var blocked *state.Block
 			if _, err := state.Update(cfg.StatePath(), cfg.Name, func(s *state.State) error {
-				return s.SetReviewerPipelineWait(wait)
+				if current := s.Role(state.RoleReviewer).PipelineWait; current != nil && current.ChangeID == wait.ChangeID && current.SHA == wait.SHA {
+					// The supervisor, not the agent, increments Attempts after a
+					// completed reviewer turn. A repeat signal therefore preserves
+					// the first wait's immutable budget and deadline.
+					wait = *current
+					wait.Reason = mr.Reason
+				}
+				if err := s.SetReviewerPipelineWait(wait); err != nil {
+					return err
+				}
+				if b := s.ExhaustReviewerPipelineWait(at); b != nil {
+					blocked = b
+					wait = *s.Role(state.RoleReviewer).PipelineWait
+				}
+				return nil
 			}); err != nil {
 				return res, failed("recording the pipeline wait: %w", err)
+			}
+			res.Verdict = state.Verdict{}
+			res.PipelineWait = &wait
+			if blocked != nil {
+				// The existing pipeline marker may name this exact exhausted
+				// wait. Remove only that marker; generic retry continuity is a
+				// separate obligation and must survive.
+				if err := clearReviewerPipelineRetry(cfg, wait.ChangeID, wait.SHA); err != nil {
+					return res, failed("clearing the exhausted reviewer pipeline retry: %w", err)
+				}
+				res.PipelineBlocked = blocked
+				return res, nil
 			}
 			// The durable state record is the authority if a supervisor crashes.
 			// This marker also wakes an already-idle reviewer supervisor when
@@ -207,8 +243,6 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 			if err := writeReviewerPipelineRetry(cfg, wait); err != nil {
 				return res, failed("arming the reviewer pipeline retry: %w", err)
 			}
-			res.Verdict = state.Verdict{}
-			res.PipelineWait = &wait
 			return res, nil
 		default:
 			return res, refuse("provider refused to merge %s: %s (%s)", req.ID, mr.Reason, mr.Outcome)
@@ -248,7 +282,7 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 	}); err != nil {
 		return res, failed("recording the verdict in state: %w", err)
 	}
-	if err := clearReviewerPipelineRetry(cfg, v.ChangeID); err != nil {
+	if err := clearReviewerPipelineRetry(cfg, v.ChangeID, v.SHA); err != nil {
 		return res, failed("clearing the resolved reviewer pipeline retry: %w", err)
 	}
 	if err := deps.Driver.Comment(ctx, req.ID, commentFor(v, deps.Reviewer)); err != nil {
@@ -418,7 +452,7 @@ func RecordMerged(ctx context.Context, cfg *config.Config, d scm.Driver, id scm.
 	}); err != nil {
 		return state.Verdict{}, "", fmt.Errorf("recording the verdict in state: %w", err)
 	}
-	if err := clearReviewerPipelineRetry(cfg, v.ChangeID); err != nil {
+	if err := clearReviewerPipelineRetry(cfg, v.ChangeID, v.SHA); err != nil {
 		return state.Verdict{}, "", fmt.Errorf("clearing the resolved reviewer pipeline retry: %w", err)
 	}
 	return v, path, nil
@@ -433,14 +467,14 @@ func writeReviewerPipelineRetry(cfg *config.Config, wait state.PipelineWait) err
 		"reviewer pipeline wait\norigin: provider pipeline\nstep: turn\nchange: %s\nsha: %s\nat: %s\n\n"+
 			"GitLab explicitly reported that CI or mergeability is still pending. Re-run the reviewer turn; do not convert this self-clearing condition into an operator-gated verdict.\n",
 		wait.ChangeID, wait.SHA, wait.At.Format(time.RFC3339))
-	return os.WriteFile(cfg.RetryPath(string(state.RoleReviewer)), []byte(body), 0o644)
+	return os.WriteFile(cfg.PipelineRetryPath(), []byte(body), 0o644)
 }
 
 // clearReviewerPipelineRetry removes only the matching pipeline marker. A
 // normal retry may use the same filename, and a wait for another change must
 // never be mistaken for proof that this verdict resolved it.
-func clearReviewerPipelineRetry(cfg *config.Config, changeID string) error {
-	path := cfg.RetryPath(string(state.RoleReviewer))
+func clearReviewerPipelineRetry(cfg *config.Config, changeID, sha string) error {
+	path := cfg.PipelineRetryPath()
 	raw, err := os.ReadFile(path)
 	if os.IsNotExist(err) {
 		return nil
@@ -448,20 +482,34 @@ func clearReviewerPipelineRetry(cfg *config.Config, changeID string) error {
 	if err != nil {
 		return err
 	}
-	origin, change := "", ""
+	origin, change, markerSHA := "", "", ""
 	for _, line := range strings.Split(string(raw), "\n") {
 		switch {
 		case strings.HasPrefix(line, "origin: "):
 			origin = strings.TrimPrefix(line, "origin: ")
 		case strings.HasPrefix(line, "change: "):
 			change = strings.TrimPrefix(line, "change: ")
+		case strings.HasPrefix(line, "sha: "):
+			markerSHA = strings.TrimPrefix(line, "sha: ")
 		}
 	}
-	if origin != "provider pipeline" || change != changeID {
+	if origin != "provider pipeline" || change != changeID || markerSHA != sha {
 		return nil
 	}
 	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
 		return err
 	}
 	return nil
+}
+
+func pipelineBudget(cfg *config.Config) (int, time.Duration) {
+	attempts := cfg.Supervisor.PipelineAttempts
+	if attempts <= 0 {
+		attempts = config.DefaultPipelineAttempts
+	}
+	seconds := cfg.Supervisor.PipelineTimeoutSeconds
+	if seconds <= 0 {
+		seconds = config.DefaultPipelineTimeout
+	}
+	return attempts, time.Duration(seconds) * time.Second
 }

@@ -76,6 +76,10 @@ func runSignal(args []string) int {
 		return exitConfig
 	}
 	if res.PipelineWait != nil {
+		if res.PipelineBlocked != nil {
+			fmt.Printf("waiting for CI on %s at %s exhausted its automatic retry budget; operator attention required: %s\n", res.PipelineWait.ChangeID, res.PipelineWait.SHA, res.PipelineBlocked.Reason)
+			return signal.ExitDone
+		}
 		fmt.Printf("waiting for CI on %s at %s; reviewer retry scheduled: %s\n", res.PipelineWait.ChangeID, res.PipelineWait.SHA, res.PipelineWait.Reason)
 		return signal.ExitDone
 	}

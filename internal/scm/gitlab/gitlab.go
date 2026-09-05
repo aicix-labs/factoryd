@@ -601,12 +601,29 @@ func (d *Driver) Merge(ctx context.Context, id scm.ChangeID, expectedHead string
 				// conflict and 422 meant CI, so a real conflict was reported as
 				// RefusedPipeline -- the wrong reason, with the suite green.
 				//
-				// The detailed merge status is the provider's stated reason. Unlike
-				// the HTTP refusal status, it distinguishes CI that may clear on
-				// its own from a conflict that needs an actor.
-				outcome := mergeRefusalOutcome(m.DetailedMergeStatus)
+				// The detailed status read before PUT is only a hint. A push or
+				// conflict can win that gap, so a possible CI retry must re-read
+				// the MR after the refusal and prove it still names the exact head
+				// we tried. A non-pipeline status needs no second read because it
+				// cannot schedule work on the old fact.
+				detailed := m.DetailedMergeStatus
+				if mergeRefusalOutcome(detailed) == scm.RefusedPipeline {
+					current, rereadErr := d.get(ctx, id)
+					if rereadErr != nil {
+						return scm.ProviderMerge{}, fmt.Errorf("gitlab re-reading %s after merge refusal: %w", id, rereadErr)
+					}
+					if current.SHA != expectedHead {
+						return scm.RefusedByProvider(scm.RefusedConflict,
+							"head moved after gitlab refused the merge: expected %s, merge request is at %s", expectedHead, current.SHA), nil
+					}
+					detailed = current.DetailedMergeStatus
+				}
+				// The post-refusal detailed status is the provider's stated reason.
+				// Unlike the HTTP refusal status, it distinguishes CI that may
+				// clear on its own from a conflict that needs an actor.
+				outcome := mergeRefusalOutcome(detailed)
 				return scm.RefusedByProvider(outcome,
-					"gitlab refused the merge (HTTP %d, detailed_merge_status=%q): %s", he.Status, m.DetailedMergeStatus, he.Message()), nil
+					"gitlab refused the merge (HTTP %d, detailed_merge_status=%q): %s", he.Status, detailed, he.Message()), nil
 			}
 		}
 		return scm.ProviderMerge{}, fmt.Errorf("gitlab merge %s: %w", id, err)

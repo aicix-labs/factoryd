@@ -66,6 +66,9 @@ func TestLoadGoodConfig(t *testing.T) {
 	if got := c.StatePath(); got != "/var/lib/factoryd/widgets/state.json" {
 		t.Fatalf("StatePath = %q", got)
 	}
+	if c.Supervisor.PipelineAttempts != config.DefaultPipelineAttempts || c.Supervisor.PipelineTimeoutSeconds != config.DefaultPipelineTimeout {
+		t.Fatalf("pipeline retry defaults = %d attempts / %ds, want %d / %d", c.Supervisor.PipelineAttempts, c.Supervisor.PipelineTimeoutSeconds, config.DefaultPipelineAttempts, config.DefaultPipelineTimeout)
+	}
 }
 
 // A misspelled key must be an error. Otherwise the default stays in place and

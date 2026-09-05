@@ -339,7 +339,11 @@ func needsMe(cfg *config.Config, s Snapshot, st *state.State) []string {
 	for _, r := range state.Roles {
 		v := s.Roles[string(r)]
 		if b := v.Blocked; b != nil {
-			out = append(out, fmt.Sprintf("%s submission %s and not retried: %s -- fix the cause and run factoryd submit; a successful submission clears this", r, b.Disposition, b.Reason))
+			if b.Disposition == state.PipelineWaitExhausted {
+				out = append(out, fmt.Sprintf("%s CI wait exhausted and is not retried: %s -- investigate the provider, then have the reviewer issue a conclusive verdict for that head", r, b.Reason))
+			} else {
+				out = append(out, fmt.Sprintf("%s submission %s and not retried: %s -- fix the cause and run factoryd submit; a successful submission clears this", r, b.Disposition, b.Reason))
+			}
 		}
 		switch {
 		case v.Halted:

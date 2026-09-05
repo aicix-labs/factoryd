@@ -263,7 +263,7 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	// alone: the producer's turn already succeeded and its intent is still
 	// declared; rerunning the model is new work, not a retry (#42).
 	resumeAfterTurn := false
-	if _, onRetry := withoutRetry(triggers); onRetry && s.afterTurn != nil && readRetryStep(s.cfg.RetryPath(s.role)) == RetryStepAfterTurn {
+	if _, onRetry, _ := withoutSupervisorRetries(triggers); onRetry && s.afterTurn != nil && readRetryStep(s.cfg.RetryPath(s.role)) == RetryStepAfterTurn {
 		resumeAfterTurn = true
 		skipped = true
 		s.log.Info("retry resumes the after-turn step; the agent does not rerun", "turn", turn.ID)
@@ -395,8 +395,8 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 		// same stall as a consumed failure, arriving via shutdown. Persist an
 		// interrupted marker so the restart runs exactly one recovery turn.
 		// The streak stays at zero: this is not a failure, it is continuity.
-		if real, onRetry := withoutRetry(triggers); len(real) > 0 && !onRetry {
-			if remaining, perr := s.watcher.Pending(); perr == nil && consumed(real, removeRetry(remaining)) {
+		if real, onRetry, _ := withoutSupervisorRetries(triggers); len(real) > 0 && !onRetry {
+			if remaining, perr := s.watcher.Pending(); perr == nil && consumed(real, removeSupervisorRetries(remaining)) {
 				if werr := s.writeInterruptedMarker(turn, res, ended); werr != nil {
 					// Cannot record continuity: say so where it will be seen, and
 					// exit non-zero so the stop is not mistaken for clean.
@@ -466,8 +466,8 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	// The retry marker is the supervisor's, not the agent's: the agent is never
 	// asked to consume it, so it must not count as an unconsumed trigger, and
 	// it is removed here once the turn it re-armed has run.
-	real, onRetry := withoutRetry(triggers)
-	remaining = removeRetry(remaining)
+	real, onRetry, onPipelineRetry := withoutSupervisorRetries(triggers)
+	remaining = removeSupervisorRetries(remaining)
 	didConsume := consumed(real, remaining) && (len(real) > 0 || onRetry)
 	// Progress, not consumption, is what resets the counter. A large task
 	// legitimately spans turns; a guard that cannot tell "still working" from
@@ -585,6 +585,8 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	var haltReason string
 	spin, fails := 0, 0
 	pipelineWaiting := false
+	pipelineExhausted := false
+	var exhaustedPipeline state.PipelineWait
 
 	if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
 		rs := st.Role(state.Role(s.role))
@@ -603,13 +605,27 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 			rs.QueueReservation = nil
 		}
 		rs.SetPending(toPending(remaining, ended))
+		// A pipeline retry whose turn cleared the wait completed a real review
+		// decision even though its marker is supervisor-owned and therefore is
+		// not counted as an agent-consumed source trigger.
+		if s.role == string(state.RoleReviewer) && onPipelineRetry && rs.PipelineWait == nil {
+			progressed = true
+		}
 		// A clean reviewer turn that recorded a provider-confirmed pipeline
 		// wait made durable progress even when its wrapper has no separate
-		// progress touch. Credit the record, not a vanished trigger, so the
-		// spin guard cannot turn a self-clearing CI condition into a halt.
-		if s.role == string(state.RoleReviewer) && !failed && rs.PipelineWait != nil {
-			pipelineWaiting = true
+		// progress touch. That credit is deliberately bounded: every such
+		// completed turn spends one state-owned retry attempt, and deadline or
+		// attempt exhaustion becomes a visible reviewer block rather than an
+		// indefinitely healthy-looking loop.
+		if s.role == string(state.RoleReviewer) && !failed && rs.PipelineWait != nil && rs.PipelineWait.ExhaustedAt == nil {
+			rs.PipelineWait.Attempts++
 			progressed = true
+			if block := st.ExhaustReviewerPipelineWait(ended); block != nil {
+				pipelineExhausted = true
+				exhaustedPipeline = *rs.PipelineWait
+			} else {
+				pipelineWaiting = true
+			}
 		}
 
 		if didConsume || progressed {
@@ -672,6 +688,13 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 		}
 		return false, restartAfterTurn
 	}
+	if pipelineExhausted && !halted {
+		if err := s.removePipelineRetry(exhaustedPipeline); err != nil {
+			return true, s.haltNow(ended, fmt.Sprintf("could not remove the exhausted reviewer pipeline retry (%v)", err))
+		}
+		s.log.Error("reviewer pipeline wait exhausted; automatic review retries stopped", "turn", turn.ID, "change", exhaustedPipeline.ChangeID, "sha", exhaustedPipeline.SHA, "attempts", exhaustedPipeline.Attempts, "limit", exhaustedPipeline.AttemptLimit, "deadline", exhaustedPipeline.Deadline)
+		return false, nil
+	}
 	if pipelineWaiting && !halted {
 		wait, err := s.reviewerPipelineWait()
 		if err != nil {
@@ -687,7 +710,7 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 		if err := s.writePipelineRetry(*wait, ended); err != nil {
 			return true, s.haltNow(ended, fmt.Sprintf("could not re-arm the reviewer after a pipeline wait (%v)", err))
 		}
-		s.log.Info("reviewer merge is waiting on CI; re-arming a review retry", "turn", turn.ID, "change", wait.ChangeID, "sha", wait.SHA, "retry", s.cfg.RetryPath(s.role))
+		s.log.Info("reviewer merge is waiting on CI; re-arming a review retry", "turn", turn.ID, "change", wait.ChangeID, "sha", wait.SHA, "retry", s.cfg.PipelineRetryPath())
 		if err := s.sleep(ctx, time.Minute); err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return false, err
@@ -938,20 +961,25 @@ func (s *Supervisor) writeStopSentinel(reason string, at time.Time) error {
 	return os.WriteFile(s.cfg.StopPath(s.role), []byte(body), 0o644)
 }
 
-// withoutRetry splits the supervisor's retry marker out of a trigger set.
-func withoutRetry(ts []watch.Trigger) (real []watch.Trigger, onRetry bool) {
+// withoutSupervisorRetries splits both supervisor-owned retry markers out of
+// a trigger set. They have separate paths because a CI wait must never erase a
+// generic failed-turn retry; neither is an agent-owned source trigger.
+func withoutSupervisorRetries(ts []watch.Trigger) (real []watch.Trigger, onRetry, onPipelineRetry bool) {
 	for _, t := range ts {
-		if t.Label == RetryLabel {
+		switch t.Label {
+		case RetryLabel:
 			onRetry = true
-			continue
+		case PipelineRetryLabel:
+			onPipelineRetry = true
+		default:
+			real = append(real, t)
 		}
-		real = append(real, t)
 	}
-	return real, onRetry
+	return real, onRetry, onPipelineRetry
 }
 
-func removeRetry(ts []watch.Trigger) []watch.Trigger {
-	out, _ := withoutRetry(ts)
+func removeSupervisorRetries(ts []watch.Trigger) []watch.Trigger {
+	out, _, _ := withoutSupervisorRetries(ts)
 	return out
 }
 
@@ -963,7 +991,7 @@ func removeRetry(ts []watch.Trigger) []watch.Trigger {
 // marker that only named "retry" would be the record of a record.
 func (s *Supervisor) writeRetry(turn Turn, res TurnResult, fails int, at time.Time, step string) error {
 	path := s.cfg.RetryPath(s.role)
-	real, onRetry := withoutRetry(turn.Triggers)
+	real, onRetry, _ := withoutSupervisorRetries(turn.Triggers)
 	origin := labels(real)
 	if onRetry && origin == "" {
 		origin = readRetryLine(path, "origin: ")
@@ -1023,7 +1051,39 @@ func (s *Supervisor) writePipelineRetry(wait state.PipelineWait, at time.Time) e
 		"reviewer pipeline wait\norigin: provider pipeline\nstep: %s\nchange: %s\nsha: %s\nat: %s\n\n"+
 			"GitLab explicitly reported that CI or mergeability is still pending. Re-run the reviewer turn; do not convert this self-clearing condition into an operator-gated verdict.\n",
 		RetryStepTurn, wait.ChangeID, wait.SHA, at.Format(time.RFC3339))
-	return os.WriteFile(s.cfg.RetryPath(s.role), []byte(body), 0o644)
+	return os.WriteFile(s.cfg.PipelineRetryPath(), []byte(body), 0o644)
+}
+
+// removePipelineRetry removes only the retry marker that names this exact
+// wait. A fresh wait for a new reviewed head can appear while state is being
+// finalised; deleting that marker would strand its independent obligation.
+func (s *Supervisor) removePipelineRetry(wait state.PipelineWait) error {
+	path := s.cfg.PipelineRetryPath()
+	raw, err := os.ReadFile(path)
+	if os.IsNotExist(err) {
+		return nil
+	}
+	if err != nil {
+		return err
+	}
+	origin, change, sha := "", "", ""
+	for _, line := range strings.Split(string(raw), "\n") {
+		switch {
+		case strings.HasPrefix(line, "origin: "):
+			origin = strings.TrimPrefix(line, "origin: ")
+		case strings.HasPrefix(line, "change: "):
+			change = strings.TrimPrefix(line, "change: ")
+		case strings.HasPrefix(line, "sha: "):
+			sha = strings.TrimPrefix(line, "sha: ")
+		}
+	}
+	if origin != "provider pipeline" || change != wait.ChangeID || sha != wait.SHA {
+		return nil
+	}
+	if err := os.Remove(path); err != nil && !os.IsNotExist(err) {
+		return err
+	}
+	return nil
 }
 
 // Retry steps: what the retry marker re-arms. RetryStepTurn reruns the
@@ -1082,7 +1142,7 @@ func (s *Supervisor) haltNow(at time.Time, reason string) error {
 // writeInterruptedMarker records that a shutdown cut a turn off after it had
 // consumed its trigger, so the next start knows to run one recovery turn.
 func (s *Supervisor) writeInterruptedMarker(turn Turn, res TurnResult, at time.Time) error {
-	real, _ := withoutRetry(turn.Triggers)
+	real, _, _ := withoutSupervisorRetries(turn.Triggers)
 	body := fmt.Sprintf(
 		"retry 0 of %d\norigin: %s\nafter turn: %s\nexit: %d\ninterrupted: true\nat: %s\n\n"+
 			"The supervisor was stopped after this turn consumed its trigger. This is a recovery turn, not a failure.\n",

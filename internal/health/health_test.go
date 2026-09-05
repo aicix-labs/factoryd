@@ -753,3 +753,26 @@ func TestBlockedSubmissionIsACondition(t *testing.T) {
 		}
 	}
 }
+
+func TestExhaustedPipelineWaitIsAConditionWithoutRearming(t *testing.T) {
+	l := newLab(t)
+	l.withState(t, func(s *state.State) {
+		at := l.now.Add(-time.Hour)
+		s.Role(state.RoleReviewer).PipelineWait = &state.PipelineWait{
+			ChangeID: "42", SHA: "abc", Reason: "ci_must_pass", At: at,
+			Attempts: 2, AttemptLimit: 2, Deadline: l.now.Add(-time.Minute),
+		}
+		if s.ExhaustReviewerPipelineWait(l.now) == nil {
+			t.Fatal("did not exhaust the pipeline wait")
+		}
+	})
+	rep := l.tick(t)
+	if !hasKey(rep, "pipeline_wait_exhausted/reviewer") {
+		t.Fatalf("findings=%v", keys(rep))
+	}
+	for _, f := range rep.Findings {
+		if f.Key == "pipeline_wait_exhausted/reviewer" && (!strings.Contains(f.Summary, "CI wait exhausted") || !strings.Contains(f.Detail, "no review retry is armed")) {
+			t.Fatalf("finding %+v", f)
+		}
+	}
+}
