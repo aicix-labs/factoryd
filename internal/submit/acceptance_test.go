@@ -1173,8 +1173,8 @@ func TestLegacyVerdictRegistryBlocksWithoutSilentQuarantine(t *testing.T) {
 		t.Fatal(err)
 	}
 	err := a.runFor(t, 1, 4*time.Second)
-	if !errors.Is(err, state.ErrVerdictRegistryMigrationRequired) {
-		t.Fatalf("Run error = %v, want migration-required", err)
+	if !errors.Is(err, state.ErrSchemaMigrationRequired) {
+		t.Fatalf("Run error = %v, want the explicit schema-migration barrier", err)
 	}
 	if got := a.producerTurns(t); got != 0 {
 		t.Fatalf("legacy verdict ran %d producer turns", got)
@@ -1187,8 +1187,8 @@ func TestLegacyVerdictRegistryBlocksWithoutSilentQuarantine(t *testing.T) {
 	if st.VerdictRegistry == nil || st.VerdictRegistry.Status != state.VerdictRegistryMigrationRequired {
 		t.Fatalf("migration block was not persisted: %+v", st.VerdictRegistry)
 	}
-	if _, err := signal.Issue(a.cfg, state.Verdict{ChangeID: "48", Kind: state.VerdictChangesRequested, Summary: "current", At: time.Now(), Branch: "producer/fix-0123456789", DeclaredBranch: "producer/fix"}); !errors.Is(err, state.ErrVerdictRegistryMigrationRequired) {
-		t.Fatalf("signal Issue bypassed registry migration: %v", err)
+	if _, err := signal.Issue(a.cfg, state.Verdict{ChangeID: "48", Kind: state.VerdictChangesRequested, Summary: "current", At: time.Now(), Branch: "producer/fix-0123456789", DeclaredBranch: "producer/fix"}); !errors.Is(err, state.ErrSchemaMigrationRequired) {
+		t.Fatalf("signal Issue bypassed the schema-migration barrier: %v", err)
 	}
 	moved, err := state.MigrateVerdictRegistry(a.cfg.StatePath(), a.cfg.Name, a.cfg.OutboxDir())
 	if err != nil {
