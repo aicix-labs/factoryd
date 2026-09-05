@@ -1055,7 +1055,12 @@ family exactly* — a complete declaration under another name is moved aside,
 the verdict kept, and the turn failed so the after-turn step never submits an
 unrelated draft (#29 again) — so a model that failed, declared nothing, or
 declared the wrong family leaves the verdict for the retry, which is then told
-it again; `FACTORYD_TRIGGER_PATHS` is split on the platform's path-list
+it again — and such a turn is *no progress*, whatever the model touched: the
+wrapper snapshots the progress marker before the agent and restores its exact
+mtime when the selected verdict ends unresolved, and exits non-zero, so the
+supervisor's guards count it, back off, and halt at `fail_abort` with the
+verdict still in the outbox, rather than reading the touch as progress and
+re-running the kept trigger forever; `FACTORYD_TRIGGER_PATHS` is split on the platform's path-list
 separator, so configured paths containing it are refused at load and a trigger
 path containing it refuses the turn; every TSV field, the path included, is refused by the
 runner if it holds a tab or newline, and configured paths with control

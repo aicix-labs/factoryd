@@ -444,8 +444,49 @@ func TestAgentCleanNoIntentKeepsTheVerdict(t *testing.T) {
 	if len(a.tr.calls) != 0 || a.drv.opened != nil {
 		t.Fatalf("submit side effects for a no-intent turn: %v", a.tr.calls)
 	}
-	if rs := a.producer(t); rs.LastTurn == nil || rs.LastTurn.ExitCode == nil || *rs.LastTurn.ExitCode != 0 {
-		t.Fatalf("last turn %+v", rs.LastTurn)
+	// Not a clean turn: the verdict was not acted on, so the wrapper
+	// reports a failure with no progress (#50 review, round 6).
+	if rs := a.producer(t); rs.LastTurn == nil || rs.LastTurn.ExitCode == nil || *rs.LastTurn.ExitCode == 0 {
+		t.Fatalf("last turn %+v; a no-intent turn on a verdict must not read as clean", rs.LastTurn)
+	}
+}
+
+// The unresolved-verdict loop (#50 review, round 6): a model that touches
+// progress and declares nothing, on a changes-requested verdict, must NOT
+// read as progress -- that would reset both guards and re-run the kept
+// trigger forever. The wrapper rolls the marker back and fails the turn,
+// so the supervisor backs off and halts at fail_abort, with the verdict
+// still in the outbox and nothing submitted. Same for the wrong family.
+func TestUnresolvedVerdictReachesFailAbortWithTheVerdictKept(t *testing.T) {
+	for _, c := range []struct{ name, model string }{
+		{"no intent, progress touched", `touch "$FACTORYD_PROGRESS"; exit 0`},
+		{"wrong family, progress touched", `printf 'producer/other
+' > "$FACTORYD_WORKDIR/.producer-branch"
+printf 'msg
+' > "$FACTORYD_WORKDIR/.producer-commit-msg"
+touch "$FACTORYD_PROGRESS"; exit 0`},
+	} {
+		t.Run(c.name, func(t *testing.T) {
+			a := newAgentAcceptance(t, c.model)
+			vp := a.verdictFor(t, "48", "producer/fix")
+			err := a.runFor(t, 50, 20*time.Second)
+			if !errors.Is(err, supervise.ErrHalted) {
+				t.Fatalf("Run returned %v, want ErrHalted: the unresolved verdict never reached fail_abort (turns=%d)", err, a.producerTurns(t))
+			}
+			rs := a.producer(t)
+			if !rs.Halted || !strings.Contains(rs.HaltReason, "fail_abort") {
+				t.Fatalf("halt: %+v", rs)
+			}
+			if got := a.producerTurns(t); got != a.cfg.Supervisor.FailAbort {
+				t.Fatalf("turns=%d, want exactly fail_abort=%d", got, a.cfg.Supervisor.FailAbort)
+			}
+			if _, err := os.Stat(vp); err != nil {
+				t.Fatal("the verdict was lost on the way to the halt")
+			}
+			if len(a.tr.calls) != 0 || a.drv.opened != nil {
+				t.Fatalf("submit ran: %v", a.tr.calls)
+			}
+		})
 	}
 }
 

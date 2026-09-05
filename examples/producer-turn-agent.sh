@@ -128,6 +128,17 @@ esac
 if [ -n "${PRODUCER_PROMPT_FILE:-}" ]; then
   printf '%s\n' "$prompt" > "$PRODUCER_PROMPT_FILE" || { echo "producer-turn-agent: cannot write $PRODUCER_PROMPT_FILE" >&2; exit 3; }
 fi
+# The progress marker is snapshotted before the agent runs (cp -p keeps
+# the nanosecond mtime). If the selected verdict ends the turn unresolved,
+# the marker is put back exactly as it was: a model that touched progress
+# and declared nothing, or the wrong family, made no progress ON THE
+# VERDICT, and reporting its touch as progress would reset the
+# supervisor's guards and re-run the kept trigger forever (#50 review).
+# With no progress and a non-zero exit the supervisor backs off and
+# halts at fail_abort, the verdict still in the outbox.
+snap=$(mktemp "${TMPDIR:-/tmp}/factoryd-progress.XXXXXX") || exit 3
+had_progress=0
+if [ -e "$FACTORYD_PROGRESS" ]; then cp -p "$FACTORYD_PROGRESS" "$snap" || exit 3; had_progress=1; fi
 printf '%s\n' "$prompt" | "$wrapper" "$@"
 rc=$?
 # The trigger is consumed by the turn that acted on it. The agent cannot be
@@ -171,7 +182,12 @@ if [ -n "$sel" ] && [ "$declared" -eq 0 ]; then
   keep="$keep
 $sel_path"
   echo "producer-turn-agent: the selected changes-requested verdict is kept: the turn $( [ "$rc" -eq 0 ] && echo 'declared no complete intent' || echo "exited $rc" )" >&2
+  # No progress on the verdict: the marker goes back to its baseline, and
+  # the turn is a failure, so the supervisor's guards count it.
+  if [ "$had_progress" -eq 1 ]; then touch -r "$snap" "$FACTORYD_PROGRESS"; else rm -f "$FACTORYD_PROGRESS"; fi
+  [ "$rc" -eq 0 ] && rc=4
 fi
+rm -f "$snap"
 IFS=:; for p in ${FACTORYD_TRIGGER_PATHS:-}; do
   case "$p" in *-retry) continue;; esac
   [ -n "$p" ] || continue

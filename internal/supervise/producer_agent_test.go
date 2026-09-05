@@ -6,6 +6,7 @@ import (
 	"path/filepath"
 	"strings"
 	"testing"
+	"time"
 )
 
 // examples/producer-turn-agent.sh composes the intent protocol once, in
@@ -90,9 +91,31 @@ func TestProducerAgentWrapperComposesTheProtocolAroundTheBrief(t *testing.T) {
 		{"operator-gated", false, "Declare NOTHING for it; wait"},
 	} {
 		os.WriteFile(vpath, []byte("{}"), 0o644)
+		// Baseline the progress marker so a rollback is observable.
+		os.WriteFile(progress, []byte("x"), 0o644)
+		base := time.Date(2026, 9, 1, 12, 0, 0, 123456789, time.UTC)
+		os.Chtimes(progress, base, base)
 		prompt, rc := run("verdict", vpath, line(vpath, "48", c.kind, "fix/{example}"), "")
-		if rc != 0 {
+		// The fake agent touches progress and declares nothing: for merged
+		// and operator-gated that IS the turn, exit 0; for changes-requested
+		// it is no progress on the verdict, exit 4, and the marker goes
+		// back to its baseline (#50 review, round 6).
+		if c.wantDecl && rc == 0 {
+			t.Fatalf("%s: a turn that declared nothing on a verdict exited 0; the guards would read its touch as progress", c.kind)
+		}
+		if !c.wantDecl && rc != 0 {
 			t.Fatalf("%s: rc=%d", c.kind, rc)
+		}
+		if st, err := os.Stat(progress); err == nil {
+			moved := !st.ModTime().Equal(base)
+			if c.wantDecl && moved {
+				t.Fatalf("%s: the progress marker kept the agent's touch (%v); the supervisor would count progress on an unresolved verdict", c.kind, st.ModTime())
+			}
+			if !c.wantDecl && !moved {
+				t.Fatalf("%s: the progress touch was rolled back on a turn that resolved its verdict", c.kind)
+			}
+		} else {
+			t.Fatalf("%s: progress marker: %v", c.kind, err)
 		}
 		if !strings.Contains(prompt, "THIS TURN IS A VERDICT") || !strings.Contains(prompt, "  - change 48: "+c.kind+" (family fix/{example})") {
 			t.Fatalf("%s: the verdict is not listed by change, kind and family (a { family must survive):\n%s", c.kind, prompt)
