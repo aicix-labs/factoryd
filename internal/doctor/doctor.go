@@ -536,8 +536,9 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 		}
 	}
 
-	add("spin guard", nil, fmt.Sprintf("warn at %d turns with no progress, halt at %d; backoff %ds",
-		cfg.Supervisor.SpinWarn, cfg.Supervisor.SpinAbort, cfg.Supervisor.BackoffSeconds))
+	add("spin guard", nil, fmt.Sprintf("warn at %d turns with no progress, halt at %d; backoff %ds; CI wait retries at most %d turns or %ds before operator escalation",
+		cfg.Supervisor.SpinWarn, cfg.Supervisor.SpinAbort, cfg.Supervisor.BackoffSeconds,
+		cfg.Supervisor.PipelineAttempts, cfg.Supervisor.PipelineTimeoutSeconds))
 	if cfg.Queue.ContinueWhileGated {
 		add("brief queue policy", nil, "continues after an exact operator-gated verdict; two open changes may conflict when merged")
 	} else {

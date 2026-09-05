@@ -85,18 +85,22 @@ type glMR struct {
 		HeadSHA string `json:"head_sha"`
 		BaseSHA string `json:"base_sha"`
 	} `json:"diff_refs"`
-	IID          int       `json:"iid"`
-	Title        string    `json:"title"`
-	Author       glUser    `json:"author"`
-	SourceBranch string    `json:"source_branch"`
-	TargetBranch string    `json:"target_branch"`
-	SHA          string    `json:"sha"`
-	Draft        bool      `json:"draft"`
-	WorkInProg   bool      `json:"work_in_progress"`
-	State        string    `json:"state"`
-	WebURL       string    `json:"web_url"`
-	Labels       []string  `json:"labels"`
-	UpdatedAt    time.Time `json:"updated_at"`
+	IID          int    `json:"iid"`
+	Title        string `json:"title"`
+	Author       glUser `json:"author"`
+	SourceBranch string `json:"source_branch"`
+	TargetBranch string `json:"target_branch"`
+	SHA          string `json:"sha"`
+	Draft        bool   `json:"draft"`
+	WorkInProg   bool   `json:"work_in_progress"`
+	State        string `json:"state"`
+	// DetailedMergeStatus is GitLab's explicit reason an otherwise-open MR
+	// cannot merge. HTTP refusal status is not reliable enough to distinguish
+	// a true conflict from CI that can clear on its own.
+	DetailedMergeStatus string    `json:"detailed_merge_status"`
+	WebURL              string    `json:"web_url"`
+	Labels              []string  `json:"labels"`
+	UpdatedAt           time.Time `json:"updated_at"`
 }
 
 type glUser struct {
@@ -597,10 +601,29 @@ func (d *Driver) Merge(ctx context.Context, id scm.ChangeID, expectedHead string
 				// conflict and 422 meant CI, so a real conflict was reported as
 				// RefusedPipeline -- the wrong reason, with the suite green.
 				//
-				// Whether CI is green is decided from Pipeline(), by the gate.
-				// It is not inferred from the shape of a merge refusal.
-				return scm.RefusedByProvider(scm.RefusedConflict,
-					"gitlab refused the merge (HTTP %d): %s", he.Status, he.Message()), nil
+				// The detailed status read before PUT is only a hint. A push or
+				// conflict can win that gap, so a possible CI retry must re-read
+				// the MR after the refusal and prove it still names the exact head
+				// we tried. A non-pipeline status needs no second read because it
+				// cannot schedule work on the old fact.
+				detailed := m.DetailedMergeStatus
+				if mergeRefusalOutcome(detailed) == scm.RefusedPipeline {
+					current, rereadErr := d.get(ctx, id)
+					if rereadErr != nil {
+						return scm.ProviderMerge{}, fmt.Errorf("gitlab re-reading %s after merge refusal: %w", id, rereadErr)
+					}
+					if current.SHA != expectedHead {
+						return scm.RefusedByProvider(scm.RefusedConflict,
+							"head moved after gitlab refused the merge: expected %s, merge request is at %s", expectedHead, current.SHA), nil
+					}
+					detailed = current.DetailedMergeStatus
+				}
+				// The post-refusal detailed status is the provider's stated reason.
+				// Unlike the HTTP refusal status, it distinguishes CI that may
+				// clear on its own from a conflict that needs an actor.
+				outcome := mergeRefusalOutcome(detailed)
+				return scm.RefusedByProvider(outcome,
+					"gitlab refused the merge (HTTP %d, detailed_merge_status=%q): %s", he.Status, detailed, he.Message()), nil
 			}
 		}
 		return scm.ProviderMerge{}, fmt.Errorf("gitlab merge %s: %w", id, err)
@@ -617,6 +640,19 @@ func (d *Driver) Merge(ctx context.Context, id scm.ChangeID, expectedHead string
 			"gitlab returned 200 but state=%q merge_commit_sha=%q message=%q", out.State, commit, out.Message), nil
 	}
 	return scm.ProviderMerged(commit), nil
+}
+
+// mergeRefusalOutcome maps only GitLab's explicit CI/merge-computation states
+// to RefusedPipeline. All other values, including unknown future statuses,
+// stay RefusedConflict: guessing that an unrecognised refusal is self-clearing
+// would retry a draft that needs a human to resolve it.
+func mergeRefusalOutcome(detailed string) scm.MergeOutcome {
+	switch strings.ToLower(strings.TrimSpace(detailed)) {
+	case "ci_must_pass", "ci_still_running", "checking", "preparing":
+		return scm.RefusedPipeline
+	default:
+		return scm.RefusedConflict
+	}
 }
 
 // ---------- audits ----------

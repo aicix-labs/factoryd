@@ -49,6 +49,10 @@ type Snapshot struct {
 	// the active cycle when the operator has allowed the brief queue to keep
 	// moving, so an operator-owned wait never looks like producer rework.
 	OperatorGates []state.OperatorGate `json:"operator_gates,omitempty"`
+	// PipelineWait is a reviewer merge that GitLab explicitly deferred for CI.
+	// It is visible separately from NeedsMe because factoryd, not an operator,
+	// will re-attempt it.
+	PipelineWait *state.PipelineWait `json:"pipeline_wait,omitempty"`
 	// Errors are things the page could not read. They are shown, not
 	// hidden: a page that could not read the state document must not look
 	// like a page for an idle factory.
@@ -197,6 +201,10 @@ func (c *Collector) Collect(ctx context.Context) Snapshot {
 	s.Verdict = st.LastVerdict
 	s.VerdictRegistry = st.VerdictRegistry
 	s.OperatorGates = append(s.OperatorGates, st.OperatorGates...)
+	if wait := st.Role(state.RoleReviewer).PipelineWait; wait != nil {
+		copy := *wait
+		s.PipelineWait = &copy
+	}
 
 	for _, r := range state.Roles {
 		rs := st.Role(r)
@@ -331,7 +339,11 @@ func needsMe(cfg *config.Config, s Snapshot, st *state.State) []string {
 	for _, r := range state.Roles {
 		v := s.Roles[string(r)]
 		if b := v.Blocked; b != nil {
-			out = append(out, fmt.Sprintf("%s submission %s and not retried: %s -- fix the cause and run factoryd submit; a successful submission clears this", r, b.Disposition, b.Reason))
+			if b.Disposition == state.PipelineWaitExhausted {
+				out = append(out, fmt.Sprintf("%s CI wait exhausted and is not retried: %s -- investigate the provider, then have the reviewer issue a conclusive verdict for that head", r, b.Reason))
+			} else {
+				out = append(out, fmt.Sprintf("%s submission %s and not retried: %s -- fix the cause and run factoryd submit; a successful submission clears this", r, b.Disposition, b.Reason))
+			}
 		}
 		switch {
 		case v.Halted:

@@ -34,8 +34,14 @@ import (
 // v4 refuses to mistake an empty v3 service map for proof that no pre-registry
 // status or health process remains alive. v5 records both the review decision
 // for the active open change and open changes deliberately left to the operator
-// while the opt-in brief queue starts independent work.
-const SchemaVersion = 5
+// while the opt-in brief queue starts independent work. v6 records a reviewer
+// pipeline wait durably, so a restart resumes a self-clearing CI refusal rather
+// than turning it into an operator gate or silently dropping its retry. v7
+// makes that retry bounded by durable attempt and deadline records. A v6
+// pipeline wait has no trustworthy budget, so the v7 migration preserves it
+// only as an exhausted, operator-visible condition; it never silently resumes
+// an unbounded automatic loop.
+const SchemaVersion = 7
 
 var (
 	// ErrProducerLifecycleBusy means a queued handoff or admitted producer
@@ -233,6 +239,13 @@ type RoleState struct {
 	// submission that succeeds -- never by progress, a restart, or a new
 	// turn (#42).
 	Blocked *Block `json:"blocked,omitempty"`
+	// PipelineWait is a reviewer merge attempt GitLab explicitly refused only
+	// because CI is pending or red. It is neither a producer task nor an
+	// operator gate: the reviewer supervisor re-arms a later review attempt
+	// only within the durable attempt/time budget carried by the wait. It is
+	// recorded in state rather than inferred from a retry marker so an agent
+	// cannot consume the marker and strand a self-clearing condition.
+	PipelineWait *PipelineWait `json:"pipeline_wait,omitempty"`
 	// TriggerAttempts counts, per pending trigger path, the turns that ran
 	// with it and left it pending. Reset when the trigger is consumed. The
 	// supervisor's own bound on how long a verdict may be carried (#50
@@ -250,6 +263,32 @@ type RoleState struct {
 	// nothing cleared kept health and status red after the role recovered.
 	LastHalt *Halt `json:"last_halt,omitempty"`
 }
+
+// PipelineWait is the provider-confirmed, retryable reason a reviewer merge
+// did not happen. The exact change and head bind a later review attempt to the
+// decision it is resuming; a changed head starts a fresh budget. Attempts and
+// Deadline are durable, preventing restarts or progress touches from extending
+// an automatic review loop forever.
+type PipelineWait struct {
+	ChangeID     string     `json:"change_id"`
+	SHA          string     `json:"sha"`
+	Reason       string     `json:"reason"`
+	At           time.Time  `json:"at"`
+	Attempts     int        `json:"attempts"`
+	AttemptLimit int        `json:"attempt_limit"`
+	Deadline     time.Time  `json:"deadline"`
+	ExhaustedAt  *time.Time `json:"exhausted_at,omitempty"`
+}
+
+// Exhausted reports whether this wait may no longer re-arm automatically.
+func (w PipelineWait) Exhausted(at time.Time) bool {
+	return w.ExhaustedAt != nil || w.Attempts >= w.AttemptLimit || !at.Before(w.Deadline)
+}
+
+// PipelineWaitExhausted is the reviewer block disposition produced when the
+// durable retry budget is spent. It is a named state, not a terminal verdict:
+// an operator can resolve CI or a new reviewed head can start a fresh budget.
+const PipelineWaitExhausted = "pipeline-wait-exhausted"
 
 // QueueReservation binds one ordered brief to the producer turn that reserved
 // the cycle. Source is the queue path, Done is factoryd's immutable handoff
@@ -816,6 +855,64 @@ func (s *State) Role(r Role) *RoleState {
 	return s.Roles[r]
 }
 
+// SetReviewerPipelineWait records a retryable CI wait from a verified reviewer
+// merge attempt. It deliberately belongs only to the reviewer role: a
+// producer cannot clear or manufacture an external merge condition.
+func (s *State) SetReviewerPipelineWait(wait PipelineWait) error {
+	if wait.ChangeID == "" || wait.SHA == "" || wait.Reason == "" || wait.At.IsZero() || wait.Attempts < 0 || wait.AttemptLimit <= 0 || wait.Deadline.IsZero() || !wait.Deadline.After(wait.At) {
+		return errors.New("state: reviewer pipeline wait is incomplete")
+	}
+	r := s.Role(RoleReviewer)
+	if previous := r.PipelineWait; previous == nil || previous.ChangeID != wait.ChangeID || previous.SHA != wait.SHA {
+		if b := r.Blocked; b != nil && b.Disposition == PipelineWaitExhausted && b.Family == wait.ChangeID {
+			r.Blocked = nil // a newly reviewed head gets a fresh bounded wait.
+		}
+	}
+	copy := wait
+	r.PipelineWait = &copy
+	return nil
+}
+
+// ClearReviewerPipelineWait removes a wait only after factoryd has recorded a
+// conclusive verdict for that same change. A verdict about another change is
+// global activity, not authority to abandon this retry.
+func (s *State) ClearReviewerPipelineWait(changeID string) {
+	r := s.Role(RoleReviewer)
+	if r.PipelineWait != nil && r.PipelineWait.ChangeID == changeID {
+		r.PipelineWait = nil
+	}
+	if b := r.Blocked; b != nil && b.Disposition == PipelineWaitExhausted && b.Family == changeID {
+		r.Blocked = nil
+	}
+}
+
+// ExhaustReviewerPipelineWait stops automatic retries after the wait's stored
+// budget has elapsed and records an operator-visible block. The caller must
+// hold the state update lock.
+func (s *State) ExhaustReviewerPipelineWait(at time.Time) *Block {
+	r := s.Role(RoleReviewer)
+	w := r.PipelineWait
+	if w == nil || !w.Exhausted(at) {
+		return nil
+	}
+	if w.ExhaustedAt == nil {
+		when := at
+		w.ExhaustedAt = &when
+	}
+	if b := r.Blocked; b != nil && b.Disposition == PipelineWaitExhausted && b.Family == w.ChangeID && b.Digest == w.SHA {
+		return b
+	}
+	b := &Block{
+		Disposition: PipelineWaitExhausted,
+		Reason:      fmt.Sprintf("CI/mergeability remained unresolved for change %s at %s after %d of %d reviewer attempts or until %s; investigate the provider and reissue a conclusive reviewer verdict", w.ChangeID, w.SHA, w.Attempts, w.AttemptLimit, w.Deadline.Format(time.RFC3339)),
+		Family:      w.ChangeID,
+		Digest:      w.SHA,
+		At:          at,
+	}
+	r.Blocked = b
+	return b
+}
+
 // Service returns the recorded handle for service, if any.
 func (s *State) Service(service Service) *proc.Ref {
 	if s.Services == nil {
@@ -1007,6 +1104,17 @@ func (s *State) Validate() error {
 		if rs.FailStreak < 0 {
 			return fmt.Errorf("state: role %s has a negative fail streak", r)
 		}
+		if wait := rs.PipelineWait; wait != nil {
+			if r != RoleReviewer {
+				return fmt.Errorf("state: role %s carries a reviewer pipeline wait", r)
+			}
+			if wait.ChangeID == "" || wait.SHA == "" || wait.Reason == "" || wait.At.IsZero() || wait.Attempts < 0 || wait.AttemptLimit <= 0 || wait.Deadline.IsZero() || !wait.Deadline.After(wait.At) {
+				return errors.New("state: reviewer pipeline wait is incomplete")
+			}
+			if wait.ExhaustedAt != nil && wait.Attempts < wait.AttemptLimit && wait.ExhaustedAt.Before(wait.Deadline) {
+				return errors.New("state: reviewer pipeline wait is marked exhausted before its budget elapsed")
+			}
+		}
 		if lease := rs.SubmissionLease; lease != nil {
 			if lease.AcquiredAt.IsZero() || lease.Holder.PID <= 0 || lease.Holder.StartToken == "" {
 				return fmt.Errorf("state: role %s has an incomplete producer worktree submission lease", r)
@@ -1107,9 +1215,9 @@ func Load(path, factory string) (*State, error) {
 	legacySchema := 0
 	switch probe.SchemaVersion {
 	case SchemaVersion:
-	case 4, 3, 2:
+	case 6, 5, 4, 3, 2:
 		// Neither older schema can inventory every current long-running
-		// process or preserve the operator-gated queue records v5 adds.
+		// process or preserve newer durable supervisor records.
 		// Their empty Services maps prove nothing: a process started by an old
 		// binary has no handle to put there. Preserve that uncertainty as a
 		// durable blocked record rather than promoting it to an empty trusted
@@ -1134,11 +1242,14 @@ func Load(path, factory string) (*State, error) {
 	if s.Factory == "" {
 		s.Factory = factory
 	}
+	if legacySchema != 0 {
+		quarantineLegacyPipelineWait(&s, time.Now().UTC())
+	}
 	if legacyServiceRegistry {
 		s.SchemaVersion = SchemaVersion
 		s.ServiceRegistry = &ServiceRegistry{
 			Status:    ServiceRegistryMigrationRequired,
-			Reason:    "state predates the complete long-running process and operator-gated queue registries; stop or restart every pre-upgrade factoryd process, including producer/reviewer supervisors and `factoryd status --serve`/`factoryd health --loop`, then have the operator run `factoryd migrate --config <file> service-registry`",
+			Reason:    "state predates the complete long-running process and durable queue/reviewer retry registries; stop or restart every pre-upgrade factoryd process, including producer/reviewer supervisors and `factoryd status --serve`/`factoryd health --loop`, then have the operator run `factoryd migrate --config <file> service-registry`",
 			BlockedAt: time.Now().UTC(),
 		}
 	}
@@ -1168,6 +1279,35 @@ func Load(path, factory string) (*State, error) {
 	}
 	s.schemaMigrationFrom = legacySchema
 	return &s, nil
+}
+
+// quarantineLegacyPipelineWait makes a pre-v7 pipeline wait safe to carry
+// across the explicit schema migration. Earlier state has no durable retry
+// budget, so assigning a new one while loading would make an old wait look
+// newly authorised. Preserve its change/head facts and make the required
+// operator action visible instead. A pre-existing block is not overwritten:
+// it is already a separate condition the operator must resolve.
+func quarantineLegacyPipelineWait(s *State, at time.Time) {
+	rs := s.Role(RoleReviewer)
+	w := rs.PipelineWait
+	if w == nil {
+		return
+	}
+	w.Attempts = 1
+	w.AttemptLimit = 1
+	w.Deadline = w.At.Add(time.Second)
+	w.ExhaustedAt = &at
+	w.Reason = "legacy unbounded CI wait was stopped during the v7 migration; inspect CI and have the reviewer issue a conclusive verdict for this head (previous provider reason: " + w.Reason + ")"
+	if rs.Blocked != nil {
+		return
+	}
+	rs.Blocked = &Block{
+		Disposition: PipelineWaitExhausted,
+		Reason:      "state predates the durable CI retry budget; automatic retries were stopped until the reviewer issues a conclusive verdict",
+		Family:      w.ChangeID,
+		Digest:      w.SHA,
+		At:          at,
+	}
 }
 
 // Save writes the document atomically: a temporary file in the same directory,

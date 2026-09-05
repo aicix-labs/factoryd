@@ -179,6 +179,124 @@ func TestNonMergeVerdictsRecordWithoutMerging(t *testing.T) {
 	}
 }
 
+// A provider-confirmed CI refusal is not a reviewer verdict. It must leave a
+// durable, self-clearing retry record and no outbox handoff for the producer;
+// once CI clears, the ordinary merged verdict retires that wait.
+func TestPipelineRefusalSchedulesReviewerRetryInsteadOfAnOperatorGate(t *testing.T) {
+	l := newLab(t)
+	genericRetry := l.cfg.RetryPath(string(state.RoleReviewer))
+	genericBody := []byte("retry 1 of 5\norigin: question\nstep: turn\n")
+	if err := os.WriteFile(genericRetry, genericBody, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	l.drv.merge = scm.RefusedByProvider(scm.RefusedPipeline, "GitLab detailed_merge_status=ci_must_pass")
+	res, err := l.run(t, "merged", "auto", "clean")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PipelineWait == nil || res.PipelineWait.ChangeID != "42" || res.PipelineWait.SHA != "abc123" || res.Verdict.Kind != "" {
+		t.Fatalf("result=%+v, want a pipeline wait and no verdict", res)
+	}
+	if v := l.verdictFile(t); v != nil {
+		t.Fatalf("pipeline wait wrote a producer verdict: %+v", v)
+	}
+	st, err := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if err != nil || st.Role(state.RoleReviewer).PipelineWait == nil {
+		t.Fatalf("pipeline wait was not durable: state=%+v err=%v", st.Role(state.RoleReviewer), err)
+	}
+	if st.LastVerdict != nil || len(l.drv.comments) != 0 {
+		t.Fatalf("pipeline wait became an observable verdict/comment: verdict=%+v comments=%v", st.LastVerdict, l.drv.comments)
+	}
+	retry, err := os.ReadFile(l.cfg.PipelineRetryPath())
+	if err != nil || !strings.Contains(string(retry), "origin: provider pipeline\n") || !strings.Contains(string(retry), "change: 42\n") {
+		t.Fatalf("pipeline wait did not wake an idle reviewer supervisor: retry=%q err=%v", retry, err)
+	}
+	if got, err := os.ReadFile(genericRetry); err != nil || string(got) != string(genericBody) {
+		t.Fatalf("pipeline wait overwrote the ordinary retry: got=%q err=%v want=%q", got, err, genericBody)
+	}
+
+	l.drv.merge = scm.ProviderMerged("m3rge")
+	if _, err := l.run(t, "merged", "auto", "clean after CI"); err != nil {
+		t.Fatal(err)
+	}
+	st, err = state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if err != nil || st.Role(state.RoleReviewer).PipelineWait != nil || st.LastVerdict == nil || st.LastVerdict.Kind != state.VerdictMerged {
+		t.Fatalf("successful retry did not clear the wait: state=%+v err=%v", st, err)
+	}
+	if _, err := os.Stat(l.cfg.PipelineRetryPath()); !os.IsNotExist(err) {
+		t.Fatalf("conclusive signal left its pipeline retry armed: %v", err)
+	}
+	if got, err := os.ReadFile(genericRetry); err != nil || string(got) != string(genericBody) {
+		t.Fatalf("conclusive signal disturbed the ordinary retry: got=%q err=%v want=%q", got, err, genericBody)
+	}
+}
+
+func TestPipelineWaitExpiresIntoAVisibleOperatorBlock(t *testing.T) {
+	l := newLab(t)
+	l.cfg.Supervisor.PipelineTimeoutSeconds = 1
+	l.drv.merge = scm.RefusedByProvider(scm.RefusedPipeline, "GitLab detailed_merge_status=ci_must_pass")
+	if res, err := l.run(t, "merged", "auto", "clean"); err != nil || res.PipelineBlocked != nil {
+		t.Fatalf("initial pipeline wait result=%+v err=%v", res, err)
+	}
+	l.now = l.now.Add(2 * time.Second)
+	res, err := l.run(t, "merged", "auto", "still red")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if res.PipelineWait == nil || res.PipelineBlocked == nil || res.PipelineBlocked.Disposition != state.PipelineWaitExhausted {
+		t.Fatalf("expired pipeline result=%+v, want visible block", res)
+	}
+	st, err := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if err != nil || st.Role(state.RoleReviewer).Blocked == nil || st.Role(state.RoleReviewer).PipelineWait == nil || st.Role(state.RoleReviewer).PipelineWait.ExhaustedAt == nil {
+		t.Fatalf("expired pipeline wait was not durable: state=%+v err=%v", st, err)
+	}
+	if _, err := os.Stat(l.cfg.PipelineRetryPath()); !os.IsNotExist(err) {
+		t.Fatalf("expired pipeline wait left a retry armed: %v", err)
+	}
+}
+
+// A pipeline wait is self-clearing only while the provider says the exact
+// reviewed head is waiting on CI. Once a later merge attempt finds a terminal
+// conflict or that same head has moved, the old watched retry must not keep
+// launching reviewer turns behind the terminal refusal.
+func TestTerminalMergeRefusalRetiresMatchingPipelineWait(t *testing.T) {
+	cases := map[string]func(t *testing.T, l *lab) (signal.Result, error){
+		"provider conflict": func(t *testing.T, l *lab) (signal.Result, error) {
+			t.Helper()
+			l.drv.merge = scm.RefusedByProvider(scm.RefusedConflict, "branch cannot be merged")
+			return l.run(t, "merged", "auto", "conflict after CI")
+		},
+		"head moved": func(t *testing.T, l *lab) (signal.Result, error) {
+			t.Helper()
+			l.drv.change.HeadSHA = "def456"
+			return l.run(t, "merged", "abc123", "head moved after CI")
+		},
+	}
+	for name, terminal := range cases {
+		t.Run(name, func(t *testing.T) {
+			l := newLab(t)
+			l.drv.merge = scm.RefusedByProvider(scm.RefusedPipeline, "GitLab detailed_merge_status=ci_must_pass")
+			if _, err := l.run(t, "merged", "auto", "waiting on CI"); err != nil {
+				t.Fatal(err)
+			}
+			res, err := terminal(t, l)
+			if got := exitOf(t, err); got != signal.ExitRefused {
+				t.Fatalf("terminal result=%+v exit=%d, want refusal", res, got)
+			}
+			st, err := state.Load(l.cfg.StatePath(), l.cfg.Name)
+			if err != nil {
+				t.Fatal(err)
+			}
+			if wait := st.Role(state.RoleReviewer).PipelineWait; wait != nil {
+				t.Fatalf("terminal refusal left a stale pipeline wait: %+v", wait)
+			}
+			if _, err := os.Stat(l.cfg.PipelineRetryPath()); !os.IsNotExist(err) {
+				t.Fatalf("terminal refusal left a stale pipeline marker: %v", err)
+			}
+		})
+	}
+}
+
 func TestRefusals(t *testing.T) {
 	cases := map[string]struct {
 		mutate  func(l *lab)

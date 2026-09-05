@@ -9,6 +9,8 @@ import (
 	"sort"
 	"strings"
 	"time"
+
+	"github.com/aicix-labs/factoryd/internal/state"
 )
 
 // Server serves one page and one JSON endpoint for any number of
@@ -75,11 +77,11 @@ func (s *Server) page(w http.ResponseWriter, r *http.Request) {
 // Text renders a snapshot for a terminal, in the page's order of questions.
 func Text(s Snapshot) string {
 	var sb strings.Builder
-	state := "WORKING"
+	workState := "WORKING"
 	if !s.Working {
-		state = "NOT WORKING"
+		workState = "NOT WORKING"
 	}
-	fmt.Fprintf(&sb, "%s  %s  (%s -> %s)  at %s\n", s.Factory, state, s.Provider, s.Target, s.At.Format(time.RFC3339))
+	fmt.Fprintf(&sb, "%s  %s  (%s -> %s)  at %s\n", s.Factory, workState, s.Provider, s.Target, s.At.Format(time.RFC3339))
 	if len(s.NeedsMe) > 0 {
 		sb.WriteString("needs you:\n")
 		for _, n := range s.NeedsMe {
@@ -100,7 +102,11 @@ func Text(s Snapshot) string {
 			fmt.Fprintf(&sb, "; recovered from a halt (%s) at %s", v.LastHalt.Reason, v.LastHalt.ClearedAt.Format(time.RFC3339))
 		}
 		if b := v.Blocked; b != nil {
-			fmt.Fprintf(&sb, "; submission %s (%s)", b.Disposition, b.Reason)
+			if b.Disposition == state.PipelineWaitExhausted {
+				fmt.Fprintf(&sb, "; CI retry budget exhausted (%s)", b.Reason)
+			} else {
+				fmt.Fprintf(&sb, "; submission %s (%s)", b.Disposition, b.Reason)
+			}
 		}
 		if v.LeftoverTurns > 0 {
 			fmt.Fprintf(&sb, "; %d turn(s) left processes behind (killed; the agent's tooling is leaking)", v.LeftoverTurns)
@@ -155,6 +161,13 @@ func Text(s Snapshot) string {
 	}
 	if s.Verdict != nil {
 		fmt.Fprintf(&sb, "verdict   %s on %s at %s: %s\n", s.Verdict.Kind, s.Verdict.ChangeID, s.Verdict.At.Format(time.RFC3339), s.Verdict.Summary)
+	}
+	if w := s.PipelineWait; w != nil {
+		if w.ExhaustedAt != nil {
+			fmt.Fprintf(&sb, "reviewer  CI wait for %s at %s exhausted at %s after %d/%d attempts (deadline %s): %s\n", w.ChangeID, w.SHA, w.ExhaustedAt.Format(time.RFC3339), w.Attempts, w.AttemptLimit, w.Deadline.Format(time.RFC3339), w.Reason)
+		} else {
+			fmt.Fprintf(&sb, "reviewer  waiting on CI for %s at %s since %s; attempt %d/%d, deadline %s: %s\n", w.ChangeID, w.SHA, w.At.Format(time.RFC3339), w.Attempts, w.AttemptLimit, w.Deadline.Format(time.RFC3339), w.Reason)
+		}
 	}
 	if len(s.OperatorGates) > 0 {
 		sb.WriteString("operator gates (awaiting you):\n")
@@ -255,6 +268,7 @@ small{color:#666}
 {{if .Changes.Open}}<table>{{range .Changes.Open}}<tr><td>{{.ID}}</td><td>{{draft .Draft}}</td><td><code>{{.SourceBranch}}</code> → <code>{{.TargetBranch}}</code></td><td>{{.Title}}</td><td><small>{{.Author}}</small></td></tr>{{end}}</table>
 {{else if not .Changes.Skipped}}<p><small>none open as of {{rfc .Changes.AsOf}}</small></p>{{end}}
 {{if .Verdict}}<h2>Last verdict</h2><p><b>{{.Verdict.Kind}}</b> on {{.Verdict.ChangeID}} <small>{{rfc .Verdict.At}}</small><br>{{.Verdict.Summary}}</p>{{end}}
+{{if .PipelineWait}}{{if .PipelineWait.ExhaustedAt}}<h2 class="bad">CI wait exhausted</h2><p>change <b>{{.PipelineWait.ChangeID}}</b> at <code>{{.PipelineWait.SHA}}</code> exhausted {{.PipelineWait.Attempts}}/{{.PipelineWait.AttemptLimit}} reviewer attempts <small>at {{rfc .PipelineWait.ExhaustedAt}}; deadline {{rfc .PipelineWait.Deadline}}</small><br>{{.PipelineWait.Reason}}</p>{{else}}<h2 class="warn">Waiting on CI</h2><p>reviewer will retry change <b>{{.PipelineWait.ChangeID}}</b> at <code>{{.PipelineWait.SHA}}</code> <small>since {{rfc .PipelineWait.At}}; attempt {{.PipelineWait.Attempts}}/{{.PipelineWait.AttemptLimit}}; deadline {{rfc .PipelineWait.Deadline}}</small><br>{{.PipelineWait.Reason}}</p>{{end}}{{end}}
 {{if .OperatorGates}}<h2 class="warn">Awaiting operator</h2><ul>{{range .OperatorGates}}<li><b>change {{.ChangeID}}</b> since {{rfc .GatedAt}}: {{.Summary}}<br><small>the producer is done; this change remains yours while the brief queue continues under operator policy</small></li>{{end}}</ul>{{end}}
 {{if .Errors}}<h2 class="bad">Could not read</h2><ul>{{range .Errors}}<li>{{.}}</li>{{end}}</ul>{{end}}
 </section>{{end}}

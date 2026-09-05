@@ -121,6 +121,53 @@ func TestV2StateBlocksUntilServiceRegistryMigration(t *testing.T) {
 	}
 }
 
+// v7 adds a durable budget to the reviewer pipeline wait. An earlier binary
+// would decode then discard that field on its next state write, so v6 is fenced
+// behind the same all-process restart sweep as the service registry migration.
+func TestV6StateBlocksUntilPipelineWaitBudgetSchemaMigration(t *testing.T) {
+	p := tmpPath(t)
+	body := `{"schema_version":6,"factory":"widgets","roles":{},"verdict_registry":{"status":"ready"},"service_registry":{"status":"ready"},"cycle":{"phase":"new"}}`
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(p, "widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.SchemaVersion != SchemaVersion || !errors.Is(s.ServiceRegistry.MigrationError(), ErrServiceRegistryMigrationRequired) {
+		t.Fatalf("v6 state was silently trusted: schema=%d registry=%+v", s.SchemaVersion, s.ServiceRegistry)
+	}
+	if _, err := Update(p, "widgets", func(*State) error { return nil }); !errors.Is(err, ErrSchemaMigrationRequired) {
+		t.Fatalf("v6 update = %v, want schema migration refusal", err)
+	}
+}
+
+// A v6 CI wait did not carry an attempt or time bound. The v7 reader must not
+// invent one and resume it indefinitely; it remains visible and blocked until
+// the operator completes the restart sweep and the reviewer makes a current
+// decision.
+func TestV6PipelineWaitIsMigratedAsAnExhaustedVisibleCondition(t *testing.T) {
+	p := tmpPath(t)
+	body := `{"schema_version":6,"factory":"widgets","roles":{"reviewer":{"pipeline_wait":{"change_id":"42","sha":"abc","reason":"ci_must_pass","at":"2026-09-04T15:00:00Z"}}},"verdict_registry":{"status":"ready"},"service_registry":{"status":"ready"},"cycle":{"phase":"new"}}`
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(p, "widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := s.Role(RoleReviewer)
+	if rs.PipelineWait == nil || rs.PipelineWait.ExhaustedAt == nil || rs.PipelineWait.Attempts != 1 || rs.PipelineWait.AttemptLimit != 1 {
+		t.Fatalf("legacy pipeline wait was not stopped visibly: %+v", rs.PipelineWait)
+	}
+	if rs.Blocked == nil || rs.Blocked.Disposition != PipelineWaitExhausted || rs.Blocked.Family != "42" || rs.Blocked.Digest != "abc" {
+		t.Fatalf("legacy pipeline wait did not get a durable operator block: %+v", rs.Blocked)
+	}
+	if _, err := Update(p, "widgets", func(*State) error { return nil }); !errors.Is(err, ErrSchemaMigrationRequired) {
+		t.Fatalf("v6 pipeline update = %v, want schema migration refusal", err)
+	}
+}
+
 // A legacy supervisor can still write state. It must be stopped before the
 // migration persists schema v4, which that old process would otherwise refuse
 // on its next Update and silently stall the factory.

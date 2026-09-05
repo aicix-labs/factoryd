@@ -272,6 +272,15 @@ type Supervisor struct {
 	// kept. The bound is the supervisor's, in its own state: a bound the
 	// bounded principal could rewrite is no bound (#50 review). Default 6.
 	VerdictAttempts int `json:"verdict_attempts,omitempty"`
+	// PipelineAttempts bounds clean reviewer turns that keep finding the same
+	// provider-confirmed CI wait. The wait is self-resuming only within this
+	// budget; exceeding it becomes a visible operator condition instead of an
+	// indefinitely healthy-looking one-minute loop.
+	PipelineAttempts int `json:"pipeline_attempts,omitempty"`
+	// PipelineTimeoutSeconds bounds wall time from the first CI wait to its
+	// visible escalation. This is stored with the wait, so changing config
+	// cannot silently extend an already-running review loop.
+	PipelineTimeoutSeconds int `json:"pipeline_timeout_seconds,omitempty"`
 	// PollIntervalSeconds is the watcher poll period, and the periodic
 	// re-check interval even when inotify is in use.
 	PollIntervalSeconds int `json:"poll_interval_seconds,omitempty"`
@@ -300,10 +309,14 @@ const (
 	DefaultFailAbort = 5
 	// DefaultVerdictAttempts: partial turns a verdict may be carried through.
 	DefaultVerdictAttempts = 6
-	DefaultPollInterval    = 2
-	DefaultBackoffSeconds  = 15
-	DefaultTurnTimeout     = 3600
-	DefaultGateTimeout     = 900
+	// DefaultPipelineAttempts and DefaultPipelineTimeout bound automatic
+	// reviewer retries for a provider-confirmed CI wait.
+	DefaultPipelineAttempts = 6
+	DefaultPipelineTimeout  = 3600
+	DefaultPollInterval     = 2
+	DefaultBackoffSeconds   = 15
+	DefaultTurnTimeout      = 3600
+	DefaultGateTimeout      = 900
 
 	DefaultHealthInterval  = 60
 	DefaultAlertAfter      = 3
@@ -537,6 +550,12 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Supervisor.VerdictAttempts == 0 {
 		c.Supervisor.VerdictAttempts = DefaultVerdictAttempts
+	}
+	if c.Supervisor.PipelineAttempts == 0 {
+		c.Supervisor.PipelineAttempts = DefaultPipelineAttempts
+	}
+	if c.Supervisor.PipelineTimeoutSeconds == 0 {
+		c.Supervisor.PipelineTimeoutSeconds = DefaultPipelineTimeout
 	}
 	if c.Supervisor.FailAbort == 0 {
 		c.Supervisor.FailAbort = DefaultFailAbort
@@ -817,6 +836,12 @@ func (c *Config) Validate() error {
 	if sv.VerdictAttempts <= 0 {
 		add("supervisor.verdict_attempts must be positive")
 	}
+	if sv.PipelineAttempts < 0 {
+		add("supervisor.pipeline_attempts is negative")
+	}
+	if sv.PipelineTimeoutSeconds < 0 {
+		add("supervisor.pipeline_timeout_seconds is negative")
+	}
 	if sv.PollIntervalSeconds <= 0 {
 		add("supervisor.poll_interval_seconds must be positive")
 	}
@@ -952,6 +977,14 @@ func (c *Config) ProgressPath(role string) string {
 // in-memory retry lost on restart recreates the exact stall it exists to fix.
 func (c *Config) RetryPath(role string) string {
 	return filepath.Join(c.InboxDir(), role+"-retry")
+}
+
+// PipelineRetryPath is the reviewer-specific, supervisor-owned retry trigger
+// for a provider-confirmed CI wait. It is deliberately separate from
+// RetryPath: a pipeline wait must not overwrite the durable retry record for
+// an unrelated failed reviewer turn.
+func (c *Config) PipelineRetryPath() string {
+	return filepath.Join(c.InboxDir(), "reviewer-pipeline-retry")
 }
 
 // StopPath is the halt sentinel for a role. Its presence stops the supervisor

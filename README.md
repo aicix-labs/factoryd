@@ -53,6 +53,16 @@ trust is decided there too, on the provider's stable ids: the reviewer is never
 the author, an audit counts only when the provider says the reviewer posted it,
 and the gate never marks a draft ready.
 
+When GitLab explicitly reports that a reviewed merge is waiting only on CI or
+mergeability computation, `signal merged` records no terminal verdict. It
+returns success with a durable reviewer pipeline wait; the reviewer supervisor
+re-arms a later review attempt, and status says “waiting on CI.” Automatic
+retries are bounded by `supervisor.pipeline_attempts` (default 6) and
+`supervisor.pipeline_timeout_seconds` (default 3600); exhaustion is a visible
+operator condition, never an indefinitely healthy loop. A conflict, scope
+refusal, or missing audit remains a refusal for the reviewer to resolve or
+explicitly operator-gate.
+
 ## What works today
 
 A model-driven producer is run through `examples/producer-turn-agent.sh`,
@@ -87,11 +97,12 @@ conflict when merged. The enabling review decision is bound to that active
 change's cycle, so recording a later verdict for another change cannot strand
 the queue. `changes-requested` never releases the queue.
 
-This policy adds an operator-gate record to factory state. On an upgrade from
-an earlier state schema, stop the producer, reviewer, `status --serve`, and
-`health --loop` processes, then run `factoryd migrate --config <file>
-service-registry` before starting the new services. Doctor reports the required
-restart sweep and no normal state update is allowed to promote the schema.
+This policy and durable reviewer pipeline waits add records to factory state.
+On an upgrade from an earlier state schema, stop the producer, reviewer,
+`status --serve`, and `health --loop` processes, then run `factoryd migrate
+--config <file> service-registry` before starting the new services. Doctor
+reports the required restart sweep and no normal state update is allowed to
+promote the schema.
 
 A change a human merged outside factoryd is reconciled by one provider read
 when the next refresh is decided, and `factoryd verdict <id> merged` records

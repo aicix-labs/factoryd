@@ -390,8 +390,13 @@ func checkRoles(cfg *config.Config, st *state.State, p Probes, at time.Time) []F
 			continue
 		}
 		if b := rs.Blocked; b != nil {
-			out = append(out, Finding{Key: "blocked/" + role, Summary: fmt.Sprintf("%s submission %s: %s", role, b.Disposition, firstLine(b.Reason)),
-				Detail: fmt.Sprintf("turn %s at %s; family %s; not retried automatically -- fix the cause and submit again (factoryd submit), which clears this", b.Turn, b.At.Format(time.RFC3339), b.Family)})
+			if b.Disposition == state.PipelineWaitExhausted {
+				out = append(out, Finding{Key: "pipeline_wait_exhausted/" + role, Summary: fmt.Sprintf("%s CI wait exhausted: %s", role, firstLine(b.Reason)),
+					Detail: fmt.Sprintf("at %s for change %s head %s; no review retry is armed -- investigate CI, then have the reviewer issue a conclusive verdict", b.At.Format(time.RFC3339), b.Family, b.Digest)})
+			} else {
+				out = append(out, Finding{Key: "blocked/" + role, Summary: fmt.Sprintf("%s submission %s: %s", role, b.Disposition, firstLine(b.Reason)),
+					Detail: fmt.Sprintf("turn %s at %s; family %s; not retried automatically -- fix the cause and submit again (factoryd submit), which clears this", b.Turn, b.At.Format(time.RFC3339), b.Family)})
+			}
 		}
 		if rs.Supervisor != nil {
 			alive, err := p.Alive(*rs)

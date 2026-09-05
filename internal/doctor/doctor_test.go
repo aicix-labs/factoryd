@@ -212,8 +212,9 @@ func fixture(t *testing.T) *config.Config {
 			Reviewer: config.RoleSpec{Command: []string{gate}, Env: map[string]string{"PATH": os.Getenv("PATH")}},
 		},
 		Supervisor: config.Supervisor{
-			VerdictAttempts: 6,
-			SpinWarn:        config.DefaultSpinWarn, SpinAbort: config.DefaultSpinAbort,
+			VerdictAttempts:  6,
+			PipelineAttempts: config.DefaultPipelineAttempts, PipelineTimeoutSeconds: config.DefaultPipelineTimeout,
+			SpinWarn: config.DefaultSpinWarn, SpinAbort: config.DefaultSpinAbort,
 			FailAbort:           config.DefaultFailAbort,
 			PollIntervalSeconds: config.DefaultPollInterval,
 			BackoffSeconds:      config.DefaultBackoffSeconds,
