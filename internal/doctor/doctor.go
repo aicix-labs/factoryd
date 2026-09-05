@@ -195,6 +195,29 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 				add(name, nil, prober.Describe()+" can write "+d)
 			}
 		}
+		// The factory root holds state.json and its lock: the supervisor's
+		// own record, where the verdict registry and the attempt counts
+		// live. The producer receives FACTORYD_ROOT and writes inbox/ and
+		// outbox/ beneath it; it must not be able to write the root itself
+		// (create, delete or replace state.json) nor state.json (#50
+		// review). Probed as the producer; the inbox write above is the
+		// control that this prober can write where it should.
+		if can, err := prober.CanWrite(ctx, cfg.Paths.Root); err != nil {
+			add("producer cannot write the factory root", fmt.Errorf("undecided: %v", err), cfg.Paths.Root)
+		} else if can {
+			add("producer cannot write the factory root", fmt.Errorf("%s CAN write %s; it could replace state.json and reset every bound the supervisor keeps there", prober.Describe(), cfg.Paths.Root), cfg.Paths.Root)
+		} else {
+			add("producer cannot write the factory root", nil, prober.Describe()+" cannot write "+cfg.Paths.Root)
+		}
+		if _, err := os.Lstat(cfg.StatePath()); err == nil {
+			if can, err := prober.CanWriteFile(ctx, cfg.StatePath()); err != nil {
+				add("producer cannot write state.json", fmt.Errorf("undecided: %v", err), cfg.StatePath())
+			} else if can {
+				add("producer cannot write state.json", fmt.Errorf("%s CAN write %s; the supervisor's record is the producer's to edit", prober.Describe(), cfg.StatePath()), cfg.StatePath())
+			} else {
+				add("producer cannot write state.json", nil, prober.Describe()+" cannot write "+cfg.StatePath())
+			}
+		}
 		// The producer receives no credential (§4.4). Probed as the producer:
 		// a reviewer token it can read is a token a networkless producer can
 		// copy into ordinary source and have submit push for it. The control

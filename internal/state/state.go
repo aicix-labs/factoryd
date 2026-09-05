@@ -10,6 +10,7 @@
 package state
 
 import (
+	"crypto/sha256"
 	"encoding/json"
 	"errors"
 	"fmt"
@@ -159,6 +160,20 @@ type Block struct {
 	// is not resubmitted by the next turn and is not lost either.
 	Quarantined []string `json:"quarantined,omitempty"`
 }
+
+// IssuedVerdict is a registry entry: what was written to the outbox, by
+// whom, and the sha256 of the bytes written.
+type IssuedVerdict struct {
+	Kind           string    `json:"kind"`
+	Branch         string    `json:"branch,omitempty"`
+	DeclaredBranch string    `json:"declared_branch,omitempty"`
+	Digest         string    `json:"digest"`
+	RecordedBy     string    `json:"recorded_by,omitempty"`
+	IssuedAt       time.Time `json:"issued_at"`
+}
+
+// DigestOf is the registry digest of a handoff document's bytes.
+func DigestOf(b []byte) string { return fmt.Sprintf("sha256:%x", sha256.Sum256(b)) }
 
 // Bool is a pointer to b, for the tri-state fields.
 func Bool(b bool) *bool { return &b }
@@ -369,6 +384,13 @@ type State struct {
 
 	// LastVerdict is the most recent verdict recorded, whatever it was.
 	LastVerdict *Verdict `json:"last_verdict,omitempty"`
+	// Issued is the registry of verdicts factoryd issued, by change id: the
+	// factoryd-owned identity of a verdict (#50 review). The outbox is a
+	// handoff directory the producer writes, so a file there is a trigger
+	// only if its digest matches an entry here; a forged or replaced file
+	// is not a verdict, and a count keyed by this identity survives a
+	// producer deleting and recreating the file.
+	Issued map[string]IssuedVerdict `json:"issued,omitempty"`
 	// Cycle is the producer's work cycle: the durable, write-ahead record of
 	// where the workdir stands between a refresh and a merge (#35). It is
 	// never inferred from absence: a document that predates it loads as

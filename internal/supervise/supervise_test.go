@@ -16,6 +16,7 @@ import (
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/proc"
+	"github.com/aicix-labs/factoryd/internal/signal"
 	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/supervise"
 )
@@ -1609,8 +1610,7 @@ func TestTimedOutTurnCountsOnTheFailStreakDespiteProgress(t *testing.T) {
 func TestVerdictCarriedPastTheBoundIsCreditedNoProgress(t *testing.T) {
 	fx := newFixture(t)
 	fx.cfg.Supervisor.VerdictAttempts = 2
-	v := filepath.Join(fx.outbox, "48.json")
-	os.WriteFile(v, []byte(`{"change_id":"48","kind":"changes-requested","branch":"fix/a-0123456789","declared_branch":"fix/a"}`), 0o644)
+	v := issueVerdict(t, fx, "48", "changes-requested", "fix/a")
 	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
 		fx.progressQuietFor("producer") // touches progress, never consumes the verdict
 		return supervise.TurnResult{}
@@ -1636,7 +1636,7 @@ func TestVerdictCarriedPastTheBoundIsCreditedNoProgress(t *testing.T) {
 	}
 	st, _ := state.Load(fx.cfg.StatePath(), fx.cfg.Name)
 	rs := st.Role(state.RoleProducer)
-	if !strings.Contains(rs.HaltReason, "spin_abort") || rs.TriggerAttempts[v] != r.count() {
+	if !strings.Contains(rs.HaltReason, "spin_abort") || rs.TriggerAttempts["48"] != r.count() {
 		t.Fatalf("halt %q attempts %v", rs.HaltReason, rs.TriggerAttempts)
 	}
 	if _, err := os.Stat(v); err != nil {
@@ -1646,8 +1646,7 @@ func TestVerdictCarriedPastTheBoundIsCreditedNoProgress(t *testing.T) {
 	// Consumption resets the count.
 	fx2 := newFixture(t)
 	fx2.cfg.Supervisor.VerdictAttempts = 2
-	v2 := filepath.Join(fx2.outbox, "48.json")
-	os.WriteFile(v2, []byte(`{"change_id":"48","kind":"changes-requested","branch":"fix/a-0123456789","declared_branch":"fix/a"}`), 0o644)
+	issueVerdict(t, fx2, "48", "changes-requested", "fix/a")
 	n := 0
 	r2 := &fakeRunner{act: func(_ int, tr supervise.Turn) supervise.TurnResult {
 		n++
@@ -1668,4 +1667,15 @@ func TestVerdictCarriedPastTheBoundIsCreditedNoProgress(t *testing.T) {
 	if len(st2.Role(state.RoleProducer).TriggerAttempts) != 0 {
 		t.Fatalf("attempts not reset on consumption: %v", st2.Role(state.RoleProducer).TriggerAttempts)
 	}
+}
+
+// issueVerdict writes AND registers a verdict, as the reviewer's signal
+// does; a file merely placed in the outbox is not a verdict.
+func issueVerdict(t *testing.T, fx *fixture, id, kind, family string) string {
+	t.Helper()
+	p, err := signal.Issue(fx.cfg, state.Verdict{ChangeID: id, Kind: kind, SHA: "s", Summary: "s", At: time.Now(), Branch: family + "-0123456789", DeclaredBranch: family})
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
 }

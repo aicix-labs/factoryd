@@ -25,6 +25,10 @@ type Prober interface {
 	// against credential files: a gate that can read the reviewer's token has
 	// the two-party model in its hands.
 	CanRead(ctx context.Context, path string) (bool, error)
+	// CanWriteFile reports whether the principal can open the existing
+	// file at path for writing. Used against state.json: a producer that
+	// can edit the supervisor's record can reset every bound kept there.
+	CanWriteFile(ctx context.Context, path string) (bool, error)
 	// CanTraverse reports whether the principal can pass THROUGH the
 	// directory at path -- search permission, access(2) with X_OK -- which
 	// is the question for a directory that holds a known secret: a 0711
@@ -120,6 +124,11 @@ func (p *setuidProber) CanTraverse(ctx context.Context, path string) (bool, erro
 // CanRead attempts a read as the principal, by the same mechanism as CanWrite.
 func (p *setuidProber) CanRead(ctx context.Context, path string) (bool, error) {
 	return p.probeShell(ctx, `test -r "$1"`, path)
+}
+
+func (p *setuidProber) CanWriteFile(ctx context.Context, path string) (bool, error) {
+	// Attempted, not reasoned: open for append without writing a byte.
+	return p.probeShell(ctx, `exec 3>>"$1"`, path)
 }
 
 // probeShell runs a one-line test as the principal and reports its truth.

@@ -1067,13 +1067,27 @@ exact mtime and the turn exits non-zero, so the supervisor's guards count it,
 back off, and halt at `fail_abort` with the verdict still in the outbox. **How
 many turns a verdict may be carried is the supervisor's bound, not the
 wrapper's**: a bound kept where the bounded principal can write is no bound.
-The supervisor counts, in its own state (`trigger_attempts`, per verdict
-path), the turns that left a verdict pending, resets the count when the
-verdict is consumed, and past `supervisor.verdict_attempts` (default 6)
-credits no progress to a turn that leaves it pending, whatever the turn did —
-so the spin guard halts at `spin_abort` with the verdict kept. Nothing the
-producer writes, deletes, or declares under the wrong family touches that
-count. And a turn the
+The supervisor counts, in its own state (`trigger_attempts`, per verdict), the
+turns that left a verdict pending, resets the count when the verdict is
+consumed, and past `supervisor.verdict_attempts` (default 6) credits no
+progress to a turn that leaves it pending, whatever the turn did — so the spin
+guard halts at `spin_abort` with the verdict kept. Three things make that
+bound the supervisor's and not the producer's. **The verdict's identity is
+factoryd's**: every verdict `signal` (or `factoryd verdict`) issues is
+registered in state by change id with the sha256 of the bytes written, before
+the file lands; the outbox is the producer's to write, so an outbox file is a
+trigger only if the registry names it and the bytes match — a forged or
+tampered file is moved aside as `<name>.unregistered` and runs no turn, and a
+registered file the producer deletes and recreates byte for byte is the same
+verdict with the same count. **The active verdict is the supervisor's
+choice**: at most one `changes-requested` verdict is passed to a turn, the
+oldest by issue time; the rest wait, untouched and uncounted, until it is
+consumed, so a multi-turn fix for one never spends another's allowance
+(`merged` and `operator-gated` pass through, they carry no work). **The
+record is out of the producer's reach**: `doctor` proves, as the producer,
+that it cannot write the factory root nor `state.json`, with the inbox write
+as the control — a producer that could replace `state.json` could reset every
+bound kept there. And a turn the
 supervisor killed at its deadline counts on the fail streak whatever the
 marker says, because nothing that would have judged its work ran (§6.3); `FACTORYD_TRIGGER_PATHS` is split on the platform's path-list
 separator, so configured paths containing it are refused at load and a trigger

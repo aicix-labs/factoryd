@@ -46,11 +46,11 @@ verdict_lines() {
   done
 }
 
-# selected_cr prints the ONE changes-requested verdict this turn acts on --
-# the first, in trigger order -- as "path<TAB>id<TAB>family". A turn has one
-# .producer-branch / .producer-commit-msg pair, so it can submit one
-# successor; the other changes-requested verdicts keep their triggers and
-# get their own turns (#50 review).
+# selected_cr prints the changes-requested verdict this turn acts on as
+# "path<TAB>id<TAB>family". The SUPERVISOR passes at most one such verdict
+# to a turn (the oldest; the rest wait, uncounted), so this is a read of
+# its choice, not a choice; the "first" here is defensive against an older
+# factoryd that passed them all (#50 review).
 selected_cr() {
   printf '%s\n' "${FACTORYD_VERDICTS_TSV:-}" | while IFS="$tab" read -r vpath vid vkind vbranch vfam; do
     if [ "$vkind" = "changes-requested" ]; then printf '%s\t%s\t%s\n' "$vpath" "$vid" "$vfam"; break; fi

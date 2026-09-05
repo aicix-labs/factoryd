@@ -317,6 +317,13 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return err
 		}
 
+		triggers, err = s.admitVerdicts(triggers)
+		if err != nil {
+			return err
+		}
+		if len(triggers) == 0 {
+			continue // everything pending was quarantined; the watcher settles
+		}
 		halted, err := s.oneTurn(ctx, triggers)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {

@@ -271,14 +271,37 @@ func auditsClear(audits []scm.Audit, sha string, reviewer scm.Identity, change s
 	return nil
 }
 
+// writeVerdict writes the handoff document and REGISTERS it in state, by
+// change id and digest, before the file lands: the outbox is the
+// producer's to write, so the registry is the verdict's identity (#50
+// review). An entry recorded and a write that then fails leaves a
+// registered verdict with no file, which is a verdict nobody can act on
+// and is reported; a file with no entry is not a verdict at all.
+// Issue writes and registers a verdict document: the one way a verdict
+// reaches the outbox, exported so tests issue registered verdicts the way
+// the reviewer does rather than planting files the supervisor rightly
+// refuses.
+func Issue(cfg *config.Config, v state.Verdict) (string, error) { return writeVerdict(cfg, v) }
+
 func writeVerdict(cfg *config.Config, v state.Verdict) (string, error) {
 	body, err := json.MarshalIndent(v, "", "  ")
 	if err != nil {
 		return "", err
 	}
+	body = append(body, '\n')
+	digest := state.DigestOf(body)
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		if st.Issued == nil {
+			st.Issued = map[string]state.IssuedVerdict{}
+		}
+		st.Issued[v.ChangeID] = state.IssuedVerdict{Kind: v.Kind, Branch: v.Branch, DeclaredBranch: v.DeclaredBranch, Digest: digest, RecordedBy: v.RecordedBy, IssuedAt: v.At}
+		return nil
+	}); err != nil {
+		return "", fmt.Errorf("registering the verdict: %w", err)
+	}
 	path := filepath.Join(cfg.OutboxDir(), v.ChangeID+".json")
 	tmp := path + ".tmp"
-	if err := os.WriteFile(tmp, append(body, '\n'), 0o644); err != nil {
+	if err := os.WriteFile(tmp, body, 0o644); err != nil {
 		return "", err
 	}
 	if err := os.Rename(tmp, path); err != nil {

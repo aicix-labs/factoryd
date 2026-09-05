@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"os"
 	"path/filepath"
+	"sort"
 	"strings"
 	"time"
 
@@ -358,21 +359,29 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 		for _, t := range remaining {
 			still[t.Path] = true
 		}
+		// Keyed by the verdict's registry identity -- its change id -- not
+		// by the file's path: a producer that deletes and recreates the
+		// file has not been issued a new verdict (#50 review).
+		stillIDs := map[string]bool{}
+		for p := range still {
+			stillIDs[strings.TrimSuffix(filepath.Base(p), ".json")] = true
+		}
 		for _, t := range real {
 			if t.Label != "verdict" {
 				continue
 			}
+			id := strings.TrimSuffix(filepath.Base(t.Path), ".json")
 			if !still[t.Path] {
 				continue // consumed; the sweep below drops its count
 			}
-			rs.TriggerAttempts[t.Path]++
-			if rs.TriggerAttempts[t.Path] > s.cfg.Supervisor.VerdictAttempts {
-				overdrawn = fmt.Sprintf("verdict %s carried through %d turns without being consumed (verdict_attempts=%d)", filepath.Base(t.Path), rs.TriggerAttempts[t.Path], s.cfg.Supervisor.VerdictAttempts)
+			rs.TriggerAttempts[id]++
+			if rs.TriggerAttempts[id] > s.cfg.Supervisor.VerdictAttempts {
+				overdrawn = fmt.Sprintf("verdict %s carried through %d turns without being consumed (verdict_attempts=%d)", id, rs.TriggerAttempts[id], s.cfg.Supervisor.VerdictAttempts)
 			}
 		}
-		for p := range rs.TriggerAttempts {
-			if !still[p] {
-				delete(rs.TriggerAttempts, p)
+		for id := range rs.TriggerAttempts {
+			if !stillIDs[id] {
+				delete(rs.TriggerAttempts, id)
 			}
 		}
 		return nil
@@ -669,4 +678,74 @@ func (s *Supervisor) writeInterruptedMarker(turn Turn, res TurnResult, at time.T
 			"The supervisor was stopped after this turn consumed its trigger. This is a recovery turn, not a failure.\n",
 		s.cfg.Supervisor.FailAbort, labels(real), turn.ID, res.ExitCode, at.Format(time.RFC3339))
 	return os.WriteFile(s.cfg.RetryPath(s.role), []byte(body), 0o644)
+}
+
+// admitVerdicts is the factoryd-owned boundary between the outbox and a
+// producer turn (#50 review). The outbox is the producer's to write, so a
+// file there is a trigger only if the registry in state names it and the
+// bytes match the registered digest: a forged or replaced file is moved
+// aside as <name>.unregistered, logged, and is not a trigger. And the
+// supervisor, not the wrapper, selects the active verdict: at most ONE
+// changes-requested verdict per turn -- the oldest by issue time -- the
+// rest left pending, untouched and uncounted, until it is consumed. So a
+// multi-turn fix for one verdict never spends another's allowance.
+// Merged and operator-gated verdicts carry no work and pass through.
+func (s *Supervisor) admitVerdicts(triggers []watch.Trigger) ([]watch.Trigger, error) {
+	if s.role != "producer" {
+		return triggers, nil
+	}
+	st, err := state.Load(s.cfg.StatePath(), s.cfg.Name)
+	if err != nil {
+		return nil, err
+	}
+	var out []watch.Trigger
+	var cr []struct {
+		t  watch.Trigger
+		at time.Time
+	}
+	for _, t := range triggers {
+		if t.Label != "verdict" {
+			out = append(out, t)
+			continue
+		}
+		id := strings.TrimSuffix(filepath.Base(t.Path), ".json")
+		iv, ok := st.Issued[id]
+		body, rerr := os.ReadFile(t.Path)
+		if !ok || rerr != nil || state.DigestOf(body) != iv.Digest {
+			why := "no registry entry"
+			switch {
+			case rerr != nil:
+				why = rerr.Error()
+			case ok:
+				why = "digest does not match the registered verdict"
+			}
+			q := t.Path + ".unregistered"
+			if err := os.Rename(t.Path, q); err != nil && !os.IsNotExist(err) {
+				return nil, fmt.Errorf("quarantining an unregistered verdict file %s: %w", t.Path, err)
+			}
+			s.log.Error("outbox file is not a registered verdict; quarantined, not a trigger", "path", t.Path, "reason", why, "moved_to", q)
+			continue
+		}
+		if iv.Kind == state.VerdictChangesRequested {
+			cr = append(cr, struct {
+				t  watch.Trigger
+				at time.Time
+			}{t, iv.IssuedAt})
+			continue
+		}
+		out = append(out, t)
+	}
+	if len(cr) > 0 {
+		sort.Slice(cr, func(i, j int) bool {
+			if cr[i].at.Equal(cr[j].at) {
+				return cr[i].t.Path < cr[j].t.Path
+			}
+			return cr[i].at.Before(cr[j].at)
+		})
+		out = append(out, cr[0].t)
+		if len(cr) > 1 {
+			s.log.Info("one changes-requested verdict per turn; the rest wait", "active", filepath.Base(cr[0].t.Path), "waiting", len(cr)-1)
+		}
+	}
+	return out, nil
 }
