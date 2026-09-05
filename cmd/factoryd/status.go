@@ -15,6 +15,7 @@ import (
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/factory"
 	"github.com/aicix-labs/factoryd/internal/scm"
+	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/status"
 )
 
@@ -37,7 +38,10 @@ func runStatus(args []string) int {
 		fmt.Fprintln(os.Stderr, "factoryd status: at least one --config is required")
 		return exitConfig
 	}
-	var cs []*status.Collector
+	var (
+		cfgs []*config.Config
+		cs   []*status.Collector
+	)
 	for _, p := range cfgPaths {
 		cfg, err := config.Load(p)
 		if err != nil {
@@ -58,6 +62,7 @@ func runStatus(args []string) int {
 			}
 			deps.ListOpen = func(ctx context.Context) ([]scm.Change, error) { return drv.ListOpen(ctx) }
 		}
+		cfgs = append(cfgs, cfg)
 		cs = append(cs, status.New(cfg, deps))
 	}
 	srv, err := status.NewServer(cs)
@@ -97,6 +102,12 @@ func runStatus(args []string) int {
 	if !boundToLoopback(ln.Addr()) {
 		fmt.Fprintf(os.Stderr, "factoryd status: WARNING: bound to %s, which is not a loopback address, and the page has no authentication; anyone who can reach it sees the factory's state\n", ln.Addr())
 	}
+	release, err := claimLongRunningService(cfgs, state.ServiceStatusServe)
+	if err != nil {
+		_ = ln.Close()
+		fmt.Fprintf(os.Stderr, "factoryd status: %v\n", err)
+		return exitConfig
+	}
 	hs := &http.Server{Handler: srv.Handler(), ReadHeaderTimeout: 5 * time.Second}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
@@ -108,8 +119,13 @@ func runStatus(args []string) int {
 	}()
 	fmt.Fprintf(os.Stderr, "factoryd status: serving %d factor%s on http://%s/ (JSON at /status.json)\n",
 		len(cs), map[bool]string{true: "y", false: "ies"}[len(cs) == 1], ln.Addr())
-	if err := hs.Serve(ln); err != nil && err != http.ErrServerClosed {
+	serveErr := hs.Serve(ln)
+	if err := release(); err != nil {
 		fmt.Fprintf(os.Stderr, "factoryd status: %v\n", err)
+		return exitError
+	}
+	if serveErr != nil && serveErr != http.ErrServerClosed {
+		fmt.Fprintf(os.Stderr, "factoryd status: %v\n", serveErr)
 		return exitError
 	}
 	return exitOK

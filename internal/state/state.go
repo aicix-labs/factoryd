@@ -28,8 +28,12 @@ import (
 // v2 adds the verdict registry. A v1 outbox document was producer-writable
 // and therefore cannot be retroactively treated as a registered verdict. A
 // v1 document loads into an explicit migration-required state instead of
-// silently quarantining the old handoff files.
-const SchemaVersion = 2
+// silently quarantining the old handoff files. v3 adds exact process handles
+// for long-running status and health services, so an older binary cannot
+// silently erase the record that doctor uses to detect a replaced executable.
+// v4 refuses to mistake an empty v3 service map for proof that no pre-registry
+// status or health process remains alive.
+const SchemaVersion = 4
 
 var (
 	// ErrProducerLifecycleBusy means a queued handoff or admitted producer
@@ -39,6 +43,14 @@ var (
 	// producer worktree while it copies and gates a declared change. A queued
 	// handoff must wait rather than start an agent beside that use.
 	ErrProducerWorktreeBusy = errors.New("producer worktree is leased for submission")
+	// ErrServiceAlreadyRunning means the exact handle for a long-running
+	// factoryd service is still live. Replacing it would hide a service doctor
+	// must be able to inspect.
+	ErrServiceAlreadyRunning = errors.New("factoryd service is already running")
+	// ErrServiceRegistryMigrationRequired means a state predates durable
+	// service handles, so an operator must complete the restart sweep before
+	// doctor or a new long-running service can trust the registry.
+	ErrServiceRegistryMigrationRequired = errors.New("service registry migration required")
 )
 
 // Role is one of the two agent roles.
@@ -51,6 +63,66 @@ const (
 
 // Roles is every role, in a stable order.
 var Roles = []Role{RoleProducer, RoleReviewer}
+
+// Service is a factoryd command that keeps using a factory after its initial
+// invocation. Unlike one-shot verbs, it must leave an exact handle in state
+// for doctor to inspect after a binary install.
+type Service string
+
+const (
+	ServiceStatusServe Service = "status-serve"
+	ServiceHealthLoop  Service = "health-loop"
+)
+
+// Services is every long-running service in a stable order.
+var Services = []Service{ServiceStatusServe, ServiceHealthLoop}
+
+// ValidService reports whether service is a known long-running service.
+func ValidService(service Service) bool {
+	for _, known := range Services {
+		if service == known {
+			return true
+		}
+	}
+	return false
+}
+
+// ServiceRegistry is the trust state of long-running service handles. A v3
+// state has no way to distinguish "no service was ever started" from "an old
+// status or health process is still serving from an inode an install deleted".
+// It therefore loads blocked until an operator explicitly attests the restart
+// sweep of every long-running factoryd process with `factoryd migrate ...
+// service-registry`.
+type ServiceRegistry struct {
+	Status      string    `json:"status"`
+	Reason      string    `json:"reason,omitempty"`
+	BlockedAt   time.Time `json:"blocked_at,omitempty"`
+	AttestedAt  time.Time `json:"attested_at,omitempty"`
+	Attestation string    `json:"attestation,omitempty"`
+}
+
+const (
+	ServiceRegistryReady             = "ready"
+	ServiceRegistryMigrationRequired = "migration-required"
+)
+
+// Ready reports whether service handles can be trusted to enumerate all
+// currently running long-lived factoryd services.
+func (r *ServiceRegistry) Ready() bool {
+	return r != nil && r.Status == ServiceRegistryReady
+}
+
+// MigrationError returns the durable reason service handles cannot yet be
+// trusted.
+func (r *ServiceRegistry) MigrationError() error {
+	if r.Ready() {
+		return nil
+	}
+	if r == nil || r.Reason == "" {
+		return ErrServiceRegistryMigrationRequired
+	}
+	return fmt.Errorf("%w: %s", ErrServiceRegistryMigrationRequired, r.Reason)
+}
 
 // Turn is one agent turn. Agent turns are one-shot: the supervisor owns all
 // continuity.
@@ -647,6 +719,14 @@ type State struct {
 	// deciding to alert and recording that it did cannot alert twice -- or,
 	// worse, decide it already had.
 	Health map[string]*Condition `json:"health,omitempty"`
+	// ServiceRegistry says whether Services is a complete inventory. An absent
+	// record is unknown, never evidence that no old service remains alive.
+	ServiceRegistry *ServiceRegistry `json:"service_registry"`
+	// Services holds exact handles for long-running non-supervisor commands.
+	// A service records itself before it begins using the factory and removes
+	// only its own handle on exit. This lets doctor distinguish a stopped
+	// service from one still executing an inode an install replaced.
+	Services map[Service]*proc.Ref `json:"services,omitempty"`
 }
 
 // Condition is one standing health condition.
@@ -669,6 +749,9 @@ func New(factory string) *State {
 		VerdictRegistry: &VerdictRegistry{
 			Status: VerdictRegistryReady,
 		},
+		ServiceRegistry: &ServiceRegistry{
+			Status: ServiceRegistryReady,
+		},
 	}
 	for _, r := range Roles {
 		s.Roles[r] = &RoleState{}
@@ -688,11 +771,68 @@ func (s *State) Role(r Role) *RoleState {
 	return s.Roles[r]
 }
 
+// Service returns the recorded handle for service, if any.
+func (s *State) Service(service Service) *proc.Ref {
+	if s.Services == nil {
+		return nil
+	}
+	return s.Services[service]
+}
+
+// ClaimService records holder as the exact process running service. Call it
+// within Update: checking an old holder and replacing it must share the state
+// lock, otherwise two service instances could both decide they own the slot.
+func (s *State) ClaimService(service Service, holder proc.Ref) error {
+	if err := s.ServiceRegistry.MigrationError(); err != nil {
+		return err
+	}
+	if !ValidService(service) {
+		return fmt.Errorf("state: unknown service %q", service)
+	}
+	if holder.PID <= 0 || holder.StartToken == "" {
+		return fmt.Errorf("state: %s service has an incomplete process handle", service)
+	}
+	if existing := s.Service(service); existing != nil {
+		if existing.PID == holder.PID && existing.StartToken == holder.StartToken {
+			return nil
+		}
+		alive, err := existing.Alive()
+		if err != nil {
+			return fmt.Errorf("state: cannot prove recorded %s service %s is gone: %w", service, existing, err)
+		}
+		if alive {
+			return fmt.Errorf("%w: %s is held by %s", ErrServiceAlreadyRunning, service, existing)
+		}
+	}
+	if s.Services == nil {
+		s.Services = map[Service]*proc.Ref{}
+	}
+	copy := holder
+	s.Services[service] = &copy
+	return nil
+}
+
+// ReleaseService removes service only when holder is still the exact process
+// that claimed it. A stopped older service must not erase a newer instance's
+// durable handle.
+func (s *State) ReleaseService(service Service, holder proc.Ref) {
+	if existing := s.Service(service); existing != nil && existing.PID == holder.PID && existing.StartToken == holder.StartToken {
+		delete(s.Services, service)
+	}
+}
+
 // VerdictsReady reports whether this state can admit a producer outbox
 // verdict. A nil registry is never ready; nil is only possible for a corrupt
-// v2 document because v1 is converted to an explicit blocked record at load.
+// current-schema document because v1 is converted to an explicit blocked
+// record at load.
 func (s *State) VerdictsReady() bool {
 	return s != nil && s.VerdictRegistry.Ready()
+}
+
+// ServicesReady reports whether service handles can be used as the complete
+// inventory of long-running status and health processes.
+func (s *State) ServicesReady() bool {
+	return s != nil && s.ServiceRegistry.Ready()
 }
 
 // Validate checks the document's internal consistency.
@@ -714,6 +854,18 @@ func (s *State) Validate() error {
 		}
 	default:
 		return fmt.Errorf("state: verdict registry status %q is not known", s.VerdictRegistry.Status)
+	}
+	if s.ServiceRegistry == nil {
+		return errors.New("state: service registry is missing; refusing to guess whether pre-registry services remain alive")
+	}
+	switch s.ServiceRegistry.Status {
+	case ServiceRegistryReady:
+	case ServiceRegistryMigrationRequired:
+		if s.ServiceRegistry.BlockedAt.IsZero() || s.ServiceRegistry.Reason == "" {
+			return errors.New("state: service registry migration is blocked without a time or reason")
+		}
+	default:
+		return fmt.Errorf("state: service registry status %q is not known", s.ServiceRegistry.Status)
 	}
 	for _, r := range Roles {
 		rs := s.Roles[r]
@@ -741,6 +893,14 @@ func (s *State) Validate() error {
 			if p.FirstSeen.IsZero() {
 				return fmt.Errorf("state: role %s pending[%d] (%s) has no first-seen time; a pending trigger with no age cannot be escalated", r, i, p.Label)
 			}
+		}
+	}
+	for service, ref := range s.Services {
+		if !ValidService(service) {
+			return fmt.Errorf("state: unknown long-running service %q", service)
+		}
+		if ref == nil || ref.PID <= 0 || ref.StartToken == "" {
+			return fmt.Errorf("state: service %s has an incomplete process handle", service)
 		}
 	}
 	if c := s.Cycle; c != nil {
@@ -793,10 +953,19 @@ func Load(path, factory string) (*State, error) {
 		return nil, fmt.Errorf("%s: not valid JSON: %w", path, err)
 	}
 	legacyVerdictRegistry := false
+	legacyServiceRegistry := false
 	switch probe.SchemaVersion {
 	case SchemaVersion:
+	case 3, 2:
+		// Neither v2 nor v3 can inventory pre-registry status/health services.
+		// Their empty Services maps prove nothing: a process started by an old
+		// binary has no handle to put there. Preserve that uncertainty as a
+		// durable blocked record rather than promoting it to an empty trusted
+		// registry.
+		legacyServiceRegistry = true
 	case 1:
 		legacyVerdictRegistry = true
+		legacyServiceRegistry = true
 	case 0:
 		return nil, fmt.Errorf("%s: no schema_version; refusing to guess which schema this is", path)
 	default:
@@ -811,11 +980,19 @@ func Load(path, factory string) (*State, error) {
 	if s.Factory == "" {
 		s.Factory = factory
 	}
+	if legacyServiceRegistry {
+		s.SchemaVersion = SchemaVersion
+		s.ServiceRegistry = &ServiceRegistry{
+			Status:    ServiceRegistryMigrationRequired,
+			Reason:    "state predates the long-running service registry; stop or restart every pre-registry factoryd process, including producer/reviewer supervisors and `factoryd status --serve`/`factoryd health --loop`, then have the operator run `factoryd migrate --config <file> service-registry`",
+			BlockedAt: time.Now().UTC(),
+		}
+	}
 	if legacyVerdictRegistry {
 		// These files were placed in an outbox with no factory-owned identity
 		// record. Do not hash and accept them now: the producer could have
 		// planted them before this binary was installed. The next Update
-		// persists this block as schema v2, and only the explicit migration
+		// persists this block as the current schema, and only the explicit migration
 		// command may make the registry ready.
 		s.SchemaVersion = SchemaVersion
 		s.VerdictRegistry = &VerdictRegistry{
@@ -962,6 +1139,59 @@ func MigrateVerdictRegistry(path, factory, outbox string) ([]string, error) {
 		return nil, err
 	}
 	return moved, nil
+}
+
+// MigrateServiceRegistry records the operator's explicit attestation that
+// every pre-registry long-running factoryd process was stopped or restarted.
+// Old status and health services have no durable handles, so that part cannot
+// be inferred from an empty map. Producer and reviewer supervisors do have
+// handles, and must be proven dead before this writes the schema that an old
+// supervisor cannot load. After the attestation only services started by this
+// build may claim a fresh exact handle.
+func MigrateServiceRegistry(path, factory string) error {
+	_, err := Update(path, factory, func(s *State) error {
+		if s.ServiceRegistry.Ready() {
+			return nil
+		}
+		if err := s.ServiceRegistry.MigrationError(); err != nil {
+			if !errors.Is(err, ErrServiceRegistryMigrationRequired) {
+				return err
+			}
+		}
+		requireStopped := func(label string, ref *proc.Ref) error {
+			if ref == nil {
+				return nil
+			}
+			alive, err := ref.Alive()
+			if err != nil {
+				return fmt.Errorf("cannot prove recorded %s %s is gone: %w", label, ref, err)
+			}
+			if alive {
+				return fmt.Errorf("recorded %s %s is still live; stop it before attesting the all-process restart sweep", label, ref)
+			}
+			return nil
+		}
+		for _, role := range Roles {
+			if err := requireStopped(string(role)+" supervisor", s.Role(role).Supervisor); err != nil {
+				return err
+			}
+		}
+		for _, service := range Services {
+			if err := requireStopped(string(service)+" service", s.Service(service)); err != nil {
+				return err
+			}
+		}
+		// Any remaining handles name dead processes. The post-attestation
+		// inventory begins empty and is populated only by fresh claims.
+		s.Services = nil
+		s.ServiceRegistry = &ServiceRegistry{
+			Status:      ServiceRegistryReady,
+			AttestedAt:  time.Now().UTC(),
+			Attestation: "operator attested that every pre-registry factoryd process, including supervisors and status/health services, was stopped or restarted",
+		}
+		return nil
+	})
+	return err
 }
 
 func legacyVerdictPath(src string) (string, error) {

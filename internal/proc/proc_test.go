@@ -1,6 +1,7 @@
 package proc
 
 import (
+	"errors"
 	"os"
 	"os/exec"
 	"testing"
@@ -71,6 +72,27 @@ func TestRefWithoutStartTokenIsRefused(t *testing.T) {
 	r := Ref{PID: os.Getpid()}
 	if _, err := r.Alive(); err == nil {
 		t.Fatal("a ref with no start token answered a liveness question it cannot answer")
+	}
+}
+
+func TestExecutableIdentifiesTheLiveSelf(t *testing.T) {
+	r, err := Self("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	path, err := r.Executable()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if path == "" {
+		t.Fatal("live process executable is empty")
+	}
+}
+
+func TestExecutableRefusesADeadRef(t *testing.T) {
+	r := Ref{PID: os.Getpid(), StartToken: "not-this-process"}
+	if _, err := r.Executable(); !errors.Is(err, ErrNotRunning) {
+		t.Fatalf("Executable error=%v, want ErrNotRunning", err)
 	}
 }
 

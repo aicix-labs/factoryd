@@ -29,7 +29,9 @@ jobs:
           fi
 
       - name: build
-        run: go build ./...
+        run: |
+          make build VERSION="${GITHUB_SHA}"
+          test "$(./factoryd version)" = "${GITHUB_SHA}"
 
       - name: vet
         run: go vet ./...

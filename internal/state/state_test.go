@@ -1,12 +1,16 @@
 package state
 
 import (
+	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/aicix-labs/factoryd/internal/proc"
 )
 
 func tmpPath(t *testing.T) string {
@@ -51,6 +55,101 @@ func TestRoundTrip(t *testing.T) {
 	}
 	if got.UpdatedAt.IsZero() {
 		t.Fatal("Save did not stamp updated_at")
+	}
+}
+
+func TestClaimAndReleaseServiceUseTheExactProcessHandle(t *testing.T) {
+	s := New("widgets")
+	holder, err := proc.Self("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimService(ServiceStatusServe, holder); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Service(ServiceStatusServe); got == nil || got.PID != holder.PID || got.StartToken != holder.StartToken {
+		t.Fatalf("status service = %+v, want exact holder %+v", got, holder)
+	}
+
+	// A process with the same PID but a different start token is not the
+	// holder. It must not clear an active service after PID reuse.
+	s.ReleaseService(ServiceStatusServe, proc.Ref{PID: holder.PID, StartToken: holder.StartToken + "-different"})
+	if got := s.Service(ServiceStatusServe); got == nil {
+		t.Fatal("non-holder released the service")
+	}
+	s.ReleaseService(ServiceStatusServe, holder)
+	if got := s.Service(ServiceStatusServe); got != nil {
+		t.Fatalf("holder did not release service: %+v", got)
+	}
+}
+
+func TestV2StateBlocksUntilServiceRegistryMigration(t *testing.T) {
+	p := tmpPath(t)
+	body := `{"schema_version":2,"factory":"widgets","roles":{},"verdict_registry":{"status":"ready"},"cycle":{"phase":"new"}}`
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(p, "widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.SchemaVersion != SchemaVersion {
+		t.Fatalf("migrated schema version = %d, want %d", s.SchemaVersion, SchemaVersion)
+	}
+	if !errors.Is(s.ServiceRegistry.MigrationError(), ErrServiceRegistryMigrationRequired) {
+		t.Fatalf("v2 service registry = %+v, want durable migration block", s.ServiceRegistry)
+	}
+	holder, err := proc.Self("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimService(ServiceStatusServe, holder); !errors.Is(err, ErrServiceRegistryMigrationRequired) {
+		t.Fatalf("v2 registry admitted a new service before attestation: %v", err)
+	}
+	if _, err := Update(p, "widgets", func(*State) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := Load(p, "widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(persisted.ServiceRegistry.MigrationError(), ErrServiceRegistryMigrationRequired) {
+		t.Fatalf("persisted v2 upgrade silently trusted empty services: %+v", persisted.ServiceRegistry)
+	}
+	if err := MigrateServiceRegistry(p, "widgets"); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Load(p, "widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migrated.ServicesReady() || migrated.ServiceRegistry.AttestedAt.IsZero() {
+		t.Fatalf("explicit service migration did not record an attestation: %+v", migrated.ServiceRegistry)
+	}
+}
+
+// A legacy supervisor can still write state. It must be stopped before the
+// migration persists schema v4, which that old process would otherwise refuse
+// on its next Update and silently stall the factory.
+func TestServiceRegistryMigrationRefusesLiveLegacySupervisor(t *testing.T) {
+	p := tmpPath(t)
+	supervisor, err := proc.Self("producer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf(`{"schema_version":3,"factory":"widgets","roles":{"producer":{"supervisor":{"pid":%d,"start_token":%q}}},"verdict_registry":{"status":"ready"},"cycle":{"phase":"new"}}`, supervisor.PID, supervisor.StartToken)
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateServiceRegistry(p, "widgets"); err == nil || !strings.Contains(err.Error(), "producer supervisor") || !strings.Contains(err.Error(), "still live") {
+		t.Fatalf("service migration with live legacy supervisor = %v, want refusal", err)
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"schema_version":3`) {
+		t.Fatalf("migration wrote a new schema while legacy supervisor was live:\n%s", raw)
 	}
 }
 

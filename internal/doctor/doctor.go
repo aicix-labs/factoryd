@@ -8,6 +8,7 @@ package doctor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/aicix-labs/factoryd/internal/alert"
 	"github.com/aicix-labs/factoryd/internal/health"
@@ -23,7 +24,9 @@ import (
 	"github.com/aicix-labs/factoryd/internal/factory"
 	"github.com/aicix-labs/factoryd/internal/gittransport"
 	"github.com/aicix-labs/factoryd/internal/principal"
+	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/scm"
+	"github.com/aicix-labs/factoryd/internal/state"
 )
 
 // Check is one question and its answer.
@@ -102,6 +105,9 @@ type Deps struct {
 	// Reach probes whether a turn of spec can reach addr, sandboxed or not.
 	// Nil uses the real runner with this binary's own _netprobe verb.
 	Reach func(ctx context.Context, spec config.RoleSpec, addr string, sandboxed bool) (bool, error)
+	// ProcessExecutable resolves the executable path of a recorded live
+	// factoryd process. Nil reads /proc through proc.Ref.Executable.
+	ProcessExecutable func(proc.Ref) (string, error)
 }
 
 // Run performs every check with the real dependencies.
@@ -129,6 +135,9 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 	}
 	if deps.Contain == nil {
 		deps.Contain = realContain
+	}
+	if deps.ProcessExecutable == nil {
+		deps.ProcessExecutable = func(ref proc.Ref) (string, error) { return ref.Executable() }
 	}
 	var r Report
 	add := func(name string, err error, detail string) {
@@ -529,6 +538,51 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 
 	add("spin guard", nil, fmt.Sprintf("warn at %d turns with no progress, halt at %d; backoff %ds",
 		cfg.Supervisor.SpinWarn, cfg.Supervisor.SpinAbort, cfg.Supervisor.BackoffSeconds))
+
+	// An install replaces the path's inode but not a process that already has
+	// it mapped. systemd then truthfully says the old process is active, while
+	// every command it serves comes from code no longer on disk. state holds an
+	// exact process handle, so inspect that process rather than searching an
+	// argv or trusting a service manager (#53). This includes the long-running
+	// status and health services: they too keep the old inode mapped after an
+	// install, even though they do not supervise an agent role.
+	if st, err := state.Load(cfg.StatePath(), cfg.Name); err != nil {
+		add("factoryd process binaries", fmt.Errorf("cannot inspect recorded factoryd processes: %w", err), cfg.StatePath())
+	} else {
+		if err := st.ServiceRegistry.MigrationError(); err != nil {
+			add("service registry", fmt.Errorf("%v; stop or restart every pre-registry factoryd process, including producer/reviewer supervisors and `factoryd status --serve`/`factoryd health --loop`, then run `factoryd migrate --config %s service-registry` as the operator", err, cfg.Path()), "long-running service inventory is intentionally unknown")
+		} else {
+			add("service registry", nil, "complete exact-handle inventory")
+		}
+		checkRecordedBinary := func(name string, ref *proc.Ref, absent, restart string) {
+			if ref == nil {
+				add(name, nil, absent)
+				return
+			}
+			path, err := deps.ProcessExecutable(*ref)
+			switch {
+			case errors.Is(err, proc.ErrNotRunning):
+				// status and health report a dead process. Doctor's question here
+				// is narrower: whether a live one is executing a replaced binary.
+				// Do not call no running process a stale executable.
+				add(name, nil, ref.String()+" is not live; no executable to compare")
+			case err != nil:
+				add(name, fmt.Errorf("cannot inspect %s: %w", ref, err), "")
+			case strings.HasSuffix(path, " (deleted)"):
+				add(name, fmt.Errorf("%s is executing %s; its on-disk binary was replaced. Restart %s before trusting its output", ref, path, restart), path)
+			default:
+				add(name, nil, path)
+			}
+		}
+		for _, role := range state.Roles {
+			name := "supervisor " + string(role) + " binary"
+			checkRecordedBinary(name, st.Role(role).Supervisor, "no supervisor recorded", "the "+string(role)+" supervisor/service")
+		}
+		for _, service := range state.Services {
+			name := "service " + string(service) + " binary"
+			checkRecordedBinary(name, st.Service(service), "no service recorded", "the "+string(service)+" service")
+		}
+	}
 
 	// --- containment ---
 	// A turn's processes are held in a per-turn cgroup, killed as a whole

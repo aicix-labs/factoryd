@@ -11,7 +11,9 @@ import (
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/doctor"
+	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/scm"
+	"github.com/aicix-labs/factoryd/internal/state"
 )
 
 // fakeDriver resolves to whatever identity its token names, so a test can make
@@ -250,6 +252,108 @@ func TestHealthyFactoryPasses(t *testing.T) {
 	if len(r.Checks) < 12 {
 		t.Fatalf("only %d checks ran; doctor is not asking enough questions", len(r.Checks))
 	}
+}
+
+// An active unit can still be serving an old inode after an install replaces
+// the binary. The state handle identifies the real supervisor without an argv
+// search, and the kernel's deleted suffix is the cheap, build-stamp-independent
+// evidence that a restart is required.
+func TestDoctorRejectsLiveSupervisorRunningADeletedBinary(t *testing.T) {
+	cfg := fixture(t)
+	ref := proc.Ref{PID: 4242, StartToken: "supervisor-start", Role: "producer"}
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		st.Role(state.RoleProducer).Supervisor = &ref
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deps := healthyDeps(cfg, nil)
+	deps.ProcessExecutable = func(got proc.Ref) (string, error) {
+		if got != ref {
+			t.Fatalf("doctor inspected %+v, want the state-recorded supervisor %+v", got, ref)
+		}
+		return "/usr/local/bin/factoryd (deleted)", nil
+	}
+	r := doctor.RunWith(context.Background(), cfg, deps)
+	for _, c := range r.Checks {
+		if c.Name == "supervisor producer binary" {
+			if c.OK || c.Err == nil || !strings.Contains(c.Err.Error(), "replaced") || !strings.Contains(c.Err.Error(), "Restart") {
+				t.Fatalf("deleted supervisor check=%+v, want a restart-required failure", c)
+			}
+			return
+		}
+	}
+	t.Fatalf("doctor did not inspect the producer supervisor binary:\n%s", r)
+}
+
+// status --serve and health --loop are long-running services too. Unlike the
+// role supervisors they do not have a CurrentTurn, so the durable service
+// handle is the only way doctor can see that an install replaced their mapped
+// executable (#53).
+func TestDoctorRejectsLiveStatusAndHealthServicesRunningADeletedBinary(t *testing.T) {
+	cfg := fixture(t)
+	statusRef := proc.Ref{PID: 4242, StartToken: "status-start", Role: "service status-serve"}
+	healthRef := proc.Ref{PID: 4343, StartToken: "health-start", Role: "service health-loop"}
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		st.Services = map[state.Service]*proc.Ref{
+			state.ServiceStatusServe: &statusRef,
+			state.ServiceHealthLoop:  &healthRef,
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deps := healthyDeps(cfg, nil)
+	deps.ProcessExecutable = func(got proc.Ref) (string, error) {
+		switch got {
+		case statusRef:
+			return "/usr/local/bin/factoryd (deleted)", nil
+		case healthRef:
+			return "/usr/local/bin/factoryd (deleted)", nil
+		default:
+			t.Fatalf("doctor inspected unexpected process %+v", got)
+			return "", nil
+		}
+	}
+	r := doctor.RunWith(context.Background(), cfg, deps)
+	want := map[string]bool{
+		"service status-serve binary": false,
+		"service health-loop binary":  false,
+	}
+	for _, c := range r.Checks {
+		if _, ok := want[c.Name]; ok {
+			if c.OK || c.Err == nil || !strings.Contains(c.Err.Error(), "replaced") || !strings.Contains(c.Err.Error(), "Restart") {
+				t.Fatalf("deleted %s check=%+v, want a restart-required failure", c.Name, c)
+			}
+			want[c.Name] = true
+		}
+	}
+	for name, found := range want {
+		if !found {
+			t.Fatalf("doctor did not inspect %s:\n%s", name, r)
+		}
+	}
+}
+
+// This is the upgrade case that originally exposed #53: those old services
+// cannot have an exact handle because their binary predates the registry.
+// Doctor must not turn that absence into a green "no service recorded" row.
+func TestDoctorBlocksV2StateUntilServiceRegistryRestartSweep(t *testing.T) {
+	cfg := fixture(t)
+	body := `{"schema_version":2,"factory":"` + cfg.Name + `","roles":{},"verdict_registry":{"status":"ready"},"cycle":{"phase":"new"}}`
+	if err := os.WriteFile(cfg.StatePath(), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
+	for _, c := range r.Checks {
+		if c.Name == "service registry" {
+			if c.OK || c.Err == nil || !strings.Contains(c.Err.Error(), "migration required") || !strings.Contains(c.Err.Error(), "restart") || !strings.Contains(c.Err.Error(), "service-registry") {
+				t.Fatalf("v2 service registry check=%+v, want restart-sweep migration failure", c)
+			}
+			return
+		}
+	}
+	t.Fatalf("doctor did not block the v2 service registry upgrade:\n%s", r)
 }
 
 // The check the two-party model rests on: one credential file for both roles.

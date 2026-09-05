@@ -9,18 +9,18 @@ import (
 	"github.com/aicix-labs/factoryd/internal/state"
 )
 
-// runMigrate is deliberately narrow. A v1 verdict handoff was writable by the
-// producer, so migration cannot manufacture registry entries from those bytes.
-// It archives the unsafe files and makes the v2 registry ready for a reviewer
-// or operator to issue a current verdict again.
+// runMigrate makes a legacy trust boundary explicit. A v1 verdict handoff was
+// writable by the producer, so migration cannot manufacture registry entries
+// from those bytes. Likewise, a pre-service-registry state cannot prove that
+// old long-running factoryd processes were stopped after an install.
 func runMigrate(args []string) int {
 	fs := flag.NewFlagSet("migrate", flag.ContinueOnError)
 	cfgPath := fs.String("config", "", "factory config file")
 	if err := fs.Parse(args); err != nil {
 		return exitError
 	}
-	if *cfgPath == "" || len(fs.Args()) != 1 || fs.Args()[0] != "verdict-registry" {
-		fmt.Fprintln(os.Stderr, "usage: factoryd migrate --config <f> verdict-registry")
+	if *cfgPath == "" || len(fs.Args()) != 1 {
+		fmt.Fprintln(os.Stderr, "usage: factoryd migrate --config <f> <verdict-registry|service-registry>")
 		return exitConfig
 	}
 	cfg, err := config.Load(*cfgPath)
@@ -28,14 +28,27 @@ func runMigrate(args []string) int {
 		fmt.Fprintf(os.Stderr, "factoryd migrate: %v\n", err)
 		return exitConfig
 	}
-	moved, err := state.MigrateVerdictRegistry(cfg.StatePath(), cfg.Name, cfg.OutboxDir())
-	if err != nil {
-		fmt.Fprintf(os.Stderr, "factoryd migrate: verdict registry: %v\n", err)
+	switch fs.Args()[0] {
+	case "verdict-registry":
+		moved, err := state.MigrateVerdictRegistry(cfg.StatePath(), cfg.Name, cfg.OutboxDir())
+		if err != nil {
+			fmt.Fprintf(os.Stderr, "factoryd migrate: verdict registry: %v\n", err)
+			return exitConfig
+		}
+		for _, path := range moved {
+			fmt.Printf("quarantined untrusted legacy verdict: %s\n", path)
+		}
+		fmt.Fprintln(os.Stdout, "verdict registry ready; reissue any still-current verdict with factoryd signal or factoryd verdict")
+		return exitOK
+	case "service-registry":
+		if err := state.MigrateServiceRegistry(cfg.StatePath(), cfg.Name); err != nil {
+			fmt.Fprintf(os.Stderr, "factoryd migrate: service registry: %v\n", err)
+			return exitConfig
+		}
+		fmt.Fprintln(os.Stdout, "service registry ready; the operator attested that every pre-registry factoryd process, including supervisors and status/health services, was stopped or restarted")
+		return exitOK
+	default:
+		fmt.Fprintln(os.Stderr, "usage: factoryd migrate --config <f> <verdict-registry|service-registry>")
 		return exitConfig
 	}
-	for _, path := range moved {
-		fmt.Printf("quarantined untrusted legacy verdict: %s\n", path)
-	}
-	fmt.Fprintln(os.Stdout, "verdict registry ready; reissue any still-current verdict with factoryd signal or factoryd verdict")
-	return exitOK
 }
