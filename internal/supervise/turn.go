@@ -185,6 +185,11 @@ func consumed(acted []watch.Trigger, remaining []watch.Trigger) bool {
 type admittedTurn struct {
 	Triggers []watch.Trigger
 	Verdicts []VerifiedVerdict
+	// QueueReserved says selectQueuedBrief atomically checked and marked the
+	// cycle working for this queued trigger. oneTurn confirms that reservation
+	// before moving the producer-visible file, so an intervening root-side
+	// lifecycle change cannot launch the brief beside a live draft.
+	QueueReserved bool
 }
 
 // oneTurn runs exactly one agent turn and applies the spin guard. It reports
@@ -244,16 +249,36 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 				break
 			}
 			queuedSource = trigger.Path
+			if admitted.QueueReserved {
+				reserved, reason, err := s.confirmQueuedCycleReservation()
+				if err != nil {
+					return false, err
+				}
+				if !reserved {
+					s.log.Warn("queued brief was not taken because its cycle reservation was lost", "turn", turn.ID, "reason", reason)
+					res, skipped = TurnResult{ExitCode: ExitBeforeTurnFailed}, true
+					break
+				}
+			}
 			var err error
 			queuedDone, err = brief.Take(s.cfg, queuedSource)
 			if err != nil {
 				s.log.Error("could not take queued brief; the turn does not run and the brief remains pending", "turn", turn.ID, "err", err)
+				if admitted.QueueReserved {
+					if releaseErr := s.releaseQueuedCycleReservation(); releaseErr != nil {
+						s.log.Error("could not release queued-cycle reservation after the brief was not taken", "turn", turn.ID, "err", releaseErr)
+					}
+				}
 				res, skipped = TurnResult{ExitCode: ExitBeforeTurnFailed}, true
 				break
 			}
 		}
 	}
-	if s.beforeTurn != nil && !resumeAfterTurn && !skipped {
+	// QueueStart already refreshed and reserved the cycle under the state lock.
+	// Calling BeforeTurn again would only inspect the expected working state;
+	// more importantly, it would reintroduce a lifecycle decision after the
+	// queue entry was selected.
+	if s.beforeTurn != nil && !admitted.QueueReserved && !resumeAfterTurn && !skipped {
 		msg, err := s.beforeTurn(ctx, turn)
 		if err != nil && queuedDone != "" {
 			if restoreErr := brief.Restore(s.cfg, queuedSource, queuedDone); restoreErr != nil {
@@ -645,6 +670,46 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 		// return instantly and the loop would spend money in a tight ring.
 		return false, s.sleep(ctx, s.backoff(spin))
 	}
+}
+
+// confirmQueuedCycleReservation takes the state lock immediately before the
+// queued file is moved. QueueStart makes CycleWorking the reservation state;
+// if a root-side operation changed it after that atomic start, leave the
+// source entry untouched and refuse to run rather than work beside the new
+// lifecycle state.
+func (s *Supervisor) confirmQueuedCycleReservation() (bool, string, error) {
+	reserved := false
+	var reason string
+	_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		if st.Cycle != nil && st.Cycle.Phase == state.CycleWorking {
+			reserved = true
+			return nil
+		}
+		if st.Cycle == nil {
+			reason = "no cycle record"
+		} else {
+			reason = "cycle is " + st.Cycle.Phase
+		}
+		return nil
+	})
+	if err != nil {
+		return false, "", err
+	}
+	return reserved, reason, nil
+}
+
+// releaseQueuedCycleReservation gives a brief that could not be taken a
+// chance to be selected again. It only releases the reservation we still own;
+// a concurrent root-side transition (for example to open) is left intact.
+func (s *Supervisor) releaseQueuedCycleReservation() error {
+	_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		if st.Cycle != nil && st.Cycle.Phase == state.CycleWorking {
+			base := st.Cycle.Base
+			st.SetCycle(state.CycleNew, s.now()).Base = base
+		}
+		return nil
+	})
+	return err
 }
 
 // backoff scales with the spin count and is capped, so a stuck factory slows

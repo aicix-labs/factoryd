@@ -178,19 +178,20 @@ type Options struct {
 	// The returned string is logged.
 	AfterTurn func(ctx context.Context, t Turn, res TurnResult) (string, error)
 
-	// QueueReady is consulted only for a producer with queued briefs and no
-	// other trigger. It says whether a new work cycle may start. The command
-	// wires it to refresh's merge reconciliation, so a human-merged open
-	// change releases the next queued brief without launching a second producer
-	// turn while the old one is still in flight.
-	QueueReady func(ctx context.Context) (ready bool, reason string, err error)
+	// QueueStart is consulted only for a producer with queued briefs and no
+	// other trigger. It performs the final lifecycle check and reserves the
+	// cycle for the queued turn while holding the state lock. The command wires
+	// it to refresh's merge reconciliation and refresh step, so a human-merged
+	// open change releases the next queued brief without launching a second
+	// producer turn while the old one is still in flight.
+	QueueStart func(ctx context.Context) (started bool, reason string, err error)
 }
 
 // Supervisor is one role's loop.
 type Supervisor struct {
 	beforeTurn func(ctx context.Context, t Turn) (string, error)
 	afterTurn  func(ctx context.Context, t Turn, res TurnResult) (string, error)
-	queueReady func(ctx context.Context) (ready bool, reason string, err error)
+	queueStart func(ctx context.Context) (started bool, reason string, err error)
 	cfg        *config.Config
 	role       string
 	runner     Runner
@@ -256,7 +257,7 @@ func New(opts Options) (*Supervisor, error) {
 	s := &Supervisor{
 		beforeTurn: opts.BeforeTurn,
 		afterTurn:  opts.AfterTurn,
-		queueReady: opts.QueueReady,
+		queueStart: opts.QueueStart,
 		cfg:        opts.Config,
 		role:       opts.Role,
 		runner:     opts.Runner,
@@ -357,7 +358,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return err
 		}
 
-		triggers, deferred, reason, err := s.selectQueuedBrief(ctx, triggers)
+		triggers, deferred, queueReserved, reason, err := s.selectQueuedBrief(ctx, triggers)
 		if err != nil {
 			return err
 		}
@@ -384,6 +385,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		if len(admitted.Triggers) == 0 {
 			continue // everything pending was quarantined; the watcher settles
 		}
+		admitted.QueueReserved = queueReserved
 		halted, err := s.oneTurn(ctx, admitted)
 		if err != nil {
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -402,10 +404,13 @@ func (s *Supervisor) Run(ctx context.Context) error {
 // describes existing work and must settle before a fresh work order begins.
 // When the queue is the only wake-up, exactly its lexical first entry starts
 // a cycle; every later entry remains pending. A closed-over draft defers that
-// selection without manufacturing a failed turn or touching the guard.
-func (s *Supervisor) selectQueuedBrief(ctx context.Context, triggers []watch.Trigger) ([]watch.Trigger, bool, string, error) {
+// selection without manufacturing a failed turn or touching the guard. Its
+// final lifecycle check and reservation are one operation: after this returns
+// a queued trigger, the cycle is working and another root-side operation sees
+// that reservation rather than an eligible stale phase.
+func (s *Supervisor) selectQueuedBrief(ctx context.Context, triggers []watch.Trigger) ([]watch.Trigger, bool, bool, string, error) {
 	if s.role != "producer" {
-		return triggers, false, "", nil
+		return triggers, false, false, "", nil
 	}
 	var queued, other []watch.Trigger
 	for _, t := range triggers {
@@ -416,39 +421,50 @@ func (s *Supervisor) selectQueuedBrief(ctx context.Context, triggers []watch.Tri
 		}
 	}
 	if len(queued) == 0 {
-		return triggers, false, "", nil
+		return triggers, false, false, "", nil
 	}
 	if len(other) > 0 {
-		return other, false, "", nil
+		return other, false, false, "", nil
 	}
 	sort.Slice(queued, func(i, j int) bool { return queued[i].Path < queued[j].Path })
-	ready, reason, err := s.queueMayStart(ctx)
+	started, reason, err := s.startQueuedCycle(ctx)
 	if err != nil {
-		return nil, false, "", err
+		return nil, false, false, "", err
 	}
-	if !ready {
-		return nil, true, reason, nil
+	if !started {
+		return nil, true, false, reason, nil
 	}
-	return []watch.Trigger{queued[0]}, false, "", nil
+	return []watch.Trigger{queued[0]}, false, true, "", nil
 }
 
-func (s *Supervisor) queueMayStart(ctx context.Context) (bool, string, error) {
-	if s.queueReady != nil {
-		return s.queueReady(ctx)
+func (s *Supervisor) startQueuedCycle(ctx context.Context) (bool, string, error) {
+	if s.queueStart != nil {
+		return s.queueStart(ctx)
 	}
-	st, err := state.Load(s.cfg.StatePath(), s.cfg.Name)
+
+	started := false
+	var reason string
+	_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		if st.Cycle == nil {
+			reason = "no cycle record; run factoryd refresh --force before taking queued work"
+			return nil
+		}
+		switch st.Cycle.Phase {
+		case state.CycleNew, state.CycleFinished, state.CycleClean:
+			// A caller without the command's refresh hook still gets the key
+			// invariant: the eligible phase is changed under the same lock as
+			// the decision before the queued file can be taken.
+			st.SetCycle(state.CycleWorking, s.now())
+			started = true
+		default:
+			reason = "cycle is " + st.Cycle.Phase + "; a queued brief waits until the in-flight work settles"
+		}
+		return nil
+	})
 	if err != nil {
 		return false, "", err
 	}
-	if st.Cycle == nil {
-		return false, "no cycle record; run factoryd refresh --force before taking queued work", nil
-	}
-	switch st.Cycle.Phase {
-	case state.CycleNew, state.CycleFinished, state.CycleClean:
-		return true, "", nil
-	default:
-		return false, "cycle is " + st.Cycle.Phase + "; a queued brief waits until the in-flight work settles", nil
-	}
+	return started, reason, nil
 }
 
 // checkVerdictRegistry stops a producer before it observes or quarantines a

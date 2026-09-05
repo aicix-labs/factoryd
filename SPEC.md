@@ -983,13 +983,16 @@ there is no queued work, which is normal idle and is stated explicitly by
 `factoryd health` and `factoryd status`. When entries exist, the producer
 supervisor selects only the lexical first regular `*.md` file, and only when
 the cycle is `new`, `clean`, or `finished`. It never starts queued work beside
-an open draft; while waiting it rechecks the open cycle through the same
-provider reconciliation that an ordinary refresh uses, so an operator merge
-releases the next item without a manual wake. Before the agent starts, factoryd
-moves the selected file to `inbox/briefs/done/` and gives that path to the
-wrapper as `FACTORYD_BRIEF`. It refuses to overwrite an existing done file, so
-a reused queue name cannot erase the record of earlier work. Later queue files
-remain where they were; a taken brief does not simply vanish.
+an open draft: while holding the state lock, it rechecks through the same
+provider reconciliation that an ordinary refresh uses, refreshes the workdir,
+and marks the cycle `working` before taking the selected file. Thus an operator
+merge releases the next item without a manual wake, while a root-side lifecycle
+operation cannot turn a stale eligibility check into a second producer turn.
+Before the agent starts, factoryd moves the selected file to
+`inbox/briefs/done/` and gives that path to the wrapper as `FACTORYD_BRIEF`. It
+refuses to overwrite an existing done file, so a reused queue name cannot erase
+the record of earlier work. Later queue files remain where they were; a taken
+brief does not simply vanish.
 
 The **question channel** is a v2 addition. v1 defined signalling only for the push
 path, so an agent blocked *before* having something to push had no way to reach its

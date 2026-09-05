@@ -288,38 +288,69 @@ func BeforeTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 	}
 }
 
-// QueueReady decides whether a queued brief may begin a producer cycle. It is
-// intentionally separate from BeforeTurn: a queued brief behind an open draft
-// must not create a synthetic failed turn merely to learn that it has to wait.
+// QueueStart decides, refreshes, and reserves a queued producer cycle in one
+// state-locked operation. It is intentionally separate from BeforeTurn: a
+// queued brief behind an open draft must not create a synthetic failed turn
+// merely to learn that it has to wait. More importantly, returning ready from
+// a read-only check would leave a gap in which another root-side operation
+// could open the cycle before factoryd takes the brief. The successful path
+// therefore refreshes and records CycleWorking before it releases the lock.
 // An open draft is reconciled at this boundary, so an operator merge releases
 // the next queued brief without a new manual wake.
-func QueueReady(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, error)) func(ctx context.Context) (bool, string, error) {
+func QueueStart(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, error)) func(ctx context.Context) (bool, string, error) {
 	return func(ctx context.Context) (bool, string, error) {
-		ready := false
+		started := false
 		var note string
 		_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+			// An open cycle may have landed since the previous turn. Build the
+			// dependencies once and reuse them for the refresh after a proved
+			// merge, matching BeforeTurn's locked sequence.
+			var deps Deps
+			var built bool
 			if c := st.Cycle; c != nil && c.Phase == state.CycleOpen {
-				deps, err := mkDeps(ctx)
+				d, err := mkDeps(ctx)
 				if err != nil {
 					return err
 				}
+				deps, built = d, true
 				if _, n := Reconcile(ctx, cfg, st, deps.Lookup, deps.Ancestor, time.Now()); n != "" {
 					note = n
 				}
 			}
 			var why string
-			ready, why = Decide(st)
-			if !ready {
+			canStart, why := Decide(st)
+			if !canStart {
 				if note != "" {
 					note += "; "
 				}
 				note += "brief queue waiting: " + why
+				return nil
 			}
+			if !built {
+				d, err := mkDeps(ctx)
+				if err != nil {
+					return err
+				}
+				deps = d
+			}
+			r, err := Run(ctx, cfg, deps)
+			if err != nil {
+				return err
+			}
+			st.SetCycle(state.CycleNew, time.Now()).Base = r.SHA
+			// This is the reservation: the queued file has not moved yet, but
+			// root-side lifecycle operations now see a producer-owned tree.
+			st.SetCycle(state.CycleWorking, time.Now())
+			started = true
+			if note != "" {
+				note += "; "
+			}
+			note += fmt.Sprintf("workdir refreshed to %s at %s", cfg.TargetBranch, short(r.SHA))
 			return nil
 		})
 		if err != nil {
-			return false, "", fmt.Errorf("refresh: checking whether the brief queue may start: %w", err)
+			return false, "", fmt.Errorf("refresh: starting the brief queue: %w", err)
 		}
-		return ready, note, nil
+		return started, note, nil
 	}
 }

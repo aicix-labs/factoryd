@@ -1043,6 +1043,69 @@ func TestQueuedBriefWaitsWithoutStartingASecondProducerTurn(t *testing.T) {
 	}
 }
 
+// Queue admission reserves CycleWorking with its final eligibility check. If a
+// root-side lifecycle operation opens a draft immediately afterwards, the
+// second locked check before brief.Take refuses the stale reservation: the
+// producer must not start work beside that draft or lose the queued source.
+func TestQueuedBriefRefusesCycleOpenedAfterQueueStart(t *testing.T) {
+	a := newAgentAcceptance(t, `touch "$FACTORYD_PROGRESS"`)
+	if err := os.MkdirAll(a.cfg.BriefsDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	queued := filepath.Join(a.cfg.BriefsDir(), "010-next.md")
+	if err := os.WriteFile(queued, []byte("next task\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+
+	s, err := supervise.New(supervise.Options{
+		Config: a.cfg, Role: "producer",
+		Runner:   &supervise.ExecRunner{Config: a.cfg, Role: "producer", Stdout: io.Discard, Stderr: io.Discard},
+		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
+		MaxTurns: 1,
+		QueueStart: func(context.Context) (bool, string, error) {
+			if _, err := state.Update(a.cfg.StatePath(), a.cfg.Name, func(st *state.State) error {
+				st.SetCycle(state.CycleWorking, time.Now())
+				return nil
+			}); err != nil {
+				return false, "", err
+			}
+			// Model the independent root-side operation taking the lock after
+			// the reservation, but before oneTurn can take the filesystem
+			// handoff. This was the old QueueReady/oneTurn race window.
+			if _, err := state.Update(a.cfg.StatePath(), a.cfg.Name, func(st *state.State) error {
+				st.SetCycle(state.CycleOpen, time.Now()).ChangeID = "49"
+				return nil
+			}); err != nil {
+				return false, "", err
+			}
+			return true, "", nil
+		},
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.producerTurns(t); got != 0 {
+		t.Fatalf("producer turns=%d, want 0 after the cycle opened", got)
+	}
+	if _, err := os.Stat(queued); err != nil {
+		t.Fatalf("queued brief was taken after the cycle opened: %v", err)
+	}
+	if _, err := os.Stat(filepath.Join(a.cfg.BriefsDoneDir(), "010-next.md")); !os.IsNotExist(err) {
+		t.Fatalf("queued brief moved to done after the cycle opened: %v", err)
+	}
+	rs := mustLoad(t, a.cfg).Role(state.RoleProducer)
+	if rs.CurrentTurn != nil {
+		t.Fatalf("refused queued turn remains running: %+v", rs.CurrentTurn)
+	}
+	if rs.LastTurn == nil || rs.LastTurn.EndedAt == nil {
+		t.Fatalf("refused queued turn was not finalized: %+v", rs.LastTurn)
+	}
+}
+
 // A matching declaration is still not an acknowledgement if root-side submit
 // concludes there is nothing to submit. The wrapper may delete the handoff,
 // but the verdict remains unresolved and visible rather than stranded behind

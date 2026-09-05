@@ -823,9 +823,9 @@ func TestReconcileFinishesAnOpenCycleOnlyForAMergeIntoTheConfiguredTarget(t *tes
 
 // A queued brief is a reason to reconcile an operator-merged draft, but not
 // a reason to launch a failed producer turn while it remains open. Once the
-// provider proves the merge landed, the queue is allowed to start its next
-// work item.
-func TestQueueReadyReconcilesAnOperatorMergedCycle(t *testing.T) {
+// provider proves the merge landed, the queue refreshes and atomically marks
+// its next work item working before the selected file is taken.
+func TestQueueStartReconcilesAndReservesAnOperatorMergedCycle(t *testing.T) {
 	cfg := cfgFor(t)
 	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
 		c := st.SetCycle(state.CycleOpen, time.Now())
@@ -836,17 +836,23 @@ func TestQueueReadyReconcilesAnOperatorMergedCycle(t *testing.T) {
 		t.Fatal(err)
 	}
 	f := &lookupFake{state: scm.StateMerged, onTarget: true}
-	ready, note, err := refresh.QueueReady(cfg, func(context.Context) (refresh.Deps, error) {
-		return refresh.Deps{Lookup: f.get, Ancestor: f.ancestor}, nil
+	started, note, err := refresh.QueueStart(cfg, func(context.Context) (refresh.Deps, error) {
+		return refresh.Deps{
+			Fetch:    func(context.Context, string) error { return nil },
+			Bundle:   func(context.Context, string, string) (string, error) { return "abc123", nil },
+			Apply:    func(context.Context, string, string) (string, error) { return "abc123", nil },
+			Lookup:   f.get,
+			Ancestor: f.ancestor,
+		}, nil
 	})(context.Background())
-	if err != nil || !ready || !strings.Contains(note, "cycle finished") {
-		t.Fatalf("ready=%v note=%q err=%v", ready, note, err)
+	if err != nil || !started || !strings.Contains(note, "cycle finished") || !strings.Contains(note, "workdir refreshed") {
+		t.Fatalf("started=%v note=%q err=%v", started, note, err)
 	}
 	st, err := state.Load(cfg.StatePath(), cfg.Name)
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Cycle == nil || st.Cycle.Phase != state.CycleFinished || f.calls != 1 || f.ancCalls != 1 {
+	if st.Cycle == nil || st.Cycle.Phase != state.CycleWorking || st.Cycle.Base != "abc123" || f.calls != 1 || f.ancCalls != 1 {
 		t.Fatalf("cycle=%+v lookup=%d ancestor=%d", st.Cycle, f.calls, f.ancCalls)
 	}
 }
