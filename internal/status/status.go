@@ -117,14 +117,15 @@ type PendingView struct {
 // record I cannot read" call for different actions, and the second is
 // reported as an error the page shows.
 type HealthView struct {
-	Present  bool                 `json:"present"`
-	Err      string               `json:"error,omitempty"`
-	Stale    bool                 `json:"stale"` // older than two health intervals
-	AgeText  string               `json:"age_text,omitempty"`
-	Healthy  bool                 `json:"healthy"`
-	Findings []health.Finding     `json:"findings,omitempty"`
-	Volumes  []health.Volume      `json:"volumes,omitempty"`
-	Caches   []health.CacheReport `json:"caches,omitempty"`
+	Present    bool                     `json:"present"`
+	Err        string                   `json:"error,omitempty"`
+	Stale      bool                     `json:"stale"` // older than two health intervals
+	AgeText    string                   `json:"age_text,omitempty"`
+	Healthy    bool                     `json:"healthy"`
+	Findings   []health.Finding         `json:"findings,omitempty"`
+	Volumes    []health.Volume          `json:"volumes,omitempty"`
+	Caches     []health.CacheReport     `json:"caches,omitempty"`
+	BriefQueue *health.BriefQueueReport `json:"brief_queue,omitempty"`
 }
 
 // ChangesView is the provider's open changes, or why they are unknown.
@@ -280,7 +281,7 @@ func (c *Collector) readHealth(now time.Time) HealthView {
 	}
 	age := now.Sub(rep.At)
 	return HealthView{Present: true, Stale: age > 2*time.Duration(c.cfg.Health.IntervalSeconds)*time.Second, AgeText: ageText(age),
-		Healthy: rep.Healthy, Findings: rep.Findings, Volumes: rep.Volumes, Caches: rep.Caches}
+		Healthy: rep.Healthy, Findings: rep.Findings, Volumes: rep.Volumes, Caches: rep.Caches, BriefQueue: rep.BriefQueue}
 }
 
 func (c *Collector) readChanges(ctx context.Context, now time.Time) ChangesView {

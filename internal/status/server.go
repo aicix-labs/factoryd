@@ -127,6 +127,13 @@ func Text(s Snapshot) string {
 			h += " STALE"
 		}
 		fmt.Fprintf(&sb, "health    %s, %s ago\n", h, s.Health.AgeText)
+		if q := s.Health.BriefQueue; q != nil {
+			if q.Empty {
+				sb.WriteString("  brief queue empty; waiting for work\n")
+			} else {
+				fmt.Fprintf(&sb, "  brief queue %d pending; next %s\n", q.Pending, q.Next)
+			}
+		}
 		for _, v := range s.Health.Volumes {
 			fmt.Fprintf(&sb, "  volume %-28s %.1f%% free\n", v.Path, v.FreePercent)
 		}
@@ -232,6 +239,7 @@ small{color:#666}
 <h2>Health</h2>
 {{if .Health.Err}}<p class="bad">unreadable: {{.Health.Err}}</p>{{else if not .Health.Present}}<p class="bad">no health document</p>{{else}}
 <p class="{{if .Health.Healthy}}ok{{else}}bad{{end}}">{{if .Health.Healthy}}healthy{{else}}{{len .Health.Findings}} finding(s){{end}}{{if .Health.Stale}} <span class="warn">STALE</span>{{end}} <small>{{.Health.AgeText}} ago</small></p>
+{{with .Health.BriefQueue}}<p><small>{{if .Empty}}brief queue empty; waiting for work{{else}}brief queue {{.Pending}} pending; next {{.Next}}{{end}}</small></p>{{end}}
 {{if .Health.Findings}}<ul>{{range .Health.Findings}}<li><code>{{.Key}}</code> {{.Summary}}</li>{{end}}</ul>{{end}}
 <table>{{range .Health.Volumes}}<tr><td>volume</td><td><code>{{.Path}}</code></td><td>{{pct .FreePercent}} free</td></tr>{{end}}
 {{range .Health.Caches}}<tr><td>cache</td><td><code>{{.Path}}</code></td><td>{{.Bytes}} of {{.MaxBytes}} bytes{{if .ReclaimedCount}}; reclaimed {{.ReclaimedCount}}{{end}}{{if .Err}} <span class="bad">{{.Err}}</span>{{end}}</td></tr>{{end}}</table>{{end}}

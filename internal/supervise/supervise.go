@@ -15,8 +15,10 @@ import (
 	"fmt"
 	"log/slog"
 	"os"
+	"sort"
 	"time"
 
+	"github.com/aicix-labs/factoryd/internal/brief"
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/state"
@@ -175,12 +177,20 @@ type Options struct {
 	// a factory whose submit keeps failing is stalled exactly the same way.
 	// The returned string is logged.
 	AfterTurn func(ctx context.Context, t Turn, res TurnResult) (string, error)
+
+	// QueueReady is consulted only for a producer with queued briefs and no
+	// other trigger. It says whether a new work cycle may start. The command
+	// wires it to refresh's merge reconciliation, so a human-merged open
+	// change releases the next queued brief without launching a second producer
+	// turn while the old one is still in flight.
+	QueueReady func(ctx context.Context) (ready bool, reason string, err error)
 }
 
 // Supervisor is one role's loop.
 type Supervisor struct {
 	beforeTurn func(ctx context.Context, t Turn) (string, error)
 	afterTurn  func(ctx context.Context, t Turn, res TurnResult) (string, error)
+	queueReady func(ctx context.Context) (ready bool, reason string, err error)
 	cfg        *config.Config
 	role       string
 	runner     Runner
@@ -209,6 +219,7 @@ func TriggersFor(cfg *config.Config, role string) ([]watch.Spec, error) {
 	case "producer":
 		return []watch.Spec{
 			{Label: "brief", Dir: cfg.InboxDir(), Pattern: "brief.md"},
+			{Label: brief.Label, Dir: cfg.BriefsDir(), Pattern: "*.md"},
 			{Label: "answer", Dir: cfg.OutboxDir(), Pattern: "answer.md"},
 			{Label: "verdict", Dir: cfg.OutboxDir(), Pattern: "*.json"},
 			retry,
@@ -236,9 +247,16 @@ func New(opts Options) (*Supervisor, error) {
 		return nil, fmt.Errorf("supervise: no runner")
 	}
 
+	if opts.Role == "producer" {
+		if err := brief.Ensure(opts.Config); err != nil {
+			return nil, err
+		}
+	}
+
 	s := &Supervisor{
 		beforeTurn: opts.BeforeTurn,
 		afterTurn:  opts.AfterTurn,
+		queueReady: opts.QueueReady,
 		cfg:        opts.Config,
 		role:       opts.Role,
 		runner:     opts.Runner,
@@ -339,6 +357,26 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return err
 		}
 
+		triggers, deferred, reason, err := s.selectQueuedBrief(ctx, triggers)
+		if err != nil {
+			return err
+		}
+		if deferred {
+			if reason != "" {
+				s.log.Info("queued brief deferred", "reason", reason)
+			}
+			if err := s.sleep(ctx, time.Duration(s.cfg.Supervisor.PollIntervalSeconds)*time.Second); err != nil {
+				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+					return nil
+				}
+				return err
+			}
+			continue
+		}
+		if len(triggers) == 0 {
+			continue
+		}
+
 		admitted, err := s.admitVerdicts(triggers)
 		if err != nil {
 			return err
@@ -356,6 +394,60 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		if halted {
 			return ErrHalted
 		}
+	}
+}
+
+// selectQueuedBrief serializes the operator backlog. A queued brief never
+// shares a producer turn with another trigger: a verdict/answer/legacy brief
+// describes existing work and must settle before a fresh work order begins.
+// When the queue is the only wake-up, exactly its lexical first entry starts
+// a cycle; every later entry remains pending. A closed-over draft defers that
+// selection without manufacturing a failed turn or touching the guard.
+func (s *Supervisor) selectQueuedBrief(ctx context.Context, triggers []watch.Trigger) ([]watch.Trigger, bool, string, error) {
+	if s.role != "producer" {
+		return triggers, false, "", nil
+	}
+	var queued, other []watch.Trigger
+	for _, t := range triggers {
+		if t.Label == brief.Label {
+			queued = append(queued, t)
+		} else {
+			other = append(other, t)
+		}
+	}
+	if len(queued) == 0 {
+		return triggers, false, "", nil
+	}
+	if len(other) > 0 {
+		return other, false, "", nil
+	}
+	sort.Slice(queued, func(i, j int) bool { return queued[i].Path < queued[j].Path })
+	ready, reason, err := s.queueMayStart(ctx)
+	if err != nil {
+		return nil, false, "", err
+	}
+	if !ready {
+		return nil, true, reason, nil
+	}
+	return []watch.Trigger{queued[0]}, false, "", nil
+}
+
+func (s *Supervisor) queueMayStart(ctx context.Context) (bool, string, error) {
+	if s.queueReady != nil {
+		return s.queueReady(ctx)
+	}
+	st, err := state.Load(s.cfg.StatePath(), s.cfg.Name)
+	if err != nil {
+		return false, "", err
+	}
+	if st.Cycle == nil {
+		return false, "no cycle record; run factoryd refresh --force before taking queued work", nil
+	}
+	switch st.Cycle.Phase {
+	case state.CycleNew, state.CycleFinished, state.CycleClean:
+		return true, "", nil
+	default:
+		return false, "cycle is " + st.Cycle.Phase + "; a queued brief waits until the in-flight work settles", nil
 	}
 }
 

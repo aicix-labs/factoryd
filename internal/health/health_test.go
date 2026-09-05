@@ -248,6 +248,33 @@ func TestUnknownLivenessIsAFinding(t *testing.T) {
 	}
 }
 
+// An empty backlog is intentional idle, not an alert condition. It is still
+// rendered explicitly so "healthy" does not leave an operator guessing
+// whether the factory is making progress or waiting for work.
+func TestBriefQueueIsExplicitWithoutBecomingAFinding(t *testing.T) {
+	l := newLab(t)
+	rep := l.tick(t)
+	if !rep.Healthy || rep.BriefQueue == nil || !rep.BriefQueue.Empty || rep.BriefQueue.Pending != 0 {
+		t.Fatalf("empty queue report = %+v, healthy=%v findings=%v", rep.BriefQueue, rep.Healthy, rep.Findings)
+	}
+	if !strings.Contains(rep.Summary(), "brief queue empty; waiting for work") {
+		t.Fatalf("summary did not name intentional idle:\n%s", rep.Summary())
+	}
+	if err := os.MkdirAll(l.cfg.BriefsDir(), 0o755); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(l.cfg.BriefsDir(), "020-later.md"), []byte("later\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := os.WriteFile(filepath.Join(l.cfg.BriefsDir(), "010-next.md"), []byte("next\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	rep = l.tick(t)
+	if !rep.Healthy || rep.BriefQueue == nil || rep.BriefQueue.Empty || rep.BriefQueue.Pending != 2 || rep.BriefQueue.Next != "010-next.md" {
+		t.Fatalf("queued report = %+v, healthy=%v findings=%v", rep.BriefQueue, rep.Healthy, rep.Findings)
+	}
+}
+
 func TestTurnPastTimeoutPlusGraceIsDetected(t *testing.T) {
 	l := newLab(t)
 	start := l.now.Add(-(600 + 60 + 1) * time.Second)

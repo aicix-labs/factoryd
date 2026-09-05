@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aicix-labs/factoryd/internal/brief"
 	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/watch"
@@ -228,8 +229,39 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 		skipped = true
 		s.log.Info("retry resumes the after-turn step; the agent does not rerun", "turn", turn.ID)
 	}
-	if s.beforeTurn != nil && !resumeAfterTurn {
+	// A queue entry is factoryd-taken, not producer-deleted. Move it before
+	// preparation so the runner can read its stable done/ path; if preparation
+	// cannot start the turn, put it back exactly where its lexical order put it.
+	queuedSource, queuedDone := "", ""
+	if !resumeAfterTurn {
+		for _, trigger := range triggers {
+			if trigger.Label != brief.Label {
+				continue
+			}
+			if queuedSource != "" {
+				s.log.Error("more than one queued brief reached one turn; the turn does not run", "turn", turn.ID)
+				res, skipped = TurnResult{ExitCode: ExitBeforeTurnFailed}, true
+				break
+			}
+			queuedSource = trigger.Path
+			var err error
+			queuedDone, err = brief.Take(s.cfg, queuedSource)
+			if err != nil {
+				s.log.Error("could not take queued brief; the turn does not run and the brief remains pending", "turn", turn.ID, "err", err)
+				res, skipped = TurnResult{ExitCode: ExitBeforeTurnFailed}, true
+				break
+			}
+		}
+	}
+	if s.beforeTurn != nil && !resumeAfterTurn && !skipped {
 		msg, err := s.beforeTurn(ctx, turn)
+		if err != nil && queuedDone != "" {
+			if restoreErr := brief.Restore(s.cfg, queuedSource, queuedDone); restoreErr != nil {
+				s.log.Error("could not restore queued brief after preparation failed", "turn", turn.ID, "err", restoreErr)
+			} else {
+				queuedDone = ""
+			}
+		}
 		if err != nil && ctx.Err() == nil {
 			// The agent does not run over a tree the step could not prepare.
 			// A failed turn, on the streak, with the triggers left pending.
@@ -671,10 +703,30 @@ func (s *Supervisor) writeRetry(turn Turn, res TurnResult, fails int, at time.Ti
 	if origin == "" {
 		origin = "unknown"
 	}
+	// A queued brief was moved to done/ before the failed turn. Carry that
+	// factory-selected path through the supervisor-owned retry marker so the
+	// retry gets the same work order instead of an empty prompt. A retry of a
+	// retry keeps the original path.
+	briefPath := ""
+	for _, trigger := range real {
+		if trigger.Label != brief.Label {
+			continue
+		}
+		if p, err := brief.DonePath(s.cfg, trigger.Path); err == nil {
+			briefPath = p
+		}
+	}
+	if briefPath == "" && onRetry {
+		briefPath = readRetryLine(path, "brief: ")
+	}
+	briefLine := ""
+	if briefPath != "" {
+		briefLine = "brief: " + briefPath + "\n"
+	}
 	body := fmt.Sprintf(
-		"retry %d of %d\norigin: %s\nstep: %s\nafter turn: %s\nexit: %d\ntimed out: %v\nat: %s\n\n"+
+		"retry %d of %d\norigin: %s\nstep: %s\n%safter turn: %s\nexit: %d\ntimed out: %v\nat: %s\n\n"+
 			"The previous turn consumed its trigger and then failed. Nothing else is pending.\n",
-		fails, s.cfg.Supervisor.FailAbort, origin, step, turn.ID, res.ExitCode, res.TimedOut, at.Format(time.RFC3339))
+		fails, s.cfg.Supervisor.FailAbort, origin, step, briefLine, turn.ID, res.ExitCode, res.TimedOut, at.Format(time.RFC3339))
 	return os.WriteFile(path, []byte(body), 0o644)
 }
 

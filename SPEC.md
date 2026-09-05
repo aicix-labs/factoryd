@@ -962,6 +962,8 @@ channel that always works when both roles share a host.
 | path | direction | meaning |
 |---|---|---|
 | `inbox/brief.md` | operator → producer | a work order |
+| `inbox/briefs/*.md` | operator → producer | ordered work queue; lexical first is the next work order |
+| `inbox/briefs/done/*.md` | factoryd → operator | immutable-by-convention record of a taken queued brief |
 | `inbox/wake` | producer → reviewer | a change is ready |
 | `inbox/question.md` | producer → reviewer | **blocked before having anything to push** |
 | `outbox/answer.md` | reviewer → producer | reply to a question |
@@ -974,6 +976,20 @@ in the outbox. `doctor` probes both as the producer identity, because factoryd
 being able to write them says nothing — found in the acceptance run, where a
 root-owned inbox made every clean producer turn read as "no progress" and a
 root-owned outbox left every verdict unconsumed.
+
+**Brief queues are ordered and auditable.** `brief.md` is retained for existing
+single-work-order factories. A queue is optional: `inbox/briefs/` is empty when
+there is no queued work, which is normal idle and is stated explicitly by
+`factoryd health` and `factoryd status`. When entries exist, the producer
+supervisor selects only the lexical first regular `*.md` file, and only when
+the cycle is `new`, `clean`, or `finished`. It never starts queued work beside
+an open draft; while waiting it rechecks the open cycle through the same
+provider reconciliation that an ordinary refresh uses, so an operator merge
+releases the next item without a manual wake. Before the agent starts, factoryd
+moves the selected file to `inbox/briefs/done/` and gives that path to the
+wrapper as `FACTORYD_BRIEF`. It refuses to overwrite an existing done file, so
+a reused queue name cannot erase the record of earlier work. Later queue files
+remain where they were; a taken brief does not simply vanish.
 
 The **question channel** is a v2 addition. v1 defined signalling only for the push
 path, so an agent blocked *before* having something to push had no way to reach its
@@ -1093,7 +1109,8 @@ marker says, because nothing that would have judged its work ran (§6.3); `FACTO
 separator, so configured paths containing it are refused at load and a trigger
 path containing it refuses the turn; every TSV field, the path included, is refused by the
 runner if it holds a tab or newline, and configured paths with control
-characters are refused at load; then the brief; then it runs the agent
+characters are refused at load; then the factory-selected brief
+(`FACTORYD_BRIEF`, the queued done path or legacy `brief.md`); then it runs the agent
 through `turn-wrapper.sh` and consumes the triggers it acted on — never the
 supervisor's retry marker, which the supervisor owns and keeps on a halt as
 the record of what was retried. It refuses to run an agent with a

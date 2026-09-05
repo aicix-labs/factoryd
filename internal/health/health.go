@@ -17,6 +17,7 @@ import (
 	"time"
 
 	"github.com/aicix-labs/factoryd/internal/alert"
+	"github.com/aicix-labs/factoryd/internal/brief"
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/scm"
 	"github.com/aicix-labs/factoryd/internal/state"
@@ -49,14 +50,24 @@ type CacheReport struct {
 	Err            string `json:"error,omitempty"`
 }
 
+// BriefQueueReport makes the normal idle state explicit. An empty queue is
+// not a finding and never alerts, but "healthy" alone does not tell an
+// operator whether the factory is processing work or waiting for more.
+type BriefQueueReport struct {
+	Empty   bool   `json:"empty"`
+	Pending int    `json:"pending"`
+	Next    string `json:"next,omitempty"`
+}
+
 // Report is the health document (§4.5), written to <root>/health.json.
 type Report struct {
-	Factory  string        `json:"factory"`
-	At       time.Time     `json:"at"`
-	Healthy  bool          `json:"healthy"`
-	Findings []Finding     `json:"findings"`
-	Volumes  []Volume      `json:"volumes"`
-	Caches   []CacheReport `json:"caches,omitempty"`
+	Factory    string            `json:"factory"`
+	At         time.Time         `json:"at"`
+	Healthy    bool              `json:"healthy"`
+	Findings   []Finding         `json:"findings"`
+	Volumes    []Volume          `json:"volumes"`
+	Caches     []CacheReport     `json:"caches,omitempty"`
+	BriefQueue *BriefQueueReport `json:"brief_queue,omitempty"`
 	// Alerted lists the finding keys alerted on this tick, and Recovered the
 	// ones that cleared; each Delivery records where an alert went and
 	// whether it arrived.
@@ -148,6 +159,15 @@ func Tick(ctx context.Context, cfg *config.Config, deps Deps) (Report, error) {
 		rep.Findings = append(rep.Findings, Finding{Key: "never_supervised", Summary: "no supervisor has ever registered for either role; nothing is watching this factory"})
 	}
 	rep.Findings = append(rep.Findings, checkRoles(cfg, st, deps.Probes, at)...)
+	queued, qerr := brief.List(cfg)
+	if qerr != nil {
+		rep.Errors = append(rep.Errors, "brief queue: "+qerr.Error())
+	} else {
+		rep.BriefQueue = &BriefQueueReport{Empty: len(queued) == 0, Pending: len(queued)}
+		if len(queued) > 0 {
+			rep.BriefQueue.Next = queued[0].Name
+		}
+	}
 
 	vols, findings, errs := checkVolumes(cfg, deps.Probes)
 	rep.Volumes = vols
@@ -701,6 +721,13 @@ func (r Report) Summary() string {
 		sb.WriteString("healthy\n")
 	} else {
 		fmt.Fprintf(&sb, "UNHEALTHY: %d finding(s)\n", len(r.Findings))
+	}
+	if q := r.BriefQueue; q != nil {
+		if q.Empty {
+			sb.WriteString("  brief queue empty; waiting for work\n")
+		} else {
+			fmt.Fprintf(&sb, "  brief queue %d pending; next %s\n", q.Pending, q.Next)
+		}
 	}
 	for _, f := range r.Findings {
 		fmt.Fprintf(&sb, "  %-32s %s\n", f.Key, f.Summary)

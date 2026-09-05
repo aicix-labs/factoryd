@@ -62,6 +62,13 @@ on a verdict what to do by kind: nothing for merged or operator-gated, the exact
 family for one changes-requested verdict per turn, the rest kept for their own
 turns — so a brief only describes work (SPEC §6.2).
 
+`inbox/brief.md` remains the one-item compatibility channel. For sustained
+work, an operator can place lexical work orders in `inbox/briefs/` (for example
+`010-auth.md`, `020-api.md`). The producer takes only the first queued brief
+when no draft is in flight, moves it to `inbox/briefs/done/` before the turn,
+and leaves later entries untouched. An empty queue is intentional idle: health
+and status say “brief queue empty; waiting for work,” not unhealthy.
+
 A change a human merged outside factoryd is reconciled by one provider read
 when the next refresh is decided, and `factoryd verdict <id> merged` records
 it as a real verdict that wakes the producer (SPEC §3). Nothing polls.

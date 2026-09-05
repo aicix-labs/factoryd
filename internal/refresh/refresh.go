@@ -287,3 +287,39 @@ func BeforeTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 		return msg, nil
 	}
 }
+
+// QueueReady decides whether a queued brief may begin a producer cycle. It is
+// intentionally separate from BeforeTurn: a queued brief behind an open draft
+// must not create a synthetic failed turn merely to learn that it has to wait.
+// An open draft is reconciled at this boundary, so an operator merge releases
+// the next queued brief without a new manual wake.
+func QueueReady(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, error)) func(ctx context.Context) (bool, string, error) {
+	return func(ctx context.Context) (bool, string, error) {
+		ready := false
+		var note string
+		_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+			if c := st.Cycle; c != nil && c.Phase == state.CycleOpen {
+				deps, err := mkDeps(ctx)
+				if err != nil {
+					return err
+				}
+				if _, n := Reconcile(ctx, cfg, st, deps.Lookup, deps.Ancestor, time.Now()); n != "" {
+					note = n
+				}
+			}
+			var why string
+			ready, why = Decide(st)
+			if !ready {
+				if note != "" {
+					note += "; "
+				}
+				note += "brief queue waiting: " + why
+			}
+			return nil
+		})
+		if err != nil {
+			return false, "", fmt.Errorf("refresh: checking whether the brief queue may start: %w", err)
+		}
+		return ready, note, nil
+	}
+}
