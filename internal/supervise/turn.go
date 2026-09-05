@@ -363,8 +363,7 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 				continue
 			}
 			if !still[t.Path] {
-				delete(rs.TriggerAttempts, t.Path)
-				continue
+				continue // consumed; the sweep below drops its count
 			}
 			rs.TriggerAttempts[t.Path]++
 			if rs.TriggerAttempts[t.Path] > s.cfg.Supervisor.VerdictAttempts {
