@@ -37,7 +37,7 @@ usage:
                                                      exits 0 submitted, 3 config/identity, 4 nothing, 5 gate red
   factoryd migrate   --config <f> <verdict-registry|service-registry>
                                                      quarantine pre-registry verdicts, or attest the restart
-                                                     sweep for pre-registry status/health services
+                                                     sweep for every pre-registry long-running factoryd process
   factoryd health    --config <f> [--loop] [--json]  one model-free tick: detect, alert, write health.json
                                                      exits 0 healthy, 1 findings, 3 could not look
   factoryd status    --config <f> [--config <g>] [--serve :8080] [--json] [--provider=false]

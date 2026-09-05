@@ -550,7 +550,7 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 		add("factoryd process binaries", fmt.Errorf("cannot inspect recorded factoryd processes: %w", err), cfg.StatePath())
 	} else {
 		if err := st.ServiceRegistry.MigrationError(); err != nil {
-			add("service registry", fmt.Errorf("%v; stop or restart every pre-registry `factoryd status --serve` and `factoryd health --loop` process, then run `factoryd migrate --config %s service-registry` as the operator", err, cfg.Path()), "long-running service inventory is intentionally unknown")
+			add("service registry", fmt.Errorf("%v; stop or restart every pre-registry factoryd process, including producer/reviewer supervisors and `factoryd status --serve`/`factoryd health --loop`, then run `factoryd migrate --config %s service-registry` as the operator", err, cfg.Path()), "long-running service inventory is intentionally unknown")
 		} else {
 			add("service registry", nil, "complete exact-handle inventory")
 		}

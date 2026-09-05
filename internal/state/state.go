@@ -91,7 +91,8 @@ func ValidService(service Service) bool {
 // state has no way to distinguish "no service was ever started" from "an old
 // status or health process is still serving from an inode an install deleted".
 // It therefore loads blocked until an operator explicitly attests the restart
-// sweep with `factoryd migrate ... service-registry`.
+// sweep of every long-running factoryd process with `factoryd migrate ...
+// service-registry`.
 type ServiceRegistry struct {
 	Status      string    `json:"status"`
 	Reason      string    `json:"reason,omitempty"`
@@ -983,7 +984,7 @@ func Load(path, factory string) (*State, error) {
 		s.SchemaVersion = SchemaVersion
 		s.ServiceRegistry = &ServiceRegistry{
 			Status:    ServiceRegistryMigrationRequired,
-			Reason:    "state predates the long-running service registry; stop or restart every pre-registry `factoryd status --serve` and `factoryd health --loop` service, then have the operator run `factoryd migrate --config <file> service-registry`",
+			Reason:    "state predates the long-running service registry; stop or restart every pre-registry factoryd process, including producer/reviewer supervisors and `factoryd status --serve`/`factoryd health --loop`, then have the operator run `factoryd migrate --config <file> service-registry`",
 			BlockedAt: time.Now().UTC(),
 		}
 	}
@@ -1141,10 +1142,12 @@ func MigrateVerdictRegistry(path, factory, outbox string) ([]string, error) {
 }
 
 // MigrateServiceRegistry records the operator's explicit attestation that
-// every pre-registry status and health service was stopped or restarted. Old
-// services have no durable handles, so this cannot be inferred from an empty
-// map. Recorded handles, if any, must already be dead; after the attestation
-// only services started by this build may claim a fresh exact handle.
+// every pre-registry long-running factoryd process was stopped or restarted.
+// Old status and health services have no durable handles, so that part cannot
+// be inferred from an empty map. Producer and reviewer supervisors do have
+// handles, and must be proven dead before this writes the schema that an old
+// supervisor cannot load. After the attestation only services started by this
+// build may claim a fresh exact handle.
 func MigrateServiceRegistry(path, factory string) error {
 	_, err := Update(path, factory, func(s *State) error {
 		if s.ServiceRegistry.Ready() {
@@ -1155,17 +1158,27 @@ func MigrateServiceRegistry(path, factory string) error {
 				return err
 			}
 		}
-		for _, service := range Services {
-			ref := s.Service(service)
+		requireStopped := func(label string, ref *proc.Ref) error {
 			if ref == nil {
-				continue
+				return nil
 			}
 			alive, err := ref.Alive()
 			if err != nil {
-				return fmt.Errorf("cannot prove recorded %s service %s is gone: %w", service, ref, err)
+				return fmt.Errorf("cannot prove recorded %s %s is gone: %w", label, ref, err)
 			}
 			if alive {
-				return fmt.Errorf("recorded %s service %s is still live; stop it before attesting the restart sweep", service, ref)
+				return fmt.Errorf("recorded %s %s is still live; stop it before attesting the all-process restart sweep", label, ref)
+			}
+			return nil
+		}
+		for _, role := range Roles {
+			if err := requireStopped(string(role)+" supervisor", s.Role(role).Supervisor); err != nil {
+				return err
+			}
+		}
+		for _, service := range Services {
+			if err := requireStopped(string(service)+" service", s.Service(service)); err != nil {
+				return err
 			}
 		}
 		// Any remaining handles name dead processes. The post-attestation
@@ -1174,7 +1187,7 @@ func MigrateServiceRegistry(path, factory string) error {
 		s.ServiceRegistry = &ServiceRegistry{
 			Status:      ServiceRegistryReady,
 			AttestedAt:  time.Now().UTC(),
-			Attestation: "operator attested that all pre-registry status and health services were stopped or restarted",
+			Attestation: "operator attested that every pre-registry factoryd process, including supervisors and status/health services, was stopped or restarted",
 		}
 		return nil
 	})

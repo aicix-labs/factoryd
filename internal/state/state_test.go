@@ -2,6 +2,7 @@ package state
 
 import (
 	"errors"
+	"fmt"
 	"os"
 	"path/filepath"
 	"strings"
@@ -124,6 +125,31 @@ func TestV2StateBlocksUntilServiceRegistryMigration(t *testing.T) {
 	}
 	if !migrated.ServicesReady() || migrated.ServiceRegistry.AttestedAt.IsZero() {
 		t.Fatalf("explicit service migration did not record an attestation: %+v", migrated.ServiceRegistry)
+	}
+}
+
+// A legacy supervisor can still write state. It must be stopped before the
+// migration persists schema v4, which that old process would otherwise refuse
+// on its next Update and silently stall the factory.
+func TestServiceRegistryMigrationRefusesLiveLegacySupervisor(t *testing.T) {
+	p := tmpPath(t)
+	supervisor, err := proc.Self("producer")
+	if err != nil {
+		t.Fatal(err)
+	}
+	body := fmt.Sprintf(`{"schema_version":3,"factory":"widgets","roles":{"producer":{"supervisor":{"pid":%d,"start_token":%q}}},"verdict_registry":{"status":"ready"},"cycle":{"phase":"new"}}`, supervisor.PID, supervisor.StartToken)
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	if err := MigrateServiceRegistry(p, "widgets"); err == nil || !strings.Contains(err.Error(), "producer supervisor") || !strings.Contains(err.Error(), "still live") {
+		t.Fatalf("service migration with live legacy supervisor = %v, want refusal", err)
+	}
+	raw, err := os.ReadFile(p)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !strings.Contains(string(raw), `"schema_version":3`) {
+		t.Fatalf("migration wrote a new schema while legacy supervisor was live:\n%s", raw)
 	}
 }
 
