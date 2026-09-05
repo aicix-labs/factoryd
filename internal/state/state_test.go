@@ -7,6 +7,8 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"github.com/aicix-labs/factoryd/internal/proc"
 )
 
 func tmpPath(t *testing.T) string {
@@ -51,6 +53,49 @@ func TestRoundTrip(t *testing.T) {
 	}
 	if got.UpdatedAt.IsZero() {
 		t.Fatal("Save did not stamp updated_at")
+	}
+}
+
+func TestClaimAndReleaseServiceUseTheExactProcessHandle(t *testing.T) {
+	s := New("widgets")
+	holder, err := proc.Self("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimService(ServiceStatusServe, holder); err != nil {
+		t.Fatal(err)
+	}
+	if got := s.Service(ServiceStatusServe); got == nil || got.PID != holder.PID || got.StartToken != holder.StartToken {
+		t.Fatalf("status service = %+v, want exact holder %+v", got, holder)
+	}
+
+	// A process with the same PID but a different start token is not the
+	// holder. It must not clear an active service after PID reuse.
+	s.ReleaseService(ServiceStatusServe, proc.Ref{PID: holder.PID, StartToken: holder.StartToken + "-different"})
+	if got := s.Service(ServiceStatusServe); got == nil {
+		t.Fatal("non-holder released the service")
+	}
+	s.ReleaseService(ServiceStatusServe, holder)
+	if got := s.Service(ServiceStatusServe); got != nil {
+		t.Fatalf("holder did not release service: %+v", got)
+	}
+}
+
+func TestV2StateMigratesBeforeServiceRegistration(t *testing.T) {
+	p := tmpPath(t)
+	body := `{"schema_version":2,"factory":"widgets","roles":{},"verdict_registry":{"status":"ready"},"cycle":{"phase":"new"}}`
+	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	s, err := Load(p, "widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if s.SchemaVersion != SchemaVersion {
+		t.Fatalf("migrated schema version = %d, want %d", s.SchemaVersion, SchemaVersion)
+	}
+	if s.Service(ServiceStatusServe) != nil || s.Service(ServiceHealthLoop) != nil {
+		t.Fatalf("v2 unexpectedly has service handles: %+v", s.Services)
 	}
 }
 

@@ -28,8 +28,10 @@ import (
 // v2 adds the verdict registry. A v1 outbox document was producer-writable
 // and therefore cannot be retroactively treated as a registered verdict. A
 // v1 document loads into an explicit migration-required state instead of
-// silently quarantining the old handoff files.
-const SchemaVersion = 2
+// silently quarantining the old handoff files. v3 adds exact process handles
+// for long-running status and health services, so an older binary cannot
+// silently erase the record that doctor uses to detect a replaced executable.
+const SchemaVersion = 3
 
 var (
 	// ErrProducerLifecycleBusy means a queued handoff or admitted producer
@@ -39,6 +41,10 @@ var (
 	// producer worktree while it copies and gates a declared change. A queued
 	// handoff must wait rather than start an agent beside that use.
 	ErrProducerWorktreeBusy = errors.New("producer worktree is leased for submission")
+	// ErrServiceAlreadyRunning means the exact handle for a long-running
+	// factoryd service is still live. Replacing it would hide a service doctor
+	// must be able to inspect.
+	ErrServiceAlreadyRunning = errors.New("factoryd service is already running")
 )
 
 // Role is one of the two agent roles.
@@ -51,6 +57,29 @@ const (
 
 // Roles is every role, in a stable order.
 var Roles = []Role{RoleProducer, RoleReviewer}
+
+// Service is a factoryd command that keeps using a factory after its initial
+// invocation. Unlike one-shot verbs, it must leave an exact handle in state
+// for doctor to inspect after a binary install.
+type Service string
+
+const (
+	ServiceStatusServe Service = "status-serve"
+	ServiceHealthLoop  Service = "health-loop"
+)
+
+// Services is every long-running service in a stable order.
+var Services = []Service{ServiceStatusServe, ServiceHealthLoop}
+
+// ValidService reports whether service is a known long-running service.
+func ValidService(service Service) bool {
+	for _, known := range Services {
+		if service == known {
+			return true
+		}
+	}
+	return false
+}
 
 // Turn is one agent turn. Agent turns are one-shot: the supervisor owns all
 // continuity.
@@ -647,6 +676,11 @@ type State struct {
 	// deciding to alert and recording that it did cannot alert twice -- or,
 	// worse, decide it already had.
 	Health map[string]*Condition `json:"health,omitempty"`
+	// Services holds exact handles for long-running non-supervisor commands.
+	// A service records itself before it begins using the factory and removes
+	// only its own handle on exit. This lets doctor distinguish a stopped
+	// service from one still executing an inode an install replaced.
+	Services map[Service]*proc.Ref `json:"services,omitempty"`
 }
 
 // Condition is one standing health condition.
@@ -688,9 +722,57 @@ func (s *State) Role(r Role) *RoleState {
 	return s.Roles[r]
 }
 
+// Service returns the recorded handle for service, if any.
+func (s *State) Service(service Service) *proc.Ref {
+	if s.Services == nil {
+		return nil
+	}
+	return s.Services[service]
+}
+
+// ClaimService records holder as the exact process running service. Call it
+// within Update: checking an old holder and replacing it must share the state
+// lock, otherwise two service instances could both decide they own the slot.
+func (s *State) ClaimService(service Service, holder proc.Ref) error {
+	if !ValidService(service) {
+		return fmt.Errorf("state: unknown service %q", service)
+	}
+	if holder.PID <= 0 || holder.StartToken == "" {
+		return fmt.Errorf("state: %s service has an incomplete process handle", service)
+	}
+	if existing := s.Service(service); existing != nil {
+		if existing.PID == holder.PID && existing.StartToken == holder.StartToken {
+			return nil
+		}
+		alive, err := existing.Alive()
+		if err != nil {
+			return fmt.Errorf("state: cannot prove recorded %s service %s is gone: %w", service, existing, err)
+		}
+		if alive {
+			return fmt.Errorf("%w: %s is held by %s", ErrServiceAlreadyRunning, service, existing)
+		}
+	}
+	if s.Services == nil {
+		s.Services = map[Service]*proc.Ref{}
+	}
+	copy := holder
+	s.Services[service] = &copy
+	return nil
+}
+
+// ReleaseService removes service only when holder is still the exact process
+// that claimed it. A stopped older service must not erase a newer instance's
+// durable handle.
+func (s *State) ReleaseService(service Service, holder proc.Ref) {
+	if existing := s.Service(service); existing != nil && existing.PID == holder.PID && existing.StartToken == holder.StartToken {
+		delete(s.Services, service)
+	}
+}
+
 // VerdictsReady reports whether this state can admit a producer outbox
 // verdict. A nil registry is never ready; nil is only possible for a corrupt
-// v2 document because v1 is converted to an explicit blocked record at load.
+// current-schema document because v1 is converted to an explicit blocked
+// record at load.
 func (s *State) VerdictsReady() bool {
 	return s != nil && s.VerdictRegistry.Ready()
 }
@@ -743,6 +825,14 @@ func (s *State) Validate() error {
 			}
 		}
 	}
+	for service, ref := range s.Services {
+		if !ValidService(service) {
+			return fmt.Errorf("state: unknown long-running service %q", service)
+		}
+		if ref == nil || ref.PID <= 0 || ref.StartToken == "" {
+			return fmt.Errorf("state: service %s has an incomplete process handle", service)
+		}
+	}
 	if c := s.Cycle; c != nil {
 		switch c.Phase {
 		case CycleNew, CycleWorking, CycleSubmitting, CycleOpen, CycleFinished, CycleClean, CycleUnknown:
@@ -793,8 +883,15 @@ func Load(path, factory string) (*State, error) {
 		return nil, fmt.Errorf("%s: not valid JSON: %w", path, err)
 	}
 	legacyVerdictRegistry := false
+	legacyServiceRegistry := false
 	switch probe.SchemaVersion {
 	case SchemaVersion:
+	case 2:
+		// A v2 binary does not know the service registry and would discard it
+		// on its next write. Upgrade before a service is registered is safe;
+		// registering one persists v3, which makes a v2 binary refuse rather
+		// than erase the durable handle.
+		legacyServiceRegistry = true
 	case 1:
 		legacyVerdictRegistry = true
 	case 0:
@@ -811,11 +908,14 @@ func Load(path, factory string) (*State, error) {
 	if s.Factory == "" {
 		s.Factory = factory
 	}
+	if legacyServiceRegistry {
+		s.SchemaVersion = SchemaVersion
+	}
 	if legacyVerdictRegistry {
 		// These files were placed in an outbox with no factory-owned identity
 		// record. Do not hash and accept them now: the producer could have
 		// planted them before this binary was installed. The next Update
-		// persists this block as schema v2, and only the explicit migration
+		// persists this block as the current schema, and only the explicit migration
 		// command may make the registry ready.
 		s.SchemaVersion = SchemaVersion
 		s.VerdictRegistry = &VerdictRegistry{

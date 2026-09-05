@@ -268,7 +268,7 @@ func TestDoctorRejectsLiveSupervisorRunningADeletedBinary(t *testing.T) {
 		t.Fatal(err)
 	}
 	deps := healthyDeps(cfg, nil)
-	deps.SupervisorExecutable = func(got proc.Ref) (string, error) {
+	deps.ProcessExecutable = func(got proc.Ref) (string, error) {
 		if got != ref {
 			t.Fatalf("doctor inspected %+v, want the state-recorded supervisor %+v", got, ref)
 		}
@@ -284,6 +284,55 @@ func TestDoctorRejectsLiveSupervisorRunningADeletedBinary(t *testing.T) {
 		}
 	}
 	t.Fatalf("doctor did not inspect the producer supervisor binary:\n%s", r)
+}
+
+// status --serve and health --loop are long-running services too. Unlike the
+// role supervisors they do not have a CurrentTurn, so the durable service
+// handle is the only way doctor can see that an install replaced their mapped
+// executable (#53).
+func TestDoctorRejectsLiveStatusAndHealthServicesRunningADeletedBinary(t *testing.T) {
+	cfg := fixture(t)
+	statusRef := proc.Ref{PID: 4242, StartToken: "status-start", Role: "service status-serve"}
+	healthRef := proc.Ref{PID: 4343, StartToken: "health-start", Role: "service health-loop"}
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		st.Services = map[state.Service]*proc.Ref{
+			state.ServiceStatusServe: &statusRef,
+			state.ServiceHealthLoop:  &healthRef,
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deps := healthyDeps(cfg, nil)
+	deps.ProcessExecutable = func(got proc.Ref) (string, error) {
+		switch got {
+		case statusRef:
+			return "/usr/local/bin/factoryd (deleted)", nil
+		case healthRef:
+			return "/usr/local/bin/factoryd (deleted)", nil
+		default:
+			t.Fatalf("doctor inspected unexpected process %+v", got)
+			return "", nil
+		}
+	}
+	r := doctor.RunWith(context.Background(), cfg, deps)
+	want := map[string]bool{
+		"service status-serve binary": false,
+		"service health-loop binary":  false,
+	}
+	for _, c := range r.Checks {
+		if _, ok := want[c.Name]; ok {
+			if c.OK || c.Err == nil || !strings.Contains(c.Err.Error(), "replaced") || !strings.Contains(c.Err.Error(), "Restart") {
+				t.Fatalf("deleted %s check=%+v, want a restart-required failure", c.Name, c)
+			}
+			want[c.Name] = true
+		}
+	}
+	for name, found := range want {
+		if !found {
+			t.Fatalf("doctor did not inspect %s:\n%s", name, r)
+		}
+	}
 }
 
 // The check the two-party model rests on: one credential file for both roles.

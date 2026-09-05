@@ -17,6 +17,7 @@ import (
 	"github.com/aicix-labs/factoryd/internal/factory"
 	"github.com/aicix-labs/factoryd/internal/health"
 	"github.com/aicix-labs/factoryd/internal/scm"
+	"github.com/aicix-labs/factoryd/internal/state"
 )
 
 // tickOnce runs one tick and classifies it: 0 healthy, 1 findings, 3 could
@@ -90,15 +91,29 @@ func runHealth(args []string) int {
 		deps.ListOpen = func(ctx context.Context) ([]scm.Change, error) { return drv.ListOpen(ctx) }
 	}
 
+	if !*loop {
+		ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
+		defer stop()
+		return tickOnce(ctx, cfg, deps, *asJSON, os.Stdout, os.Stderr)
+	}
+
+	release, err := claimLongRunningService([]*config.Config{cfg}, state.ServiceHealthLoop)
+	if err != nil {
+		fmt.Fprintf(os.Stderr, "factoryd health: %v\n", err)
+		return exitConfig
+	}
 	ctx, stop := signal.NotifyContext(context.Background(), syscall.SIGINT, syscall.SIGTERM)
 	defer stop()
 	for {
-		code := tickOnce(ctx, cfg, deps, *asJSON, os.Stdout, os.Stderr)
-		if !*loop {
-			return code
-		}
+		// Every loop tick reports its own result; this service exits only when
+		// it is stopped, so a transient finding does not drop its registration.
+		tickOnce(ctx, cfg, deps, *asJSON, os.Stdout, os.Stderr)
 		select {
 		case <-ctx.Done():
+			if err := release(); err != nil {
+				fmt.Fprintf(os.Stderr, "factoryd health: %v\n", err)
+				return exitError
+			}
 			return exitOK
 		case <-time.After(time.Duration(cfg.Health.IntervalSeconds) * time.Second):
 		}
