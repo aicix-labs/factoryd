@@ -245,6 +245,13 @@ func BeforeTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 	return func(ctx context.Context, t supervise.Turn) (string, error) {
 		var msg string
 		_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+			// A manual/root-side submit may be copying this worktree into the
+			// protected repository or running its gate. This is every producer
+			// trigger's barrier, not just the queued-brief path: legacy briefs,
+			// answers, verdicts, and retries must not refresh or launch beside it.
+			if err := st.PermitProducerWorktreeUse(); err != nil {
+				return err
+			}
 			// An open cycle is checked against the provider once before
 			// the decision (#43): the deps are built for that read, and
 			// reused for the refresh if one follows.
@@ -321,7 +328,7 @@ func QueueStart(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 				note = "brief queue waiting: another queued brief reservation is still active"
 				return nil
 			}
-			if err := st.PermitQueuedProducerHandoff(); err != nil {
+			if err := st.PermitProducerWorktreeUse(); err != nil {
 				note = "brief queue waiting: " + err.Error()
 				return nil
 			}

@@ -286,3 +286,56 @@ func TestQueuedBriefRejectsLifecycleMutationAfterFinalConfirmation(t *testing.T)
 		t.Fatalf("post-confirm mutation changed cycle: %+v", st.Cycle)
 	}
 }
+
+// A manual submit holds the same lease while it copies and gates the producer
+// worktree. A legacy inbox brief must be deferred before it creates a turn or
+// invokes BeforeTurn, rather than refreshing and launching alongside submit.
+func TestLegacyBriefDefersWhileSubmissionLeaseIsLive(t *testing.T) {
+	cfg := queueTestConfig(t)
+	holder, err := proc.Self("manual-submit")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		st.SetCycle(state.CycleNew, time.Now())
+		return st.AcquireProducerWorktreeLease(holder, time.Now())
+	}); err != nil {
+		t.Fatal(err)
+	}
+	legacy := filepath.Join(cfg.InboxDir(), "brief.md")
+	if err := os.WriteFile(legacy, []byte("legacy work\n"), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	refreshes := 0
+	runner := &queueRaceRunner{}
+	s, err := New(Options{
+		Config: cfg, Role: "producer", Runner: runner,
+		BeforeTurn: func(context.Context, Turn) (string, error) {
+			refreshes++
+			return "refreshed", nil
+		},
+		Sleep: func(context.Context, time.Duration) error { return context.DeadlineExceeded },
+		Log:   slog.New(slog.NewTextHandler(io.Discard, nil)),
+	})
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer s.Close()
+	if err := s.Run(context.Background()); err != nil {
+		t.Fatal(err)
+	}
+	if runner.runs != 0 || refreshes != 0 {
+		t.Fatalf("legacy brief ran agent=%d refreshes=%d beside the live submission lease", runner.runs, refreshes)
+	}
+	if _, err := os.Stat(legacy); err != nil {
+		t.Fatalf("deferred legacy brief was consumed: %v", err)
+	}
+	rs, err := state.Load(cfg.StatePath(), cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	producer := rs.Role(state.RoleProducer)
+	if producer.CurrentTurn != nil || producer.LastTurn != nil || producer.SubmissionLease == nil {
+		t.Fatalf("legacy deferral manufactured turn history or lost lease: %+v", producer)
+	}
+}

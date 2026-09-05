@@ -193,7 +193,7 @@ type Deps struct {
 
 // Run performs a submission. Every early return carries an *Error with the
 // exit code the CLI must use.
-func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
+func Run(ctx context.Context, cfg *config.Config, deps Deps) (result Result, retErr error) {
 	log := deps.Log
 	if log == nil {
 		log = io.Discard
@@ -311,21 +311,32 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		return Result{}, transient(wrap(ExitConfig, err, "leasing the producer worktree before submission"))
 	}
 	leaseHeld := true
-	releaseWorktreeLease := func() {
+	leaseReleaseFailure := func(err error) error {
+		return supervise.RestartRequired(transient(wrap(ExitConfig, err, "releasing the producer-worktree submission lease")))
+	}
+	releaseWorktreeLease := func() error {
 		if !leaseHeld {
-			return
+			return nil
 		}
 		if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
 			return st.ReleaseProducerWorktreeLease(leaseHolder)
 		}); err != nil {
-			// A later queue admission proves this process has exited before
-			// reclaiming a stale lease. Keep it durable rather than guessing.
-			fmt.Fprintf(log, "submission lease: could not release producer worktree: %v\n", err)
-			return
+			return err
 		}
 		leaseHeld = false
+		return nil
 	}
-	defer releaseWorktreeLease()
+	defer func() {
+		if err := releaseWorktreeLease(); err != nil {
+			// This may be the producer supervisor itself (AfterTurn), so merely
+			// logging would leave a live holder that defers every future turn.
+			// Propagate a restart request after the return values are set; the
+			// supervisor finalizes this turn and exits, allowing liveness-based
+			// recovery to reclaim the durable lease on restart.
+			result = Result{}
+			retErr = leaseReleaseFailure(err)
+		}
+	}()
 	if err := gittransport.CopyTree(work, cfg.Paths.SubmitRepo); err != nil {
 		return Result{}, transient(wrap(ExitConfig, err, "copying the producer's tree into the submit repository"))
 	}
@@ -513,7 +524,9 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	}
 	// CycleSubmitting is its own queue barrier, so the worktree lease is no
 	// longer needed once the green gate has been durably recorded.
-	releaseWorktreeLease()
+	if err := releaseWorktreeLease(); err != nil {
+		return Result{}, leaseReleaseFailure(err)
+	}
 
 	// Non-force: a branch that somehow already exists with different content
 	// is rejected by git itself. The push cannot modify anything.

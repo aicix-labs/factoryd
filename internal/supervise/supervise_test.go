@@ -1470,6 +1470,39 @@ func TestBeforeTurnRunsFirstAndItsFailureIsAFailedTurnWithoutRunningTheAgent(t *
 	}
 }
 
+// A control-plane lease that cannot be released cannot be left to an
+// after-turn retry: the producer supervisor itself may be its recorded
+// holder. Finalize the turn for status, then exit so restart liveness can
+// reclaim the lease rather than defer the queue forever.
+func TestRestartRequiredAfterTurnFinalizesThenExits(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	fx.afterTurn = func(context.Context, supervise.Turn, supervise.TurnResult) (string, error) {
+		return "", supervise.RestartRequired(disposedErr{supervise.DispositionTransient})
+	}
+	r := &fakeRunner{act: func(_ int, tr supervise.Turn) supervise.TurnResult {
+		for _, trigger := range tr.Triggers {
+			_ = os.Remove(trigger.Path)
+		}
+		return supervise.TurnResult{}
+	}}
+	s := fx.newSupervisor(t, r, 1)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	err := s.Run(ctx)
+	if !supervise.RequiresRestart(err) {
+		t.Fatalf("Run error=%v, want restart-required after-turn failure", err)
+	}
+	rs := fx.roleState(t)
+	if rs.CurrentTurn != nil || rs.LastTurn == nil || rs.LastTurn.ExitCode == nil || *rs.LastTurn.ExitCode != supervise.ExitAfterTurnFailed {
+		t.Fatalf("restart-required after-turn was not finalized: %+v", rs)
+	}
+	retry, err := os.ReadFile(fx.cfg.RetryPath("reviewer"))
+	if err != nil || !strings.Contains(string(retry), "step: "+supervise.RetryStepAfterTurn+"\n") {
+		t.Fatalf("restart-required after-turn retry=%q err=%v, want step %q", retry, err, supervise.RetryStepAfterTurn)
+	}
+}
+
 type disposedErr struct {
 	d supervise.Disposition
 }

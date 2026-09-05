@@ -192,12 +192,13 @@ type admittedTurn struct {
 	QueueTaken bool
 }
 
-// queueDeferredError means the queue's final locked lifecycle check refused to
-// start. It is not a failed agent turn: Run sleeps and waits for a real state
-// change after oneTurn has cleared its provisional CurrentTurn record.
-type queueDeferredError struct{ reason string }
+// turnDeferredError means producer-worktree admission was refused. It is not
+// a failed agent turn: Run sleeps and waits for a real state change after
+// oneTurn has cleared (or avoided creating) a provisional CurrentTurn record.
+// It covers queued briefs and every legacy producer trigger alike.
+type turnDeferredError struct{ reason string }
 
-func (e *queueDeferredError) Error() string { return "queued brief deferred: " + e.reason }
+func (e *turnDeferredError) Error() string { return "producer turn deferred: " + e.reason }
 
 // oneTurn runs exactly one agent turn and applies the spin guard. It reports
 // whether the supervisor halted.
@@ -217,13 +218,24 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 
 	// Record the pending triggers and the turn before running anything, so a
 	// supervisor killed mid-turn leaves evidence of what it was doing.
+	deferredReason := ""
 	if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		if s.role == "producer" {
+			if err := st.PermitProducerWorktreeUse(); err != nil {
+				deferredReason = err.Error()
+				return nil
+			}
+		}
 		rs := st.Role(state.Role(s.role))
 		rs.SetPending(toPending(triggers, now))
 		rs.CurrentTurn = &state.Turn{ID: turn.ID, StartedAt: now, Trigger: labels(triggers)}
 		return nil
 	}); err != nil {
 		return false, err
+	}
+	if deferredReason != "" {
+		s.turnSeq-- // an admission deferral is not a turn
+		return false, &turnDeferredError{reason: deferredReason}
 	}
 
 	queuedSource, queuedDone, queued := queuedBriefPaths(s.cfg, triggers)
@@ -233,11 +245,11 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 			return false, err
 		}
 		if !started {
-			if err := s.clearDeferredQueuedTurn(turn, triggers); err != nil {
+			if err := s.clearDeferredTurn(turn, triggers); err != nil {
 				return false, err
 			}
 			s.turnSeq-- // it was an admission check, not an agent turn
-			return false, &queueDeferredError{reason: reason}
+			return false, &turnDeferredError{reason: reason}
 		}
 	}
 
@@ -298,6 +310,17 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	// queue entry was selected.
 	if s.beforeTurn != nil && !queued && !resumeAfterTurn && !skipped {
 		msg, err := s.beforeTurn(ctx, turn)
+		if err != nil && errors.Is(err, state.ErrProducerWorktreeBusy) {
+			// Submit may have acquired the worktree lease after the generic
+			// admission check but before BeforeTurn took its state lock. Do
+			// not turn that race into a failed agent turn; no refresh or agent
+			// command has run, so clear the provisional record and wait.
+			if clearErr := s.clearDeferredTurn(turn, triggers); clearErr != nil {
+				return false, clearErr
+			}
+			s.turnSeq--
+			return false, &turnDeferredError{reason: err.Error()}
+		}
 		if err != nil && queuedDone != "" {
 			if restoreErr := brief.Restore(s.cfg, queuedSource, queuedDone); restoreErr != nil {
 				s.log.Error("could not restore queued brief after preparation failed", "turn", turn.ID, "err", restoreErr)
@@ -418,11 +441,15 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	// producer). Its failure is the turn's failure.
 	afterTurnDisposition := DispositionTransient
 	afterTurnSucceeded := runErr == nil && res.ExitCode == 0 && !res.TimedOut
+	var restartAfterTurn error
 	if runErr == nil && res.ExitCode == 0 && !res.TimedOut && s.afterTurn != nil {
 		msg, err := s.afterTurn(ctx, turn, res)
 		if err != nil {
 			afterTurnSucceeded = false
 			afterTurnDisposition = DispositionOf(err)
+			if RequiresRestart(err) {
+				restartAfterTurn = err
+			}
 			s.log.Error("after-turn step failed; counting the turn as failed", "turn", turn.ID, "disposition", string(afterTurnDisposition), "err", err)
 			res.ExitCode = ExitAfterTurnFailed
 		} else if msg != "" {
@@ -624,6 +651,18 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	s.log.Info("turn finished",
 		"turn", turn.ID, "exit", res.ExitCode, "timed_out", res.TimedOut,
 		"consumed", didConsume, "progressed", progressed, "spin", spin, "fail_streak", fails)
+	if restartAfterTurn != nil {
+		// The final state write above cleared CurrentTurn and recorded LastTurn
+		// before this return. Exiting now makes a failed submission-lease
+		// release recoverable by liveness on the next supervisor start. Re-arm
+		// the root-side step first: the agent already completed, but a restart
+		// after a consumed trigger must not idle with its declared intent
+		// stranded.
+		if err := s.writeRetry(turn, res, fails, ended, RetryStepAfterTurn); err != nil {
+			return true, s.haltNow(ended, fmt.Sprintf("could not write an after-turn retry before restarting for a failed submission-lease release (%v)", err))
+		}
+		return false, restartAfterTurn
+	}
 
 	if failed && didConsume && !halted && res.ExitCode == ExitAfterTurnFailed && afterTurnDisposition != DispositionTransient {
 		// A blocked or unknown after-turn failure arms nothing: blocked
@@ -710,11 +749,11 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	}
 }
 
-// clearDeferredQueuedTurn removes the provisional CurrentTurn created before
-// the final queue admission check. A closed cycle is not a failed agent turn:
-// it must leave neither a running turn nor guard history, only its pending
-// source brief.
-func (s *Supervisor) clearDeferredQueuedTurn(turn Turn, triggers []watch.Trigger) error {
+// clearDeferredTurn removes the provisional CurrentTurn created before a
+// producer-worktree admission check. A deferred brief, answer, verdict, or
+// retry is not a failed agent turn: it leaves neither a running turn nor guard
+// history, only its pending source trigger.
+func (s *Supervisor) clearDeferredTurn(turn Turn, triggers []watch.Trigger) error {
 	_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
 		rs := st.Role(state.Role(s.role))
 		if rs.CurrentTurn != nil && rs.CurrentTurn.ID == turn.ID {

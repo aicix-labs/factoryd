@@ -115,6 +115,27 @@ func DispositionOf(err error) Disposition {
 	return DispositionUnknown
 }
 
+// RestartError says the supervising process itself must exit after it has
+// recorded the current turn. It is for a control-plane lease whose durable
+// cleanup failed: keeping the holder process alive would make liveness-based
+// recovery believe the lease is still in use forever.
+type RestartError struct{ Err error }
+
+func (e *RestartError) Error() string { return e.Err.Error() }
+func (e *RestartError) Unwrap() error { return e.Err }
+
+// RestartRequired marks a failure that requires the current supervisor
+// process to exit. A service manager or operator restart then gives state
+// liveness recovery a dead owner it can safely reclaim.
+func RestartRequired(err error) error { return &RestartError{Err: err} }
+
+// RequiresRestart reports whether err carries a request to terminate this
+// supervisor after normal turn finalization.
+func RequiresRestart(err error) bool {
+	var r *RestartError
+	return errors.As(err, &r)
+}
+
 // ExitBeforeTurnFailed is recorded for a turn whose before-turn step failed;
 // the agent never ran.
 const ExitBeforeTurnFailed = 1002
@@ -383,10 +404,10 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		}
 		halted, err := s.oneTurn(ctx, admitted)
 		if err != nil {
-			var deferred *queueDeferredError
+			var deferred *turnDeferredError
 			if errors.As(err, &deferred) {
 				if deferred.reason != "" {
-					s.log.Info("queued brief deferred", "reason", deferred.reason)
+					s.log.Info("producer turn deferred", "reason", deferred.reason)
 				}
 				if err := s.sleep(ctx, time.Duration(s.cfg.Supervisor.PollIntervalSeconds)*time.Second); err != nil {
 					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
@@ -607,7 +628,7 @@ func (s *Supervisor) startQueuedCycle(ctx context.Context, turn Turn) (bool, str
 			reason = "another queued brief reservation is still active"
 			return nil
 		}
-		if err := st.PermitQueuedProducerHandoff(); err != nil {
+		if err := st.PermitProducerWorktreeUse(); err != nil {
 			reason = err.Error()
 			return nil
 		}

@@ -899,6 +899,41 @@ func TestQueueStartDefersWhileSubmissionLeaseIsLive(t *testing.T) {
 	}
 }
 
+// BeforeTurn is also reached by legacy inbox briefs, answers, verdicts, and
+// retries. It must reject the same live submit lease before it builds refresh
+// dependencies or touches the producer worktree.
+func TestBeforeTurnDefersWhileSubmissionLeaseIsLive(t *testing.T) {
+	cfg := cfgFor(t)
+	holder, err := proc.Self("submit-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		st.SetCycle(state.CycleNew, time.Now())
+		return st.AcquireProducerWorktreeLease(holder, time.Now())
+	}); err != nil {
+		t.Fatal(err)
+	}
+	depsBuilt := 0
+	_, err = refresh.BeforeTurn(cfg, func(context.Context) (refresh.Deps, error) {
+		depsBuilt++
+		return refresh.Deps{}, nil
+	})(context.Background(), supervise.Turn{ID: "legacy-brief", Role: "producer"})
+	if !errors.Is(err, state.ErrProducerWorktreeBusy) {
+		t.Fatalf("BeforeTurn error=%v, want live submission lease refusal", err)
+	}
+	if depsBuilt != 0 {
+		t.Fatalf("BeforeTurn built refresh dependencies %d times beside a submission lease", depsBuilt)
+	}
+	st, err := state.Load(cfg.StatePath(), cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if st.Cycle == nil || st.Cycle.Phase != state.CycleNew {
+		t.Fatalf("BeforeTurn changed cycle despite the live submission lease: %+v", st.Cycle)
+	}
+}
+
 // The durable submission barrier carries an exact process reference rather
 // than a timeout. Once that submit process has died, the next admission
 // reclaims the stale lease inside its locked decision and does not strand the

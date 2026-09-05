@@ -32,8 +32,8 @@ import (
 const SchemaVersion = 2
 
 var (
-	// ErrProducerLifecycleBusy means a queued producer handoff has not
-	// finished its agent process, so root-side cycle transitions must wait.
+	// ErrProducerLifecycleBusy means a queued handoff or admitted producer
+	// turn owns the producer worktree, so root-side cycle transitions must wait.
 	ErrProducerLifecycleBusy = errors.New("producer queued handoff is active")
 	// ErrProducerWorktreeBusy means a root-side submission has leased the
 	// producer worktree while it copies and gates a declared change. A queued
@@ -217,8 +217,8 @@ func (s *State) PermitProducerCycleMutation() error {
 }
 
 // AcquireProducerWorktreeLease is the durable barrier immediately before
-// root-side CopyTree. It gives a queued handoff priority if the handoff won
-// the state lock first, and otherwise makes queue admission wait until the
+// root-side CopyTree. It gives an admitted producer trigger priority if it won
+// the state lock first, and otherwise makes producer admission wait until the
 // submission has finished using the producer worktree and gate result.
 func (s *State) AcquireProducerWorktreeLease(holder proc.Ref, now time.Time) error {
 	if holder.PID <= 0 || holder.StartToken == "" {
@@ -227,22 +227,72 @@ func (s *State) AcquireProducerWorktreeLease(holder proc.Ref, now time.Time) err
 	if err := s.PermitProducerCycleMutation(); err != nil {
 		return err
 	}
-	if err := s.permitQueuedProducerHandoff(); err != nil {
+	if err := s.permitRootProducerWorktreeUse(holder); err != nil {
+		return err
+	}
+	if err := s.permitSubmissionLease(); err != nil {
 		return err
 	}
 	s.Role(RoleProducer).SubmissionLease = &ProducerWorktreeLease{Holder: holder, AcquiredAt: now}
 	return nil
 }
 
-// PermitQueuedProducerHandoff is called under state.Update by queue
-// admission. A live submit lease is a deliberate queue deferral; a dead owner
-// is reclaimed in this same locked update, so a crashed submit cannot strand
-// the queue indefinitely.
-func (s *State) PermitQueuedProducerHandoff() error {
-	return s.permitQueuedProducerHandoff()
+// permitRootProducerWorktreeUse makes a generic producer CurrentTurn the
+// other half of the CopyTree/gate barrier. A root-side submit arriving after a
+// legacy brief, answer, verdict, or retry was admitted must wait for that turn
+// rather than copy beside it. The producer supervisor is allowed to submit
+// from its own AfterTurn after the runner has returned; a separate manual
+// submit is not. Dead supervisors and their proven-dead children are cleaned
+// here so a crash before a runner process was recorded cannot strand submit.
+func (s *State) permitRootProducerWorktreeUse(holder proc.Ref) error {
+	rs := s.Role(RoleProducer)
+	turn := rs.CurrentTurn
+	if turn == nil {
+		return nil
+	}
+	if supervisor := rs.Supervisor; supervisor != nil && supervisor.PID == holder.PID && supervisor.StartToken == holder.StartToken {
+		return nil // AfterTurn runs inside the producer supervisor process.
+	}
+	if turn.Process != nil {
+		alive, err := turn.Process.Alive()
+		if err != nil {
+			return fmt.Errorf("%w: cannot prove current producer turn process %s is gone: %v", ErrProducerLifecycleBusy, turn.Process, err)
+		}
+		if alive {
+			return fmt.Errorf("%w: current producer turn %s process %s still owns the worktree", ErrProducerLifecycleBusy, turn.ID, turn.Process)
+		}
+	}
+	if rs.Supervisor == nil {
+		return fmt.Errorf("%w: current producer turn %s has no supervisor identity, so its worktree ownership cannot be released safely", ErrProducerLifecycleBusy, turn.ID)
+	}
+	alive, err := rs.Supervisor.Alive()
+	if err != nil {
+		return fmt.Errorf("%w: cannot prove producer supervisor %s is gone: %v", ErrProducerLifecycleBusy, rs.Supervisor, err)
+	}
+	if alive {
+		return fmt.Errorf("%w: current producer turn %s is owned by live supervisor %s", ErrProducerLifecycleBusy, turn.ID, rs.Supervisor)
+	}
+	rs.CurrentTurn = nil
+	return nil
 }
 
-func (s *State) permitQueuedProducerHandoff() error {
+// PermitProducerWorktreeUse is called under state.Update before a producer
+// turn is admitted or a queued brief is refreshed. A live submit lease is a
+// deliberate deferral; a dead owner is reclaimed in this same locked update,
+// so a crashed submit cannot strand any producer trigger indefinitely.
+func (s *State) PermitProducerWorktreeUse() error {
+	return s.permitSubmissionLease()
+}
+
+// PermitQueuedProducerHandoff is retained for callers compiled against the
+// earlier queue-only name. New admission paths must use
+// PermitProducerWorktreeUse: legacy briefs, answers, verdicts, and retries
+// use the producer worktree too.
+func (s *State) PermitQueuedProducerHandoff() error {
+	return s.PermitProducerWorktreeUse()
+}
+
+func (s *State) permitSubmissionLease() error {
 	rs := s.Role(RoleProducer)
 	lease := rs.SubmissionLease
 	if lease == nil {

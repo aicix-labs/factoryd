@@ -16,6 +16,7 @@ import (
 	"github.com/aicix-labs/factoryd/internal/brief"
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/gittransport"
+	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/refresh"
 	"github.com/aicix-labs/factoryd/internal/scm"
 	"github.com/aicix-labs/factoryd/internal/signal"
@@ -1406,6 +1407,90 @@ func TestQueueAdmissionBetweenSubmitPreflightAndGatePreventsGateAndWake(t *testi
 	}
 	if st.Role(state.RoleProducer).QueueReservation == nil {
 		t.Fatal("queue admission was not durably recorded")
+	}
+}
+
+// Queue work is not the only producer-worktree owner. A legacy inbox brief
+// can be admitted after submit's early preflight; its recorded live turn must
+// win the same barrier before CopyTree and gate execution.
+func TestLegacyProducerTurnAfterSubmitPreflightPreventsCopyGateAndWake(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "gate: legacy turn\n\nbody")
+	turnProcess, err := proc.Self("legacy-producer-turn")
+	if err != nil {
+		t.Fatal(err)
+	}
+	var admitErr error
+	l.git.afterCheckout = func() {
+		_, admitErr = state.Update(l.cfg.StatePath(), l.cfg.Name, func(st *state.State) error {
+			st.Role(state.RoleProducer).CurrentTurn = &state.Turn{
+				ID: "producer-legacy-brief", StartedAt: time.Now(), Trigger: "brief", Process: &turnProcess,
+			}
+			return nil
+		})
+	}
+
+	_, err = submit.Run(context.Background(), l.cfg, l.deps)
+	if admitErr != nil {
+		t.Fatalf("admitting legacy producer turn: %v", admitErr)
+	}
+	var got *submit.Error
+	if !errors.As(err, &got) || got.Kind != supervise.DispositionBlocked || !errors.Is(err, state.ErrProducerLifecycleBusy) {
+		t.Fatalf("submit error=%v, want blocked live legacy-turn refusal", err)
+	}
+	if l.gate.ran || len(l.tr.pushed) != 0 {
+		t.Fatalf("submit used the worktree beside a live legacy turn: gate=%v pushes=%v", l.gate.ran, l.tr.pushed)
+	}
+	if exists(filepath.Join(l.cfg.Paths.SubmitRepo, "src", "a.go")) {
+		t.Fatal("submit copied the producer worktree beside a live legacy turn")
+	}
+	for _, name := range []string{"question.md", "wake"} {
+		if exists(filepath.Join(l.cfg.InboxDir(), name)) {
+			t.Fatalf("submit wrote inbox/%s beside a live legacy turn", name)
+		}
+	}
+}
+
+// The lease holder can be the producer supervisor during AfterTurn. A failed
+// release must therefore be surfaced as a restart request, never merely
+// logged: a live supervisor process would otherwise keep its own queue
+// deferred forever.
+func TestSubmitPropagatesAProducerWorktreeLeaseReleaseFailure(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "gate: release lease\n\nbody")
+	var corruptErr error
+	l.gate.during = func() {
+		_, corruptErr = state.Update(l.cfg.StatePath(), l.cfg.Name, func(st *state.State) error {
+			lease := st.Role(state.RoleProducer).SubmissionLease
+			if lease == nil {
+				return errors.New("gate ran without a producer-worktree lease")
+			}
+			lease.Holder.StartToken = "different-process-instance"
+			return nil
+		})
+	}
+
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if corruptErr != nil {
+		t.Fatalf("forcing lease-release failure: %v", corruptErr)
+	}
+	if !supervise.RequiresRestart(err) {
+		t.Fatalf("submit error=%v, want a supervisor restart request after lease release failed", err)
+	}
+	if exitOf(t, err) != submit.ExitConfig {
+		t.Fatalf("exit=%d, want %d", exitOf(t, err), submit.ExitConfig)
+	}
+	if len(l.tr.pushed) != 0 {
+		t.Fatalf("submit pushed after the producer-worktree lease could not be released: %v", l.tr.pushed)
+	}
+	st, loadErr := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if st.Role(state.RoleProducer).SubmissionLease == nil {
+		t.Fatal("failed release silently discarded the durable lease")
 	}
 }
 
