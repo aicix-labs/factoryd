@@ -13,6 +13,7 @@
 package proc
 
 import (
+	"errors"
 	"fmt"
 	"os"
 	"strconv"
@@ -20,6 +21,11 @@ import (
 	"syscall"
 	"time"
 )
+
+// ErrNotRunning says a Ref no longer names a live process. Callers may treat
+// that differently from an inspection failure: there is no live executable to
+// inspect, while an unreadable /proc entry leaves the answer undecided.
+var ErrNotRunning = errors.New("proc: process is not running")
 
 // Ref is a durable reference to a process: a PID plus the kernel's start token
 // for that PID at the time the reference was taken.
@@ -141,6 +147,33 @@ func (r Ref) Alive() (bool, error) {
 		return false, nil
 	}
 	return true, nil
+}
+
+// Executable returns the kernel's path to the executable for this exact live
+// process. /proc/<pid>/exe carries a " (deleted)" suffix when an installer
+// replaced a binary inode under a still-running process. Check liveness before
+// and after the read so a recycled PID cannot be mistaken for the supervisor
+// recorded in state.
+func (r Ref) Executable() (string, error) {
+	alive, err := r.Alive()
+	if err != nil {
+		return "", err
+	}
+	if !alive {
+		return "", fmt.Errorf("%w: %s", ErrNotRunning, r)
+	}
+	path, err := os.Readlink(fmt.Sprintf("/proc/%d/exe", r.PID))
+	if err != nil {
+		return "", fmt.Errorf("proc: read executable for %s: %w", r, err)
+	}
+	alive, err = r.Alive()
+	if err != nil {
+		return "", err
+	}
+	if !alive {
+		return "", fmt.Errorf("%w while reading executable: %s", ErrNotRunning, r)
+	}
+	return path, nil
 }
 
 // Signal sends sig to the referenced process, but only if it is still the same

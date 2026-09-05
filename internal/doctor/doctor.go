@@ -8,6 +8,7 @@ package doctor
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"github.com/aicix-labs/factoryd/internal/alert"
 	"github.com/aicix-labs/factoryd/internal/health"
@@ -23,7 +24,9 @@ import (
 	"github.com/aicix-labs/factoryd/internal/factory"
 	"github.com/aicix-labs/factoryd/internal/gittransport"
 	"github.com/aicix-labs/factoryd/internal/principal"
+	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/scm"
+	"github.com/aicix-labs/factoryd/internal/state"
 )
 
 // Check is one question and its answer.
@@ -102,6 +105,9 @@ type Deps struct {
 	// Reach probes whether a turn of spec can reach addr, sandboxed or not.
 	// Nil uses the real runner with this binary's own _netprobe verb.
 	Reach func(ctx context.Context, spec config.RoleSpec, addr string, sandboxed bool) (bool, error)
+	// SupervisorExecutable resolves the executable path of a recorded live
+	// supervisor. Nil reads /proc through proc.Ref.Executable.
+	SupervisorExecutable func(proc.Ref) (string, error)
 }
 
 // Run performs every check with the real dependencies.
@@ -129,6 +135,9 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 	}
 	if deps.Contain == nil {
 		deps.Contain = realContain
+	}
+	if deps.SupervisorExecutable == nil {
+		deps.SupervisorExecutable = func(ref proc.Ref) (string, error) { return ref.Executable() }
 	}
 	var r Report
 	add := func(name string, err error, detail string) {
@@ -529,6 +538,38 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 
 	add("spin guard", nil, fmt.Sprintf("warn at %d turns with no progress, halt at %d; backoff %ds",
 		cfg.Supervisor.SpinWarn, cfg.Supervisor.SpinAbort, cfg.Supervisor.BackoffSeconds))
+
+	// An install replaces the path's inode but not a process that already has
+	// it mapped. systemd then truthfully says the old process is active, while
+	// every command it serves comes from code no longer on disk. state holds an
+	// exact supervisor handle, so inspect that process rather than searching an
+	// argv or trusting a service manager (#53).
+	if st, err := state.Load(cfg.StatePath(), cfg.Name); err != nil {
+		add("supervisor binaries", fmt.Errorf("cannot inspect recorded supervisors: %w", err), cfg.StatePath())
+	} else {
+		for _, role := range state.Roles {
+			name := "supervisor " + string(role) + " binary"
+			ref := st.Role(role).Supervisor
+			if ref == nil {
+				add(name, nil, "no supervisor recorded")
+				continue
+			}
+			path, err := deps.SupervisorExecutable(*ref)
+			switch {
+			case errors.Is(err, proc.ErrNotRunning):
+				// status and health report a dead supervisor. Doctor's question
+				// here is narrower: whether a live one is executing a replaced
+				// binary. Do not call no running process a stale executable.
+				add(name, nil, ref.String()+" is not live; no executable to compare")
+			case err != nil:
+				add(name, fmt.Errorf("cannot inspect %s: %w", ref, err), "")
+			case strings.HasSuffix(path, " (deleted)"):
+				add(name, fmt.Errorf("%s is executing %s; its on-disk binary was replaced. Restart the %s supervisor/service before trusting its output", ref, path, role), path)
+			default:
+				add(name, nil, path)
+			}
+		}
+	}
 
 	// --- containment ---
 	// A turn's processes are held in a per-turn cgroup, killed as a whole

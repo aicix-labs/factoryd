@@ -357,9 +357,19 @@ provider.
 ## Build
 
 ```console
-$ go build ./...
+$ make build
+$ ./factoryd version
+v1.2.3-14-gabcdef
 $ go test -race -count=1 ./...
 ```
+
+`make build` stamps `factoryd version` from `git describe`; CI stamps its
+commit SHA. Deploy that artifact, not an unadorned `go build` binary, so an
+operator can identify the code a service should be running. `factoryd doctor`
+also inspects every live supervisor recorded in `state.json`: a
+`/proc/<pid>/exe` path ending in ` (deleted)` is a failure that names the
+supervisor/service to restart. Replacing a binary never replaces its running
+inode.
 
 Go 1.25, no third-party dependencies — inotify comes from the standard
 library'"'"'s `syscall` package.

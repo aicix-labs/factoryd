@@ -11,7 +11,9 @@ import (
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/doctor"
+	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/scm"
+	"github.com/aicix-labs/factoryd/internal/state"
 )
 
 // fakeDriver resolves to whatever identity its token names, so a test can make
@@ -250,6 +252,38 @@ func TestHealthyFactoryPasses(t *testing.T) {
 	if len(r.Checks) < 12 {
 		t.Fatalf("only %d checks ran; doctor is not asking enough questions", len(r.Checks))
 	}
+}
+
+// An active unit can still be serving an old inode after an install replaces
+// the binary. The state handle identifies the real supervisor without an argv
+// search, and the kernel's deleted suffix is the cheap, build-stamp-independent
+// evidence that a restart is required.
+func TestDoctorRejectsLiveSupervisorRunningADeletedBinary(t *testing.T) {
+	cfg := fixture(t)
+	ref := proc.Ref{PID: 4242, StartToken: "supervisor-start", Role: "producer"}
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		st.Role(state.RoleProducer).Supervisor = &ref
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	deps := healthyDeps(cfg, nil)
+	deps.SupervisorExecutable = func(got proc.Ref) (string, error) {
+		if got != ref {
+			t.Fatalf("doctor inspected %+v, want the state-recorded supervisor %+v", got, ref)
+		}
+		return "/usr/local/bin/factoryd (deleted)", nil
+	}
+	r := doctor.RunWith(context.Background(), cfg, deps)
+	for _, c := range r.Checks {
+		if c.Name == "supervisor producer binary" {
+			if c.OK || c.Err == nil || !strings.Contains(c.Err.Error(), "replaced") || !strings.Contains(c.Err.Error(), "Restart") {
+				t.Fatalf("deleted supervisor check=%+v, want a restart-required failure", c)
+			}
+			return
+		}
+	}
+	t.Fatalf("doctor did not inspect the producer supervisor binary:\n%s", r)
 }
 
 // The check the two-party model rests on: one credential file for both roles.
