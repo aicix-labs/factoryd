@@ -128,6 +128,9 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 	case sha == "" || sha == "auto":
 		sha = change.HeadSHA
 	case sha != change.HeadSHA:
+		if err := retireMatchingReviewerPipelineWait(cfg, string(req.ID), sha); err != nil {
+			return Result{}, failed("retiring the obsolete reviewer pipeline wait after a head move: %w", err)
+		}
 		return Result{}, refuse("change %s head is %s, not %s; the head moved since this verdict was formed", req.ID, change.HeadSHA, sha)
 	}
 	if sha == "" {
@@ -144,6 +147,9 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 			return res, failed("reading the diff of %s: %w", req.ID, err)
 		}
 		if len(diffs) == 0 {
+			if err := retireMatchingReviewerPipelineWait(cfg, string(req.ID), sha); err != nil {
+				return res, failed("retiring the obsolete reviewer pipeline wait after a terminal scope refusal: %w", err)
+			}
 			return res, refuse("change %s has an empty diff; there is nothing to merge", req.ID)
 		}
 		// Content policy is evaluated on delivered content only. A file the
@@ -151,6 +157,9 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 		// be evaluated, and is refused rather than read as "nothing added".
 		for _, f := range diffs {
 			if f.Incomplete && len(cfg.Scope.HoldDiffRegexes) > 0 {
+				if err := retireMatchingReviewerPipelineWait(cfg, string(req.ID), sha); err != nil {
+					return res, failed("retiring the obsolete reviewer pipeline wait after a terminal scope refusal: %w", err)
+				}
 				return res, refuse("scope policy cannot be evaluated on %s: the provider did not deliver its content (%s); review it by hand and signal operator-gated, or merge outside the gate", f.Path, f.IncompleteReason)
 			}
 		}
@@ -163,6 +172,9 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 			// The verdict is not downgraded behind the reviewer's back: the
 			// merge is refused, and the reviewer signals operator-gated
 			// themselves, so the recorded verdict is always the one chosen.
+			if err := retireMatchingReviewerPipelineWait(cfg, string(req.ID), sha); err != nil {
+				return res, failed("retiring the obsolete reviewer pipeline wait after a terminal scope refusal: %w", err)
+			}
 			return res, refuse("scope policy makes %s operator-only; signal operator-gated instead:\n  %s", req.ID, strings.Join(res.Decision.Reasons, "\n  "))
 		case Escalate:
 			audits, err := deps.Driver.Audits(ctx, req.ID, sha)
@@ -171,6 +183,9 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 			}
 			res.Audits = audits
 			if err := auditsClear(audits, sha, deps.Reviewer, change, log); err != nil {
+				if clearErr := retireMatchingReviewerPipelineWait(cfg, string(req.ID), sha); clearErr != nil {
+					return res, failed("retiring the obsolete reviewer pipeline wait after a terminal audit refusal: %w", clearErr)
+				}
 				return res, refuse("scope policy requires an adversarial audit of %s at %s: %v\n  %s", req.ID, sha, err, strings.Join(res.Decision.Reasons, "\n  "))
 			}
 			fmt.Fprintf(log, "audit: %d cleared on %s\n", len(audits), sha)
@@ -184,6 +199,9 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 		// ready state would stand). Marking ready is the reviewer's own,
 		// explicit act, done after review and before signalling.
 		if change.Draft {
+			if err := retireMatchingReviewerPipelineWait(cfg, string(req.ID), sha); err != nil {
+				return res, failed("retiring the obsolete reviewer pipeline wait after a terminal draft refusal: %w", err)
+			}
 			return res, refuse("change %s is still a draft; the gate does not mark a draft ready. After review: factoryd scm --config <f> set-draft %s false, then signal", req.ID, req.ID)
 		}
 		mr, err := scm.MergeVerified(ctx, deps.Driver, req.ID, sha, cfg.TargetBranch)
@@ -245,6 +263,9 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps, req Request) (Resul
 			}
 			return res, nil
 		default:
+			if err := retireMatchingReviewerPipelineWait(cfg, string(req.ID), sha); err != nil {
+				return res, failed("retiring the obsolete reviewer pipeline wait after a terminal merge refusal: %w", err)
+			}
 			return res, refuse("provider refused to merge %s: %s (%s)", req.ID, mr.Reason, mr.Outcome)
 		}
 	}
@@ -500,6 +521,34 @@ func clearReviewerPipelineRetry(cfg *config.Config, changeID, sha string) error 
 		return err
 	}
 	return nil
+}
+
+// retireMatchingReviewerPipelineWait stops only the CI retry whose exact
+// change and head this reviewer attempt just established as terminal. A
+// different head may have acquired a fresh wait while this signal was running;
+// clearing it would strand that independent review obligation. The marker is
+// retired only after the state-owned fact is removed, and only if that exact
+// fact was present under the state lock.
+func retireMatchingReviewerPipelineWait(cfg *config.Config, changeID, sha string) error {
+	if changeID == "" || sha == "" {
+		return nil
+	}
+	matched := false
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(s *state.State) error {
+		wait := s.Role(state.RoleReviewer).PipelineWait
+		if wait == nil || wait.ChangeID != changeID || wait.SHA != sha {
+			return nil
+		}
+		s.ClearReviewerPipelineWait(changeID)
+		matched = true
+		return nil
+	}); err != nil {
+		return err
+	}
+	if !matched {
+		return nil
+	}
+	return clearReviewerPipelineRetry(cfg, changeID, sha)
 }
 
 func pipelineBudget(cfg *config.Config) (int, time.Duration) {
