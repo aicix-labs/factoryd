@@ -204,9 +204,25 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		return Result{}, fail(ExitConfig, "submit: missing a dependency")
 	}
 
+	// A queued brief has been handed to a producer before its process begins.
+	// That handoff owns the producer worktree, so a root-side submit must stop
+	// before it can read that worktree, prepare a branch, run a gate, or wake
+	// the reviewer about the agent's partial work. Keep the write-ahead check
+	// below as well: the handoff may become active while this invocation is
+	// materialising a submission.
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		return st.PermitProducerCycleMutation()
+	}); err != nil {
+		if errors.Is(err, state.ErrProducerLifecycleBusy) {
+			return Result{}, blocked(wrap(ExitConfig, err, "refusing to submit while a queued producer handoff is active"))
+		}
+		return Result{}, transient(wrap(ExitConfig, err, "checking for an active queued producer handoff"))
+	}
+
 	// 1. Identity. Fail closed: the producer must be someone, and not the
-	// reviewer. This runs before anything is read or written, because every
-	// later step acts as the producer and must not act as anyone else.
+	// reviewer. This runs before producer-owned input is read or acted upon,
+	// because every later step acts as the producer and must not act as anyone
+	// else.
 	if deps.Producer.ID == "" {
 		return Result{}, fail(ExitConfig, "the producer credential did not resolve to an identity")
 	}

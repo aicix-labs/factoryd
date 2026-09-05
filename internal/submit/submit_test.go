@@ -1309,6 +1309,46 @@ func TestSubmitRefusesAnUnfinishedQueuedHandoff(t *testing.T) {
 	}
 }
 
+// The initial handoff fence is deliberately before even a red gate: running
+// one against the queued producer's partial worktree would create a false
+// reviewer workflow. In particular, it must not leave question.md or wake
+// behind for a reviewer to mistake for the queued turn's result.
+func TestSubmitDoesNotRunOrReportARedGateBesideAnUnfinishedQueuedHandoff(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "gate: queued lifecycle\n\nbody")
+	l.gate.exit = 1
+	if _, err := state.Update(l.cfg.StatePath(), l.cfg.Name, func(st *state.State) error {
+		st.SetCycle(state.CycleWorking, time.Now())
+		st.Role(state.RoleProducer).QueueReservation = &state.QueueReservation{
+			Source:          filepath.Join(l.cfg.BriefsDir(), "010-next.md"),
+			Done:            filepath.Join(l.cfg.BriefsDoneDir(), "010-next.md"),
+			Turn:            "producer-queued",
+			ReservedAt:      time.Now(),
+			Taken:           true,
+			ProcessStarted:  false,
+			ProcessFinished: false,
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	var got *submit.Error
+	if !errors.As(err, &got) || got.Kind != supervise.DispositionBlocked || !errors.Is(err, state.ErrProducerLifecycleBusy) {
+		t.Fatalf("submit error=%v, want blocked active queued-handoff refusal", err)
+	}
+	if l.gate.ran {
+		t.Fatal("submit ran a red gate beside an active queued handoff")
+	}
+	for _, name := range []string{"question.md", "wake"} {
+		if exists(filepath.Join(l.cfg.InboxDir(), name)) {
+			t.Fatalf("submit wrote inbox/%s beside an active queued handoff", name)
+		}
+	}
+}
+
 // reviewerDriver is the fast reviewer's view of the provider for the
 // interleaving test: the draft submit just opened, mergeable at once.
 type reviewerDriver struct {
