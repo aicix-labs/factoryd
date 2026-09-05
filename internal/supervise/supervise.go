@@ -184,14 +184,14 @@ type Options struct {
 	// it to refresh's merge reconciliation and refresh step, so a human-merged
 	// open change releases the next queued brief without launching a second
 	// producer turn while the old one is still in flight.
-	QueueStart func(ctx context.Context) (started bool, reason string, err error)
+	QueueStart func(ctx context.Context, t Turn) (started bool, reason string, err error)
 }
 
 // Supervisor is one role's loop.
 type Supervisor struct {
 	beforeTurn func(ctx context.Context, t Turn) (string, error)
 	afterTurn  func(ctx context.Context, t Turn, res TurnResult) (string, error)
-	queueStart func(ctx context.Context) (started bool, reason string, err error)
+	queueStart func(ctx context.Context, t Turn) (started bool, reason string, err error)
 	cfg        *config.Config
 	role       string
 	runner     Runner
@@ -202,6 +202,10 @@ type Supervisor struct {
 
 	watcher *watch.Watcher
 	turnSeq int
+
+	// afterQueuedTake is a deterministic interleaving hook for the package's
+	// lifecycle test. It is never set by production construction.
+	afterQueuedTake func()
 }
 
 // RetryLabel names the supervisor-owned retry trigger.
@@ -348,6 +352,9 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		if s.maxTurn > 0 && s.turnSeq >= s.maxTurn {
 			return nil
 		}
+		if err := s.recoverQueuedReservation(); err != nil {
+			return err
+		}
 
 		triggers, err := s.watcher.Wait(ctx)
 		if err != nil {
@@ -358,22 +365,7 @@ func (s *Supervisor) Run(ctx context.Context) error {
 			return err
 		}
 
-		triggers, deferred, queueReserved, reason, err := s.selectQueuedBrief(ctx, triggers)
-		if err != nil {
-			return err
-		}
-		if deferred {
-			if reason != "" {
-				s.log.Info("queued brief deferred", "reason", reason)
-			}
-			if err := s.sleep(ctx, time.Duration(s.cfg.Supervisor.PollIntervalSeconds)*time.Second); err != nil {
-				if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
-					return nil
-				}
-				return err
-			}
-			continue
-		}
+		triggers = s.selectQueuedBrief(triggers)
 		if len(triggers) == 0 {
 			continue
 		}
@@ -385,9 +377,21 @@ func (s *Supervisor) Run(ctx context.Context) error {
 		if len(admitted.Triggers) == 0 {
 			continue // everything pending was quarantined; the watcher settles
 		}
-		admitted.QueueReserved = queueReserved
 		halted, err := s.oneTurn(ctx, admitted)
 		if err != nil {
+			var deferred *queueDeferredError
+			if errors.As(err, &deferred) {
+				if deferred.reason != "" {
+					s.log.Info("queued brief deferred", "reason", deferred.reason)
+				}
+				if err := s.sleep(ctx, time.Duration(s.cfg.Supervisor.PollIntervalSeconds)*time.Second); err != nil {
+					if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
+						return nil
+					}
+					return err
+				}
+				continue
+			}
 			if errors.Is(err, context.Canceled) || errors.Is(err, context.DeadlineExceeded) {
 				return nil
 			}
@@ -399,18 +403,131 @@ func (s *Supervisor) Run(ctx context.Context) error {
 	}
 }
 
+// recoverQueuedReservation closes the two crash windows around an ordered
+// handoff. Before the rename, the source remains watched and QueueStart reties
+// the reservation to the replacement turn. After the rename, the source is
+// intentionally gone, so this writes a normal supervisor retry that names the
+// durable done/ path. The marker is written before state forgets the
+// reservation; a crash in that tiny sequence is idempotent on restart.
+func (s *Supervisor) recoverQueuedReservation() error {
+	if s.role != "producer" {
+		return nil
+	}
+	st, err := state.Load(s.cfg.StatePath(), s.cfg.Name)
+	if err != nil {
+		return err
+	}
+	q := st.Role(state.RoleProducer).QueueReservation
+	if q == nil {
+		return nil
+	}
+	q = &state.QueueReservation{Source: q.Source, Done: q.Done, Turn: q.Turn, ReservedAt: q.ReservedAt, Taken: q.Taken}
+	if expected, err := brief.DonePath(s.cfg, q.Source); err != nil || expected != q.Done {
+		return s.blockBrokenQueuedReservation(q, "reservation paths are outside the configured brief queue")
+	}
+
+	_, sourceErr := os.Stat(q.Source)
+	_, doneErr := os.Stat(q.Done)
+	if !q.Taken {
+		switch {
+		case sourceErr == nil:
+			return nil // QueueStart will retie this pending source to the new turn.
+		case os.IsNotExist(sourceErr) && doneErr == nil:
+			// The rename completed but the state write did not. Runner is only
+			// called after that write returns, so restoring this source cannot
+			// race an agent that saw the done handoff.
+			_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+				rs := st.Role(state.RoleProducer)
+				if current := rs.QueueReservation; current != nil && current.Source == q.Source && current.Done == q.Done && !current.Taken {
+					return brief.Restore(s.cfg, q.Source, q.Done)
+				}
+				return nil
+			})
+			return err
+		default:
+			return s.blockBrokenQueuedReservation(q, "pending source is missing and no recoverable done handoff exists")
+		}
+	}
+
+	if doneErr != nil {
+		if sourceErr == nil {
+			// A lifecycle change restored the source, but the process died
+			// after rename and before the state write clearing Taken. The
+			// source is authoritative again; leave the new lifecycle phase
+			// alone and let the normal queue selector see it.
+			_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+				rs := st.Role(state.RoleProducer)
+				if current := rs.QueueReservation; current != nil && current.Source == q.Source && current.Done == q.Done && current.Taken {
+					rs.QueueReservation = nil
+				}
+				return nil
+			})
+			return err
+		}
+		return s.blockBrokenQueuedReservation(q, "taken done handoff is missing")
+	}
+	markerBrief := readRetryLine(s.cfg.RetryPath(s.role), "brief: ")
+	if markerBrief != "" && markerBrief != q.Done {
+		return s.blockBrokenQueuedReservation(q, "a different supervisor retry marker is already pending")
+	}
+	if markerBrief != q.Done {
+		if err := s.writeQueuedRecoveryMarker(q); err != nil {
+			return err
+		}
+	}
+	_, err = state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		rs := st.Role(state.RoleProducer)
+		if current := rs.QueueReservation; current != nil && current.Source == q.Source && current.Done == q.Done && current.Taken {
+			rs.QueueReservation = nil
+		}
+		return nil
+	})
+	return err
+}
+
+func (s *Supervisor) writeQueuedRecoveryMarker(q *state.QueueReservation) error {
+	body := fmt.Sprintf(
+		"retry 0 of %d\norigin: %s\nstep: %s\nbrief: %s\nafter turn: %s\nrecovered queued handoff: true\nat: %s\n\n"+
+			"factoryd restarted after taking this queued brief; run the same immutable done handoff once.\n",
+		s.cfg.Supervisor.FailAbort, brief.Label, RetryStepTurn, q.Done, q.Turn, s.now().Format(time.RFC3339))
+	return os.WriteFile(s.cfg.RetryPath(s.role), []byte(body), 0o644)
+}
+
+func (s *Supervisor) blockBrokenQueuedReservation(q *state.QueueReservation, why string) error {
+	_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		rs := st.Role(state.RoleProducer)
+		current := rs.QueueReservation
+		if current == nil || current.Source != q.Source || current.Done != q.Done {
+			return nil
+		}
+		rs.Blocked = &state.Block{
+			Disposition: "blocked",
+			Reason:      "queued brief reservation cannot be recovered: " + why,
+			Turn:        current.Turn,
+			At:          s.now(),
+		}
+		if rs.CurrentTurn != nil && rs.CurrentTurn.ID == current.Turn {
+			rs.CurrentTurn = nil
+		}
+		rs.QueueReservation = nil
+		if st.Cycle != nil && st.Cycle.Phase == state.CycleWorking {
+			st.SetCycle(state.CycleUnknown, s.now()).Note = "queued brief reservation cannot be recovered"
+		}
+		return nil
+	})
+	return err
+}
+
 // selectQueuedBrief serializes the operator backlog. A queued brief never
 // shares a producer turn with another trigger: a verdict/answer/legacy brief
 // describes existing work and must settle before a fresh work order begins.
 // When the queue is the only wake-up, exactly its lexical first entry starts
-// a cycle; every later entry remains pending. A closed-over draft defers that
-// selection without manufacturing a failed turn or touching the guard. Its
-// final lifecycle check and reservation are one operation: after this returns
-// a queued trigger, the cycle is working and another root-side operation sees
-// that reservation rather than an eligible stale phase.
-func (s *Supervisor) selectQueuedBrief(ctx context.Context, triggers []watch.Trigger) ([]watch.Trigger, bool, bool, string, error) {
+// a cycle; every later entry remains pending. Lifecycle admission happens only
+// after oneTurn durably records the selected turn; otherwise a crash between a
+// successful reservation and CurrentTurn would strand the queue in working.
+func (s *Supervisor) selectQueuedBrief(triggers []watch.Trigger) []watch.Trigger {
 	if s.role != "producer" {
-		return triggers, false, false, "", nil
+		return triggers
 	}
 	var queued, other []watch.Trigger
 	for _, t := range triggers {
@@ -421,30 +538,37 @@ func (s *Supervisor) selectQueuedBrief(ctx context.Context, triggers []watch.Tri
 		}
 	}
 	if len(queued) == 0 {
-		return triggers, false, false, "", nil
+		return triggers
 	}
 	if len(other) > 0 {
-		return other, false, false, "", nil
+		return other
 	}
 	sort.Slice(queued, func(i, j int) bool { return queued[i].Path < queued[j].Path })
-	started, reason, err := s.startQueuedCycle(ctx)
-	if err != nil {
-		return nil, false, false, "", err
-	}
-	if !started {
-		return nil, true, false, reason, nil
-	}
-	return []watch.Trigger{queued[0]}, false, true, "", nil
+	return []watch.Trigger{queued[0]}
 }
 
-func (s *Supervisor) startQueuedCycle(ctx context.Context) (bool, string, error) {
+func (s *Supervisor) startQueuedCycle(ctx context.Context, turn Turn) (bool, string, error) {
 	if s.queueStart != nil {
-		return s.queueStart(ctx)
+		return s.queueStart(ctx, turn)
 	}
 
 	started := false
 	var reason string
 	_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		rs := st.Role(state.Role(s.role))
+		source, done, ok := queuedBriefPaths(s.cfg, turn.Triggers)
+		if !ok {
+			return fmt.Errorf("queued cycle start without exactly one queued brief")
+		}
+		if q := rs.QueueReservation; q != nil {
+			if q.Source == source && q.Done == done && !q.Taken && st.Cycle != nil && st.Cycle.Phase == state.CycleWorking {
+				q.Turn = turn.ID // a restart resumes the durable reservation
+				started = true
+				return nil
+			}
+			reason = "another queued brief reservation is still active"
+			return nil
+		}
 		if st.Cycle == nil {
 			reason = "no cycle record; run factoryd refresh --force before taking queued work"
 			return nil
@@ -455,6 +579,7 @@ func (s *Supervisor) startQueuedCycle(ctx context.Context) (bool, string, error)
 			// invariant: the eligible phase is changed under the same lock as
 			// the decision before the queued file can be taken.
 			st.SetCycle(state.CycleWorking, s.now())
+			rs.QueueReservation = &state.QueueReservation{Source: source, Done: done, Turn: turn.ID, ReservedAt: s.now()}
 			started = true
 		default:
 			reason = "cycle is " + st.Cycle.Phase + "; a queued brief waits until the in-flight work settles"
@@ -465,6 +590,26 @@ func (s *Supervisor) startQueuedCycle(ctx context.Context) (bool, string, error)
 		return false, "", err
 	}
 	return started, reason, nil
+}
+
+// queuedBriefPaths returns the one factory-selected queue source and its done
+// path. Queue turns are intentionally singular; accepting two would make a
+// single durable reservation unable to say which handoff may be resumed.
+func queuedBriefPaths(cfg *config.Config, triggers []watch.Trigger) (source, done string, ok bool) {
+	for _, trigger := range triggers {
+		if trigger.Label != brief.Label {
+			continue
+		}
+		if source != "" {
+			return "", "", false
+		}
+		p, err := brief.DonePath(cfg, trigger.Path)
+		if err != nil {
+			return "", "", false
+		}
+		source, done = trigger.Path, p
+	}
+	return source, done, source != ""
 }
 
 // checkVerdictRegistry stops a producer before it observes or quarantines a

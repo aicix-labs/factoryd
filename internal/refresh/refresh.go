@@ -25,10 +25,12 @@ import (
 	"strings"
 	"time"
 
+	"github.com/aicix-labs/factoryd/internal/brief"
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/scm"
 	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/supervise"
+	"github.com/aicix-labs/factoryd/internal/watch"
 )
 
 // Deps are the three sides of the crossing. Each is faked in tests.
@@ -297,11 +299,28 @@ func BeforeTurn(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 // therefore refreshes and records CycleWorking before it releases the lock.
 // An open draft is reconciled at this boundary, so an operator merge releases
 // the next queued brief without a new manual wake.
-func QueueStart(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, error)) func(ctx context.Context) (bool, string, error) {
-	return func(ctx context.Context) (bool, string, error) {
+func QueueStart(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, error)) func(ctx context.Context, t supervise.Turn) (bool, string, error) {
+	return func(ctx context.Context, t supervise.Turn) (bool, string, error) {
+		source, done, err := queuedBriefPaths(cfg, t.Triggers)
+		if err != nil {
+			return false, "", err
+		}
 		started := false
 		var note string
-		_, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		_, err = state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+			rs := st.Role(state.RoleProducer)
+			if q := rs.QueueReservation; q != nil {
+				if q.Source == source && q.Done == done && !q.Taken && st.Cycle != nil && st.Cycle.Phase == state.CycleWorking {
+					// The supervisor crashed after reserving this source but before
+					// taking it. The replacement supervisor owns the same durable
+					// handoff and can finish the atomically checked move.
+					q.Turn = t.ID
+					started = true
+					return nil
+				}
+				note = "brief queue waiting: another queued brief reservation is still active"
+				return nil
+			}
 			// An open cycle may have landed since the previous turn. Build the
 			// dependencies once and reuse them for the refresh after a proved
 			// merge, matching BeforeTurn's locked sequence.
@@ -338,9 +357,12 @@ func QueueStart(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 				return err
 			}
 			st.SetCycle(state.CycleNew, time.Now()).Base = r.SHA
-			// This is the reservation: the queued file has not moved yet, but
-			// root-side lifecycle operations now see a producer-owned tree.
+			// The current turn was recorded before entering QueueStart. Keep the
+			// source and planned done path in root-owned state with CycleWorking,
+			// so a crash before the rename is recoverable rather than a permanent
+			// queue stall.
 			st.SetCycle(state.CycleWorking, time.Now())
+			rs.QueueReservation = &state.QueueReservation{Source: source, Done: done, Turn: t.ID, ReservedAt: time.Now()}
 			started = true
 			if note != "" {
 				note += "; "
@@ -353,4 +375,24 @@ func QueueStart(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 		}
 		return started, note, nil
 	}
+}
+
+func queuedBriefPaths(cfg *config.Config, triggers []watch.Trigger) (source, done string, err error) {
+	for _, trigger := range triggers {
+		if trigger.Label != brief.Label {
+			continue
+		}
+		if source != "" {
+			return "", "", errors.New("refresh: queued cycle has more than one brief")
+		}
+		p, pathErr := brief.DonePath(cfg, trigger.Path)
+		if pathErr != nil {
+			return "", "", fmt.Errorf("refresh: queued brief path: %w", pathErr)
+		}
+		source, done = trigger.Path, p
+	}
+	if source == "" {
+		return "", "", errors.New("refresh: queued cycle has no brief")
+	}
+	return source, done, nil
 }

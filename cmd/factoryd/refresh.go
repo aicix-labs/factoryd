@@ -75,7 +75,7 @@ func producerBeforeTurn(cfg *config.Config) func(ctx context.Context, t supervis
 // producerQueueStart keeps queued briefs behind a live draft, while using the
 // same provider reconciliation and locked refresh as a real producer start to
 // reserve the next item after an operator merge.
-func producerQueueStart(cfg *config.Config) func(ctx context.Context) (bool, string, error) {
+func producerQueueStart(cfg *config.Config) func(ctx context.Context, t supervise.Turn) (bool, string, error) {
 	return refresh.QueueStart(cfg, func(ctx context.Context) (refresh.Deps, error) { return refreshDeps(ctx, cfg) })
 }
 

@@ -985,9 +985,15 @@ supervisor selects only the lexical first regular `*.md` file, and only when
 the cycle is `new`, `clean`, or `finished`. It never starts queued work beside
 an open draft: while holding the state lock, it rechecks through the same
 provider reconciliation that an ordinary refresh uses, refreshes the workdir,
-and marks the cycle `working` before taking the selected file. Thus an operator
-merge releases the next item without a manual wake, while a root-side lifecycle
-operation cannot turn a stale eligibility check into a second producer turn.
+records the selected source as a root-owned reservation, and marks the cycle
+`working` before taking the selected file. The check and move are one locked
+operation; a transition that lands immediately afterwards restores the source
+and refuses the producer turn. Thus an operator merge releases the next item
+without a manual wake, while a root-side lifecycle operation cannot turn a
+stale eligibility check into a second producer turn. The reservation records
+whether the move completed: after a restart, a pending source is re-reserved,
+and a taken `done/` handoff is rearmed through the supervisor's retry marker
+rather than silently stranding the queue.
 Before the agent starts, factoryd moves the selected file to
 `inbox/briefs/done/` and gives that path to the wrapper as `FACTORYD_BRIEF`. It
 refuses to overwrite an existing done file, so a reused queue name cannot erase

@@ -185,12 +185,19 @@ func consumed(acted []watch.Trigger, remaining []watch.Trigger) bool {
 type admittedTurn struct {
 	Triggers []watch.Trigger
 	Verdicts []VerifiedVerdict
-	// QueueReserved says selectQueuedBrief atomically checked and marked the
-	// cycle working for this queued trigger. oneTurn confirms that reservation
-	// before moving the producer-visible file, so an intervening root-side
-	// lifecycle change cannot launch the brief beside a live draft.
-	QueueReserved bool
+	// QueueTaken is a durable queue reservation recovered after a restart. Its
+	// source no longer exists because factoryd had already moved it to done/;
+	// oneTurn resumes the same handoff rather than waiting forever for a file
+	// that correctly will not reappear.
+	QueueTaken bool
 }
+
+// queueDeferredError means the queue's final locked lifecycle check refused to
+// start. It is not a failed agent turn: Run sleeps and waits for a real state
+// change after oneTurn has cleared its provisional CurrentTurn record.
+type queueDeferredError struct{ reason string }
+
+func (e *queueDeferredError) Error() string { return "queued brief deferred: " + e.reason }
 
 // oneTurn runs exactly one agent turn and applies the spin guard. It reports
 // whether the supervisor halted.
@@ -219,6 +226,21 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 		return false, err
 	}
 
+	queuedSource, queuedDone, queued := queuedBriefPaths(s.cfg, triggers)
+	if queued && !admitted.QueueTaken {
+		started, reason, err := s.startQueuedCycle(ctx, turn)
+		if err != nil {
+			return false, err
+		}
+		if !started {
+			if err := s.clearDeferredQueuedTurn(turn, triggers); err != nil {
+				return false, err
+			}
+			s.turnSeq-- // it was an admission check, not an agent turn
+			return false, &queueDeferredError{reason: reason}
+		}
+	}
+
 	before := s.progressMTime()
 	s.log.Info("turn starting", "turn", turn.ID, "triggers", labels(triggers))
 
@@ -234,43 +256,37 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 		skipped = true
 		s.log.Info("retry resumes the after-turn step; the agent does not rerun", "turn", turn.ID)
 	}
-	// A queue entry is factoryd-taken, not producer-deleted. Move it before
-	// preparation so the runner can read its stable done/ path; if preparation
-	// cannot start the turn, put it back exactly where its lexical order put it.
-	queuedSource, queuedDone := "", ""
-	if !resumeAfterTurn {
-		for _, trigger := range triggers {
-			if trigger.Label != brief.Label {
-				continue
-			}
-			if queuedSource != "" {
-				s.log.Error("more than one queued brief reached one turn; the turn does not run", "turn", turn.ID)
-				res, skipped = TurnResult{ExitCode: ExitBeforeTurnFailed}, true
-				break
-			}
-			queuedSource = trigger.Path
-			if admitted.QueueReserved {
-				reserved, reason, err := s.confirmQueuedCycleReservation()
-				if err != nil {
-					return false, err
-				}
-				if !reserved {
-					s.log.Warn("queued brief was not taken because its cycle reservation was lost", "turn", turn.ID, "reason", reason)
-					res, skipped = TurnResult{ExitCode: ExitBeforeTurnFailed}, true
-					break
-				}
-			}
+	// A queue entry is factoryd-taken, never producer-deleted. The lifecycle
+	// reservation check and the filesystem move are one state-locked action;
+	// a root-side transition cannot open the cycle in the old check/take gap.
+	if queued && !resumeAfterTurn {
+		if !admitted.QueueTaken {
+			var taken bool
+			var reason string
 			var err error
-			queuedDone, err = brief.Take(s.cfg, queuedSource)
+			queuedDone, taken, reason, err = s.takeQueuedBrief(turn, queuedSource)
 			if err != nil {
-				s.log.Error("could not take queued brief; the turn does not run and the brief remains pending", "turn", turn.ID, "err", err)
-				if admitted.QueueReserved {
-					if releaseErr := s.releaseQueuedCycleReservation(); releaseErr != nil {
-						s.log.Error("could not release queued-cycle reservation after the brief was not taken", "turn", turn.ID, "err", releaseErr)
-					}
-				}
+				return false, err
+			}
+			if !taken {
+				s.log.Warn("queued brief was not taken because its lifecycle reservation was lost", "turn", turn.ID, "reason", reason)
 				res, skipped = TurnResult{ExitCode: ExitBeforeTurnFailed}, true
-				break
+			}
+		}
+		if !skipped {
+			if s.afterQueuedTake != nil {
+				s.afterQueuedTake()
+			}
+			// The post-handoff confirmation catches a root operation that began
+			// immediately after the atomic move. If it won the next lock, put
+			// the file back and refuse rather than launch beside its draft.
+			confirmed, reason, err := s.confirmQueuedBriefHandoff(turn, queuedSource, queuedDone)
+			if err != nil {
+				return false, err
+			}
+			if !confirmed {
+				s.log.Warn("queued brief restored because its lifecycle changed after handoff", "turn", turn.ID, "reason", reason)
+				res, skipped = TurnResult{ExitCode: ExitBeforeTurnFailed}, true
 			}
 		}
 	}
@@ -278,7 +294,7 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	// Calling BeforeTurn again would only inspect the expected working state;
 	// more importantly, it would reintroduce a lifecycle decision after the
 	// queue entry was selected.
-	if s.beforeTurn != nil && !admitted.QueueReserved && !resumeAfterTurn && !skipped {
+	if s.beforeTurn != nil && !queued && !resumeAfterTurn && !skipped {
 		msg, err := s.beforeTurn(ctx, turn)
 		if err != nil && queuedDone != "" {
 			if restoreErr := brief.Restore(s.cfg, queuedSource, queuedDone); restoreErr != nil {
@@ -328,6 +344,9 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 			}
 			rs.LastTurn = &t
 			rs.CurrentTurn = nil
+			if q := rs.QueueReservation; q != nil && q.Turn == turn.ID {
+				rs.QueueReservation = nil
+			}
 			return nil
 		}); err != nil {
 			s.log.Warn("could not record the interrupted turn", "turn", turn.ID, "err", err)
@@ -536,6 +555,9 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 		}
 		rs.LastTurn = &t
 		rs.CurrentTurn = nil
+		if q := rs.QueueReservation; q != nil && q.Turn == turn.ID {
+			rs.QueueReservation = nil
+		}
 		rs.SetPending(toPending(remaining, ended))
 
 		if didConsume || progressed {
@@ -672,17 +694,76 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	}
 }
 
-// confirmQueuedCycleReservation takes the state lock immediately before the
-// queued file is moved. QueueStart makes CycleWorking the reservation state;
-// if a root-side operation changed it after that atomic start, leave the
-// source entry untouched and refuse to run rather than work beside the new
-// lifecycle state.
-func (s *Supervisor) confirmQueuedCycleReservation() (bool, string, error) {
-	reserved := false
-	var reason string
+// clearDeferredQueuedTurn removes the provisional CurrentTurn created before
+// the final queue admission check. A closed cycle is not a failed agent turn:
+// it must leave neither a running turn nor guard history, only its pending
+// source brief.
+func (s *Supervisor) clearDeferredQueuedTurn(turn Turn, triggers []watch.Trigger) error {
 	_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
-		if st.Cycle != nil && st.Cycle.Phase == state.CycleWorking {
-			reserved = true
+		rs := st.Role(state.Role(s.role))
+		if rs.CurrentTurn != nil && rs.CurrentTurn.ID == turn.ID {
+			rs.CurrentTurn = nil
+		}
+		rs.SetPending(toPending(triggers, s.now()))
+		return nil
+	})
+	return err
+}
+
+// takeQueuedBrief checks the durable reservation and moves the handoff while
+// holding the state lock. A root-side lifecycle operation obtains this same
+// lock, so it cannot turn the cycle open between the check and the rename.
+func (s *Supervisor) takeQueuedBrief(turn Turn, source string) (done string, taken bool, reason string, err error) {
+	var takeErr error
+	_, err = state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		rs := st.Role(state.Role(s.role))
+		q := rs.QueueReservation
+		if q == nil || q.Turn != turn.ID || q.Source != source {
+			reason = "queued brief reservation is absent or belongs to another turn"
+			return nil
+		}
+		if st.Cycle == nil || st.Cycle.Phase != state.CycleWorking {
+			if st.Cycle == nil {
+				reason = "no cycle record"
+			} else {
+				reason = "cycle is " + st.Cycle.Phase
+			}
+			return nil
+		}
+		if q.Taken {
+			done, taken = q.Done, true
+			return nil
+		}
+		done, takeErr = brief.Take(s.cfg, source)
+		if takeErr != nil {
+			return nil
+		}
+		q.Done, q.Taken = done, true
+		taken = true
+		return nil
+	})
+	if err != nil {
+		return "", false, "", err
+	}
+	if takeErr != nil {
+		if releaseErr := s.releaseQueuedReservation(turn); releaseErr != nil {
+			return "", false, "", fmt.Errorf("taking queued brief: %v; releasing reservation: %w", takeErr, releaseErr)
+		}
+		return "", false, takeErr.Error(), nil
+	}
+	return done, taken, reason, nil
+}
+
+// confirmQueuedBriefHandoff is the check immediately before Runner.Run. It
+// restores the source under the state lock if another lifecycle operation won
+// after the atomic check-and-take action, so no producer command sees a brief
+// beside an open draft.
+func (s *Supervisor) confirmQueuedBriefHandoff(turn Turn, source, done string) (confirmed bool, reason string, err error) {
+	_, err = state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		rs := st.Role(state.Role(s.role))
+		q := rs.QueueReservation
+		if q != nil && q.Turn == turn.ID && q.Source == source && q.Done == done && q.Taken && st.Cycle != nil && st.Cycle.Phase == state.CycleWorking {
+			confirmed = true
 			return nil
 		}
 		if st.Cycle == nil {
@@ -690,22 +771,29 @@ func (s *Supervisor) confirmQueuedCycleReservation() (bool, string, error) {
 		} else {
 			reason = "cycle is " + st.Cycle.Phase
 		}
+		if q != nil && q.Turn == turn.ID && q.Taken {
+			if restoreErr := brief.Restore(s.cfg, q.Source, q.Done); restoreErr != nil {
+				return fmt.Errorf("restoring queued brief after lifecycle change: %w", restoreErr)
+			}
+			rs.QueueReservation = nil
+		}
 		return nil
 	})
-	if err != nil {
-		return false, "", err
-	}
-	return reserved, reason, nil
+	return confirmed, reason, err
 }
 
-// releaseQueuedCycleReservation gives a brief that could not be taken a
-// chance to be selected again. It only releases the reservation we still own;
-// a concurrent root-side transition (for example to open) is left intact.
-func (s *Supervisor) releaseQueuedCycleReservation() error {
+// releaseQueuedReservation gives a source that could not be moved a chance to
+// be selected again. It releases only this turn's reservation and never
+// rewrites a root-side transition that already changed the cycle.
+func (s *Supervisor) releaseQueuedReservation(turn Turn) error {
 	_, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
-		if st.Cycle != nil && st.Cycle.Phase == state.CycleWorking {
-			base := st.Cycle.Base
-			st.SetCycle(state.CycleNew, s.now()).Base = base
+		rs := st.Role(state.Role(s.role))
+		if q := rs.QueueReservation; q != nil && q.Turn == turn.ID {
+			rs.QueueReservation = nil
+			if st.Cycle != nil && st.Cycle.Phase == state.CycleWorking {
+				base := st.Cycle.Base
+				st.SetCycle(state.CycleNew, s.now()).Base = base
+			}
 		}
 		return nil
 	})

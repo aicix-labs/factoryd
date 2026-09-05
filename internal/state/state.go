@@ -103,6 +103,12 @@ type RoleState struct {
 	FailStreak int `json:"fail_streak"`
 	// Pending are the triggers seen and not yet consumed, oldest first.
 	Pending []Pending `json:"pending,omitempty"`
+	// QueueReservation is the factoryd-owned record of a queued brief between
+	// selecting its source and completing its turn. A filesystem rename cannot
+	// be atomic with state, so this is the restart authority for deciding
+	// whether to take the source again, restore a pre-record crash window, or
+	// resume the already-taken done/ handoff. The producer never writes it.
+	QueueReservation *QueueReservation `json:"queue_reservation,omitempty"`
 	// WatchMode records whether the watcher is event-driven or polling, so a
 	// degraded watcher is visible rather than merely slower.
 	WatchMode string `json:"watch_mode,omitempty"`
@@ -151,6 +157,19 @@ type RoleState struct {
 	// the operator's restart after removing the sentinel (#30); a halt that
 	// nothing cleared kept health and status red after the role recovered.
 	LastHalt *Halt `json:"last_halt,omitempty"`
+}
+
+// QueueReservation binds one ordered brief to the producer turn that reserved
+// the cycle. Source is the queue path, Done is factoryd's immutable handoff
+// path, and Taken says the state write after the rename completed. A restart
+// can therefore distinguish a pending source from a taken brief even though
+// the watched source path no longer exists in the latter case.
+type QueueReservation struct {
+	Source     string    `json:"source"`
+	Done       string    `json:"done"`
+	Turn       string    `json:"turn"`
+	ReservedAt time.Time `json:"reserved_at"`
+	Taken      bool      `json:"taken"`
 }
 
 // Block is a submission that will not be retried automatically.

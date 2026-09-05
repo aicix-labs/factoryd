@@ -1062,7 +1062,7 @@ func TestQueuedBriefRefusesCycleOpenedAfterQueueStart(t *testing.T) {
 		Runner:   &supervise.ExecRunner{Config: a.cfg, Role: "producer", Stdout: io.Discard, Stderr: io.Discard},
 		Log:      slog.New(slog.NewTextHandler(io.Discard, nil)),
 		MaxTurns: 1,
-		QueueStart: func(context.Context) (bool, string, error) {
+		QueueStart: func(context.Context, supervise.Turn) (bool, string, error) {
 			if _, err := state.Update(a.cfg.StatePath(), a.cfg.Name, func(st *state.State) error {
 				st.SetCycle(state.CycleWorking, time.Now())
 				return nil

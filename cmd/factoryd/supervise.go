@@ -60,7 +60,7 @@ func runSupervise(args []string) int {
 			}
 			return nil
 		}(),
-		QueueStart: func() func(context.Context) (bool, string, error) {
+		QueueStart: func() func(context.Context, supervise.Turn) (bool, string, error) {
 			if *role == "producer" {
 				return producerQueueStart(cfg)
 			}

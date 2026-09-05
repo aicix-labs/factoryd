@@ -14,6 +14,7 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aicix-labs/factoryd/internal/brief"
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/refresh"
@@ -21,6 +22,7 @@ import (
 	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/submit"
 	"github.com/aicix-labs/factoryd/internal/supervise"
+	"github.com/aicix-labs/factoryd/internal/watch"
 )
 
 func cfgFor(t *testing.T) *config.Config {
@@ -844,7 +846,9 @@ func TestQueueStartReconcilesAndReservesAnOperatorMergedCycle(t *testing.T) {
 			Lookup:   f.get,
 			Ancestor: f.ancestor,
 		}, nil
-	})(context.Background())
+	})(context.Background(), supervise.Turn{ID: "queue-1", Role: "producer", Triggers: []watch.Trigger{{
+		Label: brief.Label, Path: filepath.Join(cfg.BriefsDir(), "010-next.md"),
+	}}})
 	if err != nil || !started || !strings.Contains(note, "cycle finished") || !strings.Contains(note, "workdir refreshed") {
 		t.Fatalf("started=%v note=%q err=%v", started, note, err)
 	}
@@ -852,7 +856,8 @@ func TestQueueStartReconcilesAndReservesAnOperatorMergedCycle(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	if st.Cycle == nil || st.Cycle.Phase != state.CycleWorking || st.Cycle.Base != "abc123" || f.calls != 1 || f.ancCalls != 1 {
+	q := st.Role(state.RoleProducer).QueueReservation
+	if st.Cycle == nil || st.Cycle.Phase != state.CycleWorking || st.Cycle.Base != "abc123" || q == nil || q.Source != filepath.Join(cfg.BriefsDir(), "010-next.md") || q.Taken || f.calls != 1 || f.ancCalls != 1 {
 		t.Fatalf("cycle=%+v lookup=%d ancestor=%d", st.Cycle, f.calls, f.ancCalls)
 	}
 }
