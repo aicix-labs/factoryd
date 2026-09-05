@@ -61,7 +61,7 @@ func newAcceptance(t *testing.T, script string) *acceptance {
 		Producer: config.RoleSpec{Command: []string{wrapperPath(t), "sh", "-c", full}, Env: map[string]string{"PATH": os.Getenv("PATH")}, RunAs: &config.RunAs{User: u.Username}},
 		Reviewer: config.RoleSpec{Command: []string{"true"}, Env: map[string]string{"PATH": os.Getenv("PATH")}},
 	}
-	l.cfg.Supervisor = config.Supervisor{SpinWarn: 2, SpinAbort: 4, FailAbort: 3, PollIntervalSeconds: 1, BackoffSeconds: 1, ForcePoll: true}
+	l.cfg.Supervisor = config.Supervisor{SpinWarn: 2, SpinAbort: 4, FailAbort: 3, VerdictAttempts: 6, PollIntervalSeconds: 1, BackoffSeconds: 1, ForcePoll: true}
 	l.cfg.Alerts = []config.Alert{{Kind: "file", Path: filepath.Join(l.root, "alerts.log")}}
 	l.cfg.Credentials = config.Credentials{Producer: config.CredentialRef{Env: "P"}, Reviewer: config.CredentialRef{Env: "R"}}
 	if err := l.cfg.Validate(); err != nil {
@@ -640,13 +640,14 @@ touch "$FACTORYD_WORKDIR/build/heartbeat"; touch "$FACTORYD_PROGRESS"; exit 0`)
 
 // Even content changes can be meaningless (#50 review, round 8). A model
 // that rewrites a file with new content every turn and never declares is
-// bounded: after PRODUCER_VERDICT_ATTEMPTS partial turns on the verdict,
-// further partial turns are no progress, and the factory halts at
-// fail_abort with the verdict kept.
+// bounded by the SUPERVISOR (round 9): supervisor.verdict_attempts, in
+// factoryd's own state, not in anything the producer writes. Past it a
+// turn that leaves the verdict pending is credited no progress, so the
+// spin guard halts with the verdict kept.
 func TestEndlessContentChangesAreBoundedPerVerdict(t *testing.T) {
 	a := newAgentAcceptance(t, `n=$(wc -l < "$FACTORYD_ROOT/turns"); mkdir -p "$FACTORYD_WORKDIR/src"
 printf 'attempt %s\n' "$n" > "$FACTORYD_WORKDIR/src/churn.go"; touch "$FACTORYD_PROGRESS"; exit 0`)
-	a.cfg.Roles.Producer.Env["PRODUCER_VERDICT_ATTEMPTS"] = "2"
+	a.cfg.Supervisor.VerdictAttempts = 2
 	if err := a.cfg.Validate(); err != nil {
 		t.Fatal(err)
 	}
@@ -655,13 +656,56 @@ printf 'attempt %s\n' "$n" > "$FACTORYD_WORKDIR/src/churn.go"; touch "$FACTORYD_
 	if !errors.Is(err, supervise.ErrHalted) {
 		t.Fatalf("Run returned %v, want ErrHalted (turns=%d): endless content churn was unbounded", err, a.producerTurns(t))
 	}
-	if got := a.producerTurns(t); got != 2+a.cfg.Supervisor.FailAbort {
-		t.Fatalf("turns=%d, want bound=2 partial turns + fail_abort=%d", got, a.cfg.Supervisor.FailAbort)
+	if got := a.producerTurns(t); got != 2+a.cfg.Supervisor.SpinAbort {
+		t.Fatalf("turns=%d, want verdict_attempts=2 credited turns + spin_abort=%d uncredited", got, a.cfg.Supervisor.SpinAbort)
+	}
+	if rs := a.producer(t); !strings.Contains(rs.HaltReason, "spin_abort") {
+		t.Fatalf("halt reason %q", rs.HaltReason)
 	}
 	if _, err := os.Stat(vp); err != nil {
 		t.Fatal("the verdict was lost")
 	}
 	if len(a.tr.calls) != 0 {
 		t.Fatalf("submit ran: %v", a.tr.calls)
+	}
+}
+
+// Exhaustion, then a wrong-family declaration, then more partial work
+// (#50 review, round 9): the bound is the supervisor's and survives the
+// wrapper's own outcomes. Bound 2: two credited partial turns; a
+// wrong-family declaration (refused, failed, verdict kept); then partial
+// turns that are credited nothing -- the factory halts with the verdict
+// kept and nothing submitted. Nothing the producer did reset the count.
+func TestExhaustionThenWrongFamilyThenMorePartialWorkStillHalts(t *testing.T) {
+	a := newAgentAcceptance(t, `n=$(wc -l < "$FACTORYD_ROOT/turns"); mkdir -p "$FACTORYD_WORKDIR/src"
+printf 'attempt %s\n' "$n" > "$FACTORYD_WORKDIR/src/churn.go"
+if [ "$n" -eq 3 ]; then
+  printf 'producer/other\n' > "$FACTORYD_WORKDIR/.producer-branch"; printf 'msg\n' > "$FACTORYD_WORKDIR/.producer-commit-msg"
+fi
+touch "$FACTORYD_PROGRESS"; exit 0`)
+	a.cfg.Supervisor.VerdictAttempts = 2
+	if err := a.cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	vp := a.verdictFor(t, "48", "producer/fix")
+	err := a.runFor(t, 50, 30*time.Second)
+	if !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted (turns=%d): a wrong-family declaration reset the bound", err, a.producerTurns(t))
+	}
+	// Turns 1-2 credited; turn 3 failed (wrong family: rolled back, no
+	// progress, so it is the first uncredited turn on the spin guard, and
+	// the count keeps climbing); turns 4.. credited nothing; halt when the
+	// spin guard reaches spin_abort.
+	if got := a.producerTurns(t); got != 2+a.cfg.Supervisor.SpinAbort {
+		t.Fatalf("turns=%d, want 2 credited + spin_abort=%d uncredited (the wrong-family turn among them)", got, a.cfg.Supervisor.SpinAbort)
+	}
+	if _, err := os.Stat(vp); err != nil {
+		t.Fatal("the verdict was lost")
+	}
+	if len(a.tr.calls) != 0 || a.drv.opened != nil {
+		t.Fatalf("submit ran: %v", a.tr.calls)
+	}
+	if rs := a.producer(t); rs.TriggerAttempts[vp] < 3 {
+		t.Fatalf("trigger_attempts=%v; the count did not survive the wrong-family turn", rs.TriggerAttempts)
 	}
 }

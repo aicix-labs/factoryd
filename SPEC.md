@@ -1061,13 +1061,19 @@ fingerprints the tree by content, type and mode — every file's bytes, every
 symlink's target, every directory, `.git` and the control files aside — and
 the progress marker before the agent. A changed tree with no declaration yet is
 a large fix spanning turns — the model's progress stands, the verdict waits for
-the next turn, the turn is clean — up to a bound, because even content changes
-can be meaningless: after `PRODUCER_VERDICT_ATTEMPTS` (default 6) partial
-turns on the same verdict without a declaration, further partial turns are no
-progress. A touched or re-touched file, an unchanged tree with no declaration,
-a wrong family, or the bound reached: the marker is restored to its exact
-mtime and the turn exits non-zero, so the supervisor's guards count it, back
-off, and halt at `fail_abort` with the verdict still in the outbox. And a turn the
+the next turn, the turn is clean. A touched or re-touched file, an unchanged
+tree with no declaration, or a wrong family: the marker is restored to its
+exact mtime and the turn exits non-zero, so the supervisor's guards count it,
+back off, and halt at `fail_abort` with the verdict still in the outbox. **How
+many turns a verdict may be carried is the supervisor's bound, not the
+wrapper's**: a bound kept where the bounded principal can write is no bound.
+The supervisor counts, in its own state (`trigger_attempts`, per verdict
+path), the turns that left a verdict pending, resets the count when the
+verdict is consumed, and past `supervisor.verdict_attempts` (default 6)
+credits no progress to a turn that leaves it pending, whatever the turn did —
+so the spin guard halts at `spin_abort` with the verdict kept. Nothing the
+producer writes, deletes, or declares under the wrong family touches that
+count. And a turn the
 supervisor killed at its deadline counts on the fail streak whatever the
 marker says, because nothing that would have judged its work ran (§6.3); `FACTORYD_TRIGGER_PATHS` is split on the platform's path-list
 separator, so configured paths containing it are refused at load and a trigger

@@ -5,6 +5,7 @@ import (
 	"errors"
 	"fmt"
 	"os"
+	"path/filepath"
 	"strings"
 	"time"
 
@@ -340,6 +341,49 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 	// "achieving nothing" halts real work, which it did in the first
 	// implementation of this rule.
 	progressed := after.After(before)
+
+	// A verdict carried through too many turns without being consumed is
+	// credited no progress from then on, whatever the turn did (#50
+	// review): the count lives in state, the supervisor's, and resets when
+	// the trigger is consumed. Past the bound the spin guard halts with
+	// the verdict kept -- the loop this closes was a producer that kept
+	// its verdict pending and kept touching, or churning, forever.
+	overdrawn := ""
+	if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
+		rs := st.Role(state.Role(s.role))
+		if rs.TriggerAttempts == nil {
+			rs.TriggerAttempts = map[string]int{}
+		}
+		still := map[string]bool{}
+		for _, t := range remaining {
+			still[t.Path] = true
+		}
+		for _, t := range real {
+			if t.Label != "verdict" {
+				continue
+			}
+			if !still[t.Path] {
+				delete(rs.TriggerAttempts, t.Path)
+				continue
+			}
+			rs.TriggerAttempts[t.Path]++
+			if rs.TriggerAttempts[t.Path] > s.cfg.Supervisor.VerdictAttempts {
+				overdrawn = fmt.Sprintf("verdict %s carried through %d turns without being consumed (verdict_attempts=%d)", filepath.Base(t.Path), rs.TriggerAttempts[t.Path], s.cfg.Supervisor.VerdictAttempts)
+			}
+		}
+		for p := range rs.TriggerAttempts {
+			if !still[p] {
+				delete(rs.TriggerAttempts, p)
+			}
+		}
+		return nil
+	}); err != nil {
+		return false, err
+	}
+	if overdrawn != "" && progressed {
+		s.log.Warn("progress not credited: "+overdrawn, "turn", turn.ID)
+		progressed = false
+	}
 
 	// A non-zero exit or a timeout is a failed turn whatever happened to the
 	// trigger. The spin guard cannot see a turn that consumed its trigger and

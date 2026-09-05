@@ -129,6 +129,12 @@ type RoleState struct {
 	// submission that succeeds -- never by progress, a restart, or a new
 	// turn (#42).
 	Blocked *Block `json:"blocked,omitempty"`
+	// TriggerAttempts counts, per pending trigger path, the turns that ran
+	// with it and left it pending. Reset when the trigger is consumed. The
+	// supervisor's own bound on how long a verdict may be carried (#50
+	// review): kept here, root-owned, not in a handoff directory the
+	// producer writes.
+	TriggerAttempts map[string]int `json:"trigger_attempts,omitempty"`
 	// LeftoverTurns counts turns that recorded progress but left processes
 	// behind after the leader exited. The strays are killed and verified
 	// gone; the turn stands (#33). The count is the hygiene signal an

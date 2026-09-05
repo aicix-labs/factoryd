@@ -262,6 +262,13 @@ type Supervisor struct {
 	// guard never sees it. Observed in production as a factory idle for 3.5h
 	// with completed work stranded and every signal green (issue #12).
 	FailAbort int `json:"fail_abort,omitempty"`
+	// VerdictAttempts bounds the turns a verdict trigger may be carried
+	// through without being consumed while still crediting progress.
+	// Past it, a turn that leaves the verdict pending is credited no
+	// progress whatever it did, so the spin guard halts with the verdict
+	// kept. The bound is the supervisor's, in its own state: a bound the
+	// bounded principal could rewrite is no bound (#50 review). Default 6.
+	VerdictAttempts int `json:"verdict_attempts,omitempty"`
 	// PollIntervalSeconds is the watcher poll period, and the periodic
 	// re-check interval even when inotify is in use.
 	PollIntervalSeconds int `json:"poll_interval_seconds,omitempty"`
@@ -275,13 +282,15 @@ type Supervisor struct {
 // Defaults, applied by Load. They are named rather than inlined so doctor and
 // the docs can quote the same numbers.
 const (
-	DefaultSpinWarn       = 3
-	DefaultSpinAbort      = 8
-	DefaultFailAbort      = 5
-	DefaultPollInterval   = 2
-	DefaultBackoffSeconds = 15
-	DefaultTurnTimeout    = 3600
-	DefaultGateTimeout    = 900
+	DefaultSpinWarn  = 3
+	DefaultSpinAbort = 8
+	DefaultFailAbort = 5
+	// DefaultVerdictAttempts: partial turns a verdict may be carried through.
+	DefaultVerdictAttempts = 6
+	DefaultPollInterval    = 2
+	DefaultBackoffSeconds  = 15
+	DefaultTurnTimeout     = 3600
+	DefaultGateTimeout     = 900
 
 	DefaultHealthInterval  = 60
 	DefaultAlertAfter      = 3
@@ -512,6 +521,9 @@ func (c *Config) applyDefaults() {
 	}
 	if c.Supervisor.SpinAbort == 0 {
 		c.Supervisor.SpinAbort = DefaultSpinAbort
+	}
+	if c.Supervisor.VerdictAttempts == 0 {
+		c.Supervisor.VerdictAttempts = DefaultVerdictAttempts
 	}
 	if c.Supervisor.FailAbort == 0 {
 		c.Supervisor.FailAbort = DefaultFailAbort
@@ -788,6 +800,9 @@ func (c *Config) Validate() error {
 	}
 	if sv.FailAbort <= 0 {
 		add("supervisor.fail_abort must be positive")
+	}
+	if sv.VerdictAttempts <= 0 {
+		add("supervisor.verdict_attempts must be positive")
 	}
 	if sv.PollIntervalSeconds <= 0 {
 		add("supervisor.poll_interval_seconds must be positive")
