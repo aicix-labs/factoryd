@@ -25,6 +25,7 @@ import (
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/gittransport"
+	"github.com/aicix-labs/factoryd/internal/proc"
 	"github.com/aicix-labs/factoryd/internal/scm"
 	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/supervise"
@@ -291,6 +292,40 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 	if err := deps.Git.Checkout(ctx, declared, "refs/remotes/factoryd/"+cfg.TargetBranch); err != nil {
 		return Result{}, transient(wrap(ExitConfig, err, "creating %s from %s", declared, cfg.TargetBranch))
 	}
+	// The early check above reports an already-active queued handoff before
+	// any submission work starts. This is the durable barrier for the opposite
+	// order: after fetching but before the first producer-worktree copy, claim
+	// exclusive use through CopyTree and the gate outcome. Queue admission uses
+	// the same state lock, so it either wins before this point (and we refuse
+	// before CopyTree) or waits until the gate result is complete.
+	leaseHolder, err := proc.Self("submit")
+	if err != nil {
+		return Result{}, transient(wrap(ExitConfig, err, "identifying the submission process for the producer-worktree lease"))
+	}
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		return st.AcquireProducerWorktreeLease(leaseHolder, deps.Now())
+	}); err != nil {
+		if errors.Is(err, state.ErrProducerLifecycleBusy) || errors.Is(err, state.ErrProducerWorktreeBusy) {
+			return Result{}, blocked(wrap(ExitConfig, err, "refusing to use the producer worktree while a queued handoff or submission owns it"))
+		}
+		return Result{}, transient(wrap(ExitConfig, err, "leasing the producer worktree before submission"))
+	}
+	leaseHeld := true
+	releaseWorktreeLease := func() {
+		if !leaseHeld {
+			return
+		}
+		if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+			return st.ReleaseProducerWorktreeLease(leaseHolder)
+		}); err != nil {
+			// A later queue admission proves this process has exited before
+			// reclaiming a stale lease. Keep it durable rather than guessing.
+			fmt.Fprintf(log, "submission lease: could not release producer worktree: %v\n", err)
+			return
+		}
+		leaseHeld = false
+	}
+	defer releaseWorktreeLease()
 	if err := gittransport.CopyTree(work, cfg.Paths.SubmitRepo); err != nil {
 		return Result{}, transient(wrap(ExitConfig, err, "copying the producer's tree into the submit repository"))
 	}
@@ -476,6 +511,9 @@ func Run(ctx context.Context, cfg *config.Config, deps Deps) (Result, error) {
 		}
 		return Result{}, transient(wrap(ExitConfig, err, "recording the submission before the push"))
 	}
+	// CycleSubmitting is its own queue barrier, so the worktree lease is no
+	// longer needed once the green gate has been durably recorded.
+	releaseWorktreeLease()
 
 	// Non-force: a branch that somehow already exists with different content
 	// is rejected by git itself. The push cannot modify anything.

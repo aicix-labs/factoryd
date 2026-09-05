@@ -321,6 +321,10 @@ func QueueStart(cfg *config.Config, mkDeps func(ctx context.Context) (Deps, erro
 				note = "brief queue waiting: another queued brief reservation is still active"
 				return nil
 			}
+			if err := st.PermitQueuedProducerHandoff(); err != nil {
+				note = "brief queue waiting: " + err.Error()
+				return nil
+			}
 			// An open cycle may have landed since the previous turn. Build the
 			// dependencies once and reuse them for the refresh after a proved
 			// merge, matching BeforeTurn's locked sequence.

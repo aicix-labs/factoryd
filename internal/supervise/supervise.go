@@ -607,6 +607,10 @@ func (s *Supervisor) startQueuedCycle(ctx context.Context, turn Turn) (bool, str
 			reason = "another queued brief reservation is still active"
 			return nil
 		}
+		if err := st.PermitQueuedProducerHandoff(); err != nil {
+			reason = err.Error()
+			return nil
+		}
 		if st.Cycle == nil {
 			reason = "no cycle record; run factoryd refresh --force before taking queued work"
 			return nil

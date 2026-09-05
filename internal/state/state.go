@@ -31,9 +31,15 @@ import (
 // silently quarantining the old handoff files.
 const SchemaVersion = 2
 
-// ErrProducerLifecycleBusy means a queued producer handoff has not finished
-// its agent process, so root-side cycle transitions must wait.
-var ErrProducerLifecycleBusy = errors.New("producer queued handoff is active")
+var (
+	// ErrProducerLifecycleBusy means a queued producer handoff has not
+	// finished its agent process, so root-side cycle transitions must wait.
+	ErrProducerLifecycleBusy = errors.New("producer queued handoff is active")
+	// ErrProducerWorktreeBusy means a root-side submission has leased the
+	// producer worktree while it copies and gates a declared change. A queued
+	// handoff must wait rather than start an agent beside that use.
+	ErrProducerWorktreeBusy = errors.New("producer worktree is leased for submission")
+)
 
 // Role is one of the two agent roles.
 type Role string
@@ -113,6 +119,10 @@ type RoleState struct {
 	// whether to take the source again, restore a pre-record crash window, or
 	// resume the already-taken done/ handoff. The producer never writes it.
 	QueueReservation *QueueReservation `json:"queue_reservation,omitempty"`
+	// SubmissionLease serializes root-side use of the producer worktree with
+	// admission of the next queued brief. It is held before CopyTree through
+	// the gate outcome, never in a producer-writable directory.
+	SubmissionLease *ProducerWorktreeLease `json:"submission_lease,omitempty"`
 	// WatchMode records whether the watcher is event-driven or polling, so a
 	// degraded watcher is visible rather than merely slower.
 	WatchMode string `json:"watch_mode,omitempty"`
@@ -183,6 +193,15 @@ type QueueReservation struct {
 	ProcessFinished bool `json:"process_finished,omitempty"`
 }
 
+// ProducerWorktreeLease records the root process that is copying and gating a
+// producer declaration. The process handle makes a crash recoverable: queue
+// admission can clear a lease only after proving its owner is gone, and blocks
+// safely if that proof cannot be made.
+type ProducerWorktreeLease struct {
+	Holder     proc.Ref  `json:"holder"`
+	AcquiredAt time.Time `json:"acquired_at"`
+}
+
 // PermitProducerCycleMutation refuses a root-side lifecycle mutation while a
 // queued handoff's producer process has not finished. Queue reservation makes
 // CycleWorking mean more than a phase: it binds a specific handoff to the
@@ -195,6 +214,65 @@ func (s *State) PermitProducerCycleMutation() error {
 		return nil
 	}
 	return fmt.Errorf("%w: %q is reserved for turn %s, whose process has not finished", ErrProducerLifecycleBusy, q.Source, q.Turn)
+}
+
+// AcquireProducerWorktreeLease is the durable barrier immediately before
+// root-side CopyTree. It gives a queued handoff priority if the handoff won
+// the state lock first, and otherwise makes queue admission wait until the
+// submission has finished using the producer worktree and gate result.
+func (s *State) AcquireProducerWorktreeLease(holder proc.Ref, now time.Time) error {
+	if holder.PID <= 0 || holder.StartToken == "" {
+		return fmt.Errorf("%w: submission lease holder is not an exact process reference", ErrProducerWorktreeBusy)
+	}
+	if err := s.PermitProducerCycleMutation(); err != nil {
+		return err
+	}
+	if err := s.permitQueuedProducerHandoff(); err != nil {
+		return err
+	}
+	s.Role(RoleProducer).SubmissionLease = &ProducerWorktreeLease{Holder: holder, AcquiredAt: now}
+	return nil
+}
+
+// PermitQueuedProducerHandoff is called under state.Update by queue
+// admission. A live submit lease is a deliberate queue deferral; a dead owner
+// is reclaimed in this same locked update, so a crashed submit cannot strand
+// the queue indefinitely.
+func (s *State) PermitQueuedProducerHandoff() error {
+	return s.permitQueuedProducerHandoff()
+}
+
+func (s *State) permitQueuedProducerHandoff() error {
+	rs := s.Role(RoleProducer)
+	lease := rs.SubmissionLease
+	if lease == nil {
+		return nil
+	}
+	alive, err := lease.Holder.Alive()
+	if err != nil {
+		return fmt.Errorf("%w: cannot prove submission lease holder %s is gone: %v", ErrProducerWorktreeBusy, lease.Holder, err)
+	}
+	if alive {
+		return fmt.Errorf("%w: holder %s acquired it at %s", ErrProducerWorktreeBusy, lease.Holder, lease.AcquiredAt.UTC().Format(time.RFC3339))
+	}
+	rs.SubmissionLease = nil
+	return nil
+}
+
+// ReleaseProducerWorktreeLease clears only the lease held by this exact
+// process. A mismatched release is refused rather than allowing one submit to
+// erase another submit's barrier.
+func (s *State) ReleaseProducerWorktreeLease(holder proc.Ref) error {
+	rs := s.Role(RoleProducer)
+	lease := rs.SubmissionLease
+	if lease == nil {
+		return nil
+	}
+	if lease.Holder.PID != holder.PID || lease.Holder.StartToken != holder.StartToken {
+		return fmt.Errorf("%w: refusing to release lease held by %s", ErrProducerWorktreeBusy, lease.Holder)
+	}
+	rs.SubmissionLease = nil
+	return nil
 }
 
 // Block is a submission that will not be retried automatically.
@@ -600,6 +678,11 @@ func (s *State) Validate() error {
 		}
 		if rs.FailStreak < 0 {
 			return fmt.Errorf("state: role %s has a negative fail streak", r)
+		}
+		if lease := rs.SubmissionLease; lease != nil {
+			if lease.AcquiredAt.IsZero() || lease.Holder.PID <= 0 || lease.Holder.StartToken == "" {
+				return fmt.Errorf("state: role %s has an incomplete producer worktree submission lease", r)
+			}
 		}
 		for i, p := range rs.Pending {
 			if p.Label == "" || p.Path == "" {

@@ -862,6 +862,81 @@ func TestQueueStartReconcilesAndReservesAnOperatorMergedCycle(t *testing.T) {
 	}
 }
 
+// A submit that won the producer-worktree barrier must finish copying and
+// gating before a queued brief can refresh and launch an agent beside it.
+func TestQueueStartDefersWhileSubmissionLeaseIsLive(t *testing.T) {
+	cfg := cfgFor(t)
+	holder, err := proc.Self("submit-test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		st.SetCycle(state.CycleNew, time.Now())
+		return st.AcquireProducerWorktreeLease(holder, time.Now())
+	}); err != nil {
+		t.Fatal(err)
+	}
+	depsBuilt := 0
+	started, note, err := refresh.QueueStart(cfg, func(context.Context) (refresh.Deps, error) {
+		depsBuilt++
+		return refresh.Deps{}, nil
+	})(context.Background(), supervise.Turn{ID: "queue-lease", Role: "producer", Triggers: []watch.Trigger{{
+		Label: brief.Label, Path: filepath.Join(cfg.BriefsDir(), "010-next.md"),
+	}}})
+	if err != nil || started || !strings.Contains(note, state.ErrProducerWorktreeBusy.Error()) {
+		t.Fatalf("started=%v note=%q err=%v, want queue deferral for the live submission lease", started, note, err)
+	}
+	if depsBuilt != 0 {
+		t.Fatalf("queue built refresh dependencies %d times while a submit held the worktree", depsBuilt)
+	}
+	st, err := state.Load(cfg.StatePath(), cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := st.Role(state.RoleProducer)
+	if rs.SubmissionLease == nil || rs.QueueReservation != nil {
+		t.Fatalf("queue changed active submission lease state: %+v", rs)
+	}
+}
+
+// The durable submission barrier carries an exact process reference rather
+// than a timeout. Once that submit process has died, the next admission
+// reclaims the stale lease inside its locked decision and does not strand the
+// first queued brief.
+func TestQueueStartReclaimsADeadSubmissionLease(t *testing.T) {
+	cfg := cfgFor(t)
+	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		st.SetCycle(state.CycleNew, time.Now())
+		st.Role(state.RoleProducer).SubmissionLease = &state.ProducerWorktreeLease{
+			Holder:     proc.Ref{PID: os.Getpid(), StartToken: "not-this-process"},
+			AcquiredAt: time.Now(),
+		}
+		return nil
+	}); err != nil {
+		t.Fatal(err)
+	}
+	started, note, err := refresh.QueueStart(cfg, func(context.Context) (refresh.Deps, error) {
+		return refresh.Deps{
+			Fetch:  func(context.Context, string) error { return nil },
+			Bundle: func(context.Context, string, string) (string, error) { return "abc123", nil },
+			Apply:  func(context.Context, string, string) (string, error) { return "abc123", nil },
+		}, nil
+	})(context.Background(), supervise.Turn{ID: "queue-after-crash", Role: "producer", Triggers: []watch.Trigger{{
+		Label: brief.Label, Path: filepath.Join(cfg.BriefsDir(), "010-next.md"),
+	}}})
+	if err != nil || !started {
+		t.Fatalf("started=%v note=%q err=%v, want dead submission lease reclaimed", started, note, err)
+	}
+	st, err := state.Load(cfg.StatePath(), cfg.Name)
+	if err != nil {
+		t.Fatal(err)
+	}
+	rs := st.Role(state.RoleProducer)
+	if rs.SubmissionLease != nil || rs.QueueReservation == nil {
+		t.Fatalf("dead submission lease did not become a queue reservation: %+v", rs)
+	}
+}
+
 // End to end: the reviewer signalled operator-gated, a human merged !55,
 // last_verdict still says operator-gated. The next brief's before-turn
 // step reconciles under the lock, finishes the cycle, and refreshes to

@@ -4,9 +4,6 @@ import (
 	"bytes"
 	"context"
 	"errors"
-	"github.com/aicix-labs/factoryd/internal/signal"
-	"github.com/aicix-labs/factoryd/internal/state"
-	"github.com/aicix-labs/factoryd/internal/supervise"
 	"io"
 	"os"
 	"os/exec"
@@ -16,10 +13,16 @@ import (
 	"testing"
 	"time"
 
+	"github.com/aicix-labs/factoryd/internal/brief"
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/gittransport"
+	"github.com/aicix-labs/factoryd/internal/refresh"
 	"github.com/aicix-labs/factoryd/internal/scm"
+	"github.com/aicix-labs/factoryd/internal/signal"
+	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/submit"
+	"github.com/aicix-labs/factoryd/internal/supervise"
+	"github.com/aicix-labs/factoryd/internal/watch"
 )
 
 // ---------- fakes ----------
@@ -61,14 +64,20 @@ func (f *fakeTransport) Push(_ context.Context, r string) error {
 }
 
 type fakeGit struct {
-	tree     string // what Tree returns
-	calls    []string
-	nothing  bool // Commit reports nothing to commit
-	commitOK string
+	tree          string // what Tree returns
+	calls         []string
+	nothing       bool // Commit reports nothing to commit
+	commitOK      string
+	afterCheckout func()
 }
 
 func (g *fakeGit) Checkout(_ context.Context, branch, start string) error {
 	g.calls = append(g.calls, "checkout "+branch+" from "+start)
+	if g.afterCheckout != nil {
+		after := g.afterCheckout
+		g.afterCheckout = nil
+		after()
+	}
 	return nil
 }
 func (g *fakeGit) Commit(_ context.Context, msg, name, email string) (string, bool, error) {
@@ -1346,6 +1355,57 @@ func TestSubmitDoesNotRunOrReportARedGateBesideAnUnfinishedQueuedHandoff(t *test
 		if exists(filepath.Join(l.cfg.InboxDir(), name)) {
 			t.Fatalf("submit wrote inbox/%s beside an active queued handoff", name)
 		}
+	}
+}
+
+// The early preflight is deliberately not the barrier: a queue admission can
+// win the state lock after it, while submit is fetching. The durable lease is
+// acquired immediately before CopyTree, sees that admitted handoff, and stops
+// before it can gate the newly changing producer worktree or wake a reviewer.
+func TestQueueAdmissionBetweenSubmitPreflightAndGatePreventsGateAndWake(t *testing.T) {
+	l := newLab(t)
+	l.edit(t, "src/a.go")
+	l.declare(t, "producer/fix", "gate: queued lifecycle\n\nbody")
+	l.gate.exit = 1
+	var admissionErr error
+	var admitted bool
+	l.git.afterCheckout = func() {
+		admitted, _, admissionErr = refresh.QueueStart(l.cfg, func(context.Context) (refresh.Deps, error) {
+			return refresh.Deps{
+				Fetch:  func(context.Context, string) error { return nil },
+				Bundle: func(context.Context, string, string) (string, error) { return "abc123", nil },
+				Apply:  func(context.Context, string, string) (string, error) { return "abc123", nil },
+			}, nil
+		})(context.Background(), supervise.Turn{ID: "producer-queued", Role: "producer", Triggers: []watch.Trigger{{
+			Label: brief.Label, Path: filepath.Join(l.cfg.BriefsDir(), "010-next.md"),
+		}}})
+	}
+
+	_, err := submit.Run(context.Background(), l.cfg, l.deps)
+	if admissionErr != nil {
+		t.Fatalf("queue admission after submit preflight: %v", admissionErr)
+	}
+	if !admitted {
+		t.Fatal("queue admission did not win the barrier after submit's preflight")
+	}
+	var got *submit.Error
+	if !errors.As(err, &got) || got.Kind != supervise.DispositionBlocked || !errors.Is(err, state.ErrProducerLifecycleBusy) {
+		t.Fatalf("submit error=%v, want blocked queued-handoff refusal", err)
+	}
+	if l.gate.ran {
+		t.Fatal("submit ran a gate after queue admission won the worktree barrier")
+	}
+	for _, name := range []string{"question.md", "wake"} {
+		if exists(filepath.Join(l.cfg.InboxDir(), name)) {
+			t.Fatalf("submit wrote inbox/%s after queue admission won the barrier", name)
+		}
+	}
+	st, loadErr := state.Load(l.cfg.StatePath(), l.cfg.Name)
+	if loadErr != nil {
+		t.Fatal(loadErr)
+	}
+	if st.Role(state.RoleProducer).QueueReservation == nil {
+		t.Fatal("queue admission was not durably recorded")
 	}
 }
 
