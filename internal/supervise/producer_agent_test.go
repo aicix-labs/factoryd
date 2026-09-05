@@ -107,10 +107,55 @@ func TestProducerAgentWrapperComposesTheProtocolAroundTheBrief(t *testing.T) {
 		if !c.wantDecl && (named || !strings.Contains(prompt, "No verdict this turn asks for a declaration")) {
 			t.Fatalf("%s: the producer was told to re-declare, or not told to declare nothing:\n%s", c.kind, prompt)
 		}
-		if _, err := os.Stat(vpath); !os.IsNotExist(err) {
+		// The fake agent touched progress and declared nothing. For merged
+		// and operator-gated that is the right outcome and the trigger is
+		// consumed; for changes-requested the verdict was NOT acted on, and
+		// the trigger is kept for the retry (#50 review).
+		_, statErr := os.Stat(vpath)
+		if c.wantDecl && statErr != nil {
+			t.Fatalf("%s: the selected verdict was consumed by a turn that declared nothing; the retry would have no verdict", c.kind)
+		}
+		if !c.wantDecl && !os.IsNotExist(statErr) {
 			t.Fatalf("%s: the verdict trigger was not consumed", c.kind)
 		}
+		os.Remove(vpath)
 	}
+
+	// The selected changes-requested trigger is consumed only by a turn
+	// that succeeded AND declared completely. Non-zero exit: kept. Zero
+	// with progress and no intent: kept (proved above). Zero with one
+	// control file: kept. Zero with both: consumed.
+	declaring := func(files string) string {
+		return "cat > " + got + " && touch " + progress + " && " + files
+	}
+	cases := []struct {
+		name  string
+		agent string
+		keep  bool
+	}{
+		{"exit 7 after declaring both", declaring("printf 'fix/{example}\\n' > "+work+"/.producer-branch && printf 'msg\\n' > "+work+"/.producer-commit-msg") + " && exit 7", true},
+		{"only .producer-branch", declaring("printf 'fix/{example}\\n' > " + work + "/.producer-branch"), true},
+		{"only .producer-commit-msg", declaring("printf 'msg\\n' > " + work + "/.producer-commit-msg"), true},
+		{"empty control files", declaring(": > " + work + "/.producer-branch && : > " + work + "/.producer-commit-msg"), true},
+		{"both files, exit 0", declaring("printf 'fix/{example}\\n' > " + work + "/.producer-branch && printf 'msg\\n' > " + work + "/.producer-commit-msg"), false},
+	}
+	for _, c := range cases {
+		os.Remove(filepath.Join(work, ".producer-branch"))
+		os.Remove(filepath.Join(work, ".producer-commit-msg"))
+		os.WriteFile(vpath, []byte("{}"), 0o644)
+		agent = c.agent
+		_, _ = run("verdict", vpath, line(vpath, "48", "changes-requested", "fix/{example}"), "")
+		_, err := os.Stat(vpath)
+		if c.keep && err != nil {
+			t.Fatalf("%s: the selected verdict was consumed", c.name)
+		}
+		if !c.keep && !os.IsNotExist(err) {
+			t.Fatalf("%s: the selected verdict was not consumed after a complete declaration", c.name)
+		}
+	}
+	agent = "cat > " + got + " && touch " + progress
+	os.Remove(filepath.Join(work, ".producer-branch"))
+	os.Remove(filepath.Join(work, ".producer-commit-msg"))
 
 	// Two changes-requested verdicts (#50 review): a turn has one
 	// declaration, so exactly one is acted on -- the first -- its family
@@ -122,6 +167,7 @@ func TestProducerAgentWrapperComposesTheProtocolAroundTheBrief(t *testing.T) {
 		os.WriteFile(p, []byte("{}"), 0o644)
 	}
 	tsv := line(p48, "48", "merged", "fix/done") + line(p49, "49", "changes-requested", "fix/first") + line(p50, "50", "changes-requested", "fix/second")
+	agent = declaring("printf 'fix/first\\n' > " + work + "/.producer-branch && printf 'msg\\n' > " + work + "/.producer-commit-msg")
 	prompt, rc = run("verdict", p48+":"+p49+":"+p50, tsv, "")
 	if rc != 0 {
 		t.Fatalf("two changes-requested: rc=%d", rc)
@@ -145,6 +191,7 @@ func TestProducerAgentWrapperComposesTheProtocolAroundTheBrief(t *testing.T) {
 		t.Fatal("the unselected changes-requested trigger was consumed; that verdict is lost")
 	}
 	// The next turn sees the remaining one and acts on it.
+	agent = declaring("printf 'fix/second\\n' > " + work + "/.producer-branch && printf 'msg\\n' > " + work + "/.producer-commit-msg")
 	prompt, rc = run("verdict", p50, line(p50, "50", "changes-requested", "fix/second"), "")
 	if rc != 0 || !strings.Contains(prompt, "verbatim:\n    fix/second\n") {
 		t.Fatalf("the kept verdict was not acted on next: rc=%d\n%s", rc, prompt)
@@ -152,6 +199,9 @@ func TestProducerAgentWrapperComposesTheProtocolAroundTheBrief(t *testing.T) {
 	if _, err := os.Stat(p50); !os.IsNotExist(err) {
 		t.Fatal("the kept verdict's trigger was not consumed on its own turn")
 	}
+	agent = "cat > " + got + " && touch " + progress
+	os.Remove(filepath.Join(work, ".producer-branch"))
+	os.Remove(filepath.Join(work, ".producer-commit-msg"))
 	// An old factoryd without the rendering: refused, nothing consumed.
 	os.WriteFile(p48, []byte("{}"), 0o644)
 	if _, rc := run("verdict", p48, "", ""); rc != 3 {

@@ -615,6 +615,17 @@ func (c *Config) Validate() error {
 	if len(c.Health.Caches) > 0 && c.Paths.CacheRoot == "" {
 		add("health.caches declared but paths.cache_root is empty; reclamation deletes, and only inside a dedicated cache root")
 	}
+	// A configured path with a control character in it is a path that
+	// cannot be carried exactly in any line- or tab-delimited handoff (#50
+	// review), and no deployment means one. Refused at load.
+	for _, p := range []struct{ name, path string }{
+		{"paths.root", c.Paths.Root}, {"paths.producer_workdir", c.Paths.ProducerWorkdir},
+		{"paths.submit_repo", c.Paths.SubmitRepo}, {"paths.cache_root", c.Paths.CacheRoot},
+	} {
+		if strings.ContainsAny(p.path, "\t\n\r") {
+			add("%s %q contains a control character", p.name, p.path)
+		}
+	}
 	if cr := c.Paths.CacheRoot; cr != "" {
 		switch {
 		case !filepath.IsAbs(cr):

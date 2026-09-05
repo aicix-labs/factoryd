@@ -292,8 +292,17 @@ func (r *ExecRunner) env(t Turn) ([]string, error) {
 		// refnames, so no field can contain a tab or a newline, and a
 		// wrapper needs no JSON parser to read this exactly. "{" and the
 		// like are ordinary in a family name and pass through untouched.
+		// Every field is checked, the path included: a path is not a
+		// refname, and a tab or newline in one would shift the fields and
+		// make a wrapper select the wrong verdict, or none, and consume it
+		// (#50 review). Refused, not escaped: the turn does not start.
 		var tsv strings.Builder
 		for _, v := range verdicts {
+			for _, f := range []struct{ name, val string }{{"path", v.Path}, {"change_id", v.ChangeID}, {"kind", v.Kind}, {"branch", v.Branch}, {"declared_branch", v.DeclaredBranch}} {
+				if strings.ContainsAny(f.val, "\t\n\r") {
+					return nil, fmt.Errorf("verdict %s: %s %q contains a tab or newline; FACTORYD_VERDICTS_TSV cannot carry it exactly", v.ChangeID, f.name, f.val)
+				}
+			}
 			fmt.Fprintf(&tsv, "%s\t%s\t%s\t%s\t%s\n", v.Path, v.ChangeID, v.Kind, v.Branch, v.DeclaredBranch)
 		}
 		factoryd["FACTORYD_VERDICTS_TSV"] = tsv.String()

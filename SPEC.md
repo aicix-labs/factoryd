@@ -1047,9 +1047,14 @@ runner's tab-separated rendering of the same verdicts (git refuses control
 characters in refnames, so no field can hold a tab or newline, and `{` in a
 family is only a character), never parsed out of JSON by a shell. **One
 `changes-requested` verdict per turn**: a turn has one declaration, so the
-wrapper selects the first, names it, consumes its trigger, and *keeps* the
-other changes-requested triggers for their own turns — a consumed verdict
-nobody acted on is lost for good; then the brief; then it runs the agent
+wrapper selects the first, names it, and *keeps* the other changes-requested
+triggers for their own turns — a consumed verdict nobody acted on is lost for
+good; the selected one is consumed only by a turn that exited zero AND left
+both control files as non-empty regular files, so a model that failed, or
+exited clean having declared nothing, leaves the verdict for the retry, which
+is then told it again; every TSV field, the path included, is refused by the
+runner if it holds a tab or newline, and configured paths with control
+characters are refused at load; then the brief; then it runs the agent
 through `turn-wrapper.sh` and consumes the triggers it acted on — never the
 supervisor's retry marker, which the supervisor owns and keeps on a halt as
 the record of what was retried. It refuses to run an agent with a

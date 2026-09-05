@@ -534,3 +534,24 @@ func TestVerdictTurnIsGivenATabSeparatedRendering(t *testing.T) {
 		t.Fatalf("no-verdict turn: %q", out2.String())
 	}
 }
+
+// A verdict path with a tab in it cannot be carried exactly in the TSV;
+// the turn does not start (#50 review). Paths are not refnames.
+func TestVerdictPathWithATabRefusesTheTurn(t *testing.T) {
+	fx, r, _ := execFixture(t, []string{"true"}, 30)
+	dir := filepath.Join(fx.outbox, "odd\tdir")
+	if err := os.MkdirAll(dir, 0o755); err != nil {
+		t.Fatal(err)
+	}
+	p := filepath.Join(dir, "48.json")
+	v := state.Verdict{ChangeID: "48", Kind: "merged", SHA: "s", Summary: "s", Branch: "fix/a-0123456789", DeclaredBranch: "fix/a"}
+	b, _ := json.Marshal(v)
+	if err := os.WriteFile(p, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	tn := turn(fx, 0)
+	tn.Triggers = []watch.Trigger{{Label: "verdict", Path: p}}
+	if _, err := r.Run(context.Background(), tn, nil); err == nil || !strings.Contains(err.Error(), "tab or newline") {
+		t.Fatalf("a verdict path with a tab started the turn: %v", err)
+	}
+}

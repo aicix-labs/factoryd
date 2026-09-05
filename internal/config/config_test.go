@@ -483,3 +483,16 @@ func TestCacheRootMayNotContainTheOperatorCredential(t *testing.T) {
 		t.Fatalf("a token outside the cache root refused: %v", err)
 	}
 }
+
+// A configured path with a control character cannot be carried exactly in
+// a line- or tab-delimited handoff; refused at load (#50 review).
+func TestPathsWithControlCharactersAreRefused(t *testing.T) {
+	c, err := config.Load("../../examples/factory.github.json")
+	if err != nil {
+		t.Fatal(err)
+	}
+	c.Paths.Root = "/var/lib/factoryd/odd\tname"
+	if err := c.Validate(); err == nil || !strings.Contains(err.Error(), "paths.root") || !strings.Contains(err.Error(), "control character") {
+		t.Fatalf("a root with a tab was accepted: %v", err)
+	}
+}

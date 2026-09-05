@@ -113,6 +113,7 @@ prompt=$(compose) || { echo "producer-turn-agent: could not compose the prompt" 
 # Which changes-requested triggers stay for later turns: every one but the
 # selected. (merged / operator-gated triggers carry no work; consumed.)
 keep=""
+sel_path=""
 sel=$(selected_cr)
 if [ -n "$sel" ]; then
   sel_path=$(printf '%s' "$sel" | cut -f1)
@@ -135,7 +136,23 @@ rc=$?
 # owns it, removes it after the retry ran, and keeps it on purpose when the
 # retry halts, as the record of what was being retried.
 # A changes-requested trigger not acted on this turn is kept: it is the
-# next turn's work, and deleting it would lose that verdict for good.
+# next turn's work, and deleting it would lose that verdict for good. The
+# SELECTED one is consumed only when the turn both succeeded and left a
+# complete declaration (#50 review): a model that exited non-zero, or
+# exited clean having declared nothing, has not acted on the verdict, and
+# a retry without the trigger would have no verdict, family or work to
+# retry. Then the supervisor's guards see an unconsumed trigger and say so.
+declared=0
+if [ "$rc" -eq 0 ] \
+   && [ -f "$FACTORYD_WORKDIR/.producer-branch" ] && [ ! -L "$FACTORYD_WORKDIR/.producer-branch" ] && [ -s "$FACTORYD_WORKDIR/.producer-branch" ] \
+   && [ -f "$FACTORYD_WORKDIR/.producer-commit-msg" ] && [ ! -L "$FACTORYD_WORKDIR/.producer-commit-msg" ] && [ -s "$FACTORYD_WORKDIR/.producer-commit-msg" ]; then
+  declared=1
+fi
+if [ -n "$sel" ] && [ "$declared" -eq 0 ]; then
+  keep="$keep
+$sel_path"
+  echo "producer-turn-agent: the selected changes-requested verdict is kept: the turn $( [ "$rc" -eq 0 ] && echo 'declared no complete intent' || echo "exited $rc" )" >&2
+fi
 IFS=:; for p in ${FACTORYD_TRIGGER_PATHS:-}; do
   case "$p" in *-retry) continue;; esac
   [ -n "$p" ] || continue

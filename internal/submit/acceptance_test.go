@@ -2,6 +2,7 @@ package submit_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -359,5 +360,110 @@ IFS=:; for p in $FACTORYD_TRIGGER_PATHS; do rm -f "$p"; done
 	}
 	if a.producer(t).Blocked != nil {
 		t.Fatal("the operator's successful submission did not clear the block")
+	}
+}
+
+// ---------- #50: the agent wrapper on a real supervisor ----------
+
+func agentWrapperPath(t *testing.T) string {
+	t.Helper()
+	p, err := filepath.Abs(filepath.Join("..", "..", "examples", "producer-turn-agent.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+// newAgentAcceptance runs the producer through examples/producer-turn-
+// agent.sh around a scripted "model" that reads its prompt on stdin.
+func newAgentAcceptance(t *testing.T, model string) *acceptance {
+	t.Helper()
+	a := newAcceptance(t, "true")
+	full := fmt.Sprintf("cat > %s.prompt; echo run >> %s\n%s", a.marker, a.marker, model)
+	a.cfg.Roles.Producer.Command = []string{agentWrapperPath(t), "sh", "-c", full}
+	if err := a.cfg.Validate(); err != nil {
+		t.Fatal(err)
+	}
+	return a
+}
+
+func (a *acceptance) verdictFor(t *testing.T, id, family string) string {
+	t.Helper()
+	v := state.Verdict{ChangeID: id, Kind: state.VerdictChangesRequested, SHA: "abc", Summary: "fix it", At: time.Now(),
+		Branch: family + "-0123456789", DeclaredBranch: family}
+	b, _ := json.Marshal(v)
+	p := filepath.Join(a.cfg.OutboxDir(), id+".json")
+	if err := os.WriteFile(p, b, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	return p
+}
+
+func (a *acceptance) lastPrompt(t *testing.T) string {
+	t.Helper()
+	b, _ := os.ReadFile(a.marker + ".prompt")
+	return string(b)
+}
+
+// A changes-requested verdict, and the model exits non-zero. The verdict
+// trigger survives the failed turn, so the retry the supervisor arms is
+// told the verdict and its family again -- not a bare retry with nothing
+// to retry (#50 review).
+func TestAgentFailureKeepsTheVerdictForTheRetry(t *testing.T) {
+	a := newAgentAcceptance(t, `touch "$FACTORYD_PROGRESS"; exit 7`)
+	vp := a.verdictFor(t, "48", "producer/fix")
+	if err := a.runFor(t, 2, 6*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.producerTurns(t); got < 2 {
+		t.Fatalf("turns=%d, want the failed turn and its retry", got)
+	}
+	if _, err := os.Stat(vp); err != nil {
+		t.Fatal("the verdict trigger was consumed by a failed turn; the retry had no verdict")
+	}
+	if p := a.lastPrompt(t); !strings.Contains(p, "THIS TURN ACTS ON ONE changes-requested verdict: change 48") || !strings.Contains(p, "verbatim:\n    producer/fix\n") {
+		t.Fatalf("the retry turn was not told the verdict:\n%s", p)
+	}
+	if len(a.tr.calls) != 0 {
+		t.Fatalf("submit ran for a turn that declared nothing: %v", a.tr.calls)
+	}
+}
+
+// The model exits clean, touches progress, and declares nothing. The
+// verdict is not acted on, its trigger is kept, and nothing is submitted;
+// the supervisor's spin guard, not silence, is what follows.
+func TestAgentCleanNoIntentKeepsTheVerdict(t *testing.T) {
+	a := newAgentAcceptance(t, `touch "$FACTORYD_PROGRESS"; exit 0`)
+	vp := a.verdictFor(t, "48", "producer/fix")
+	if err := a.runFor(t, 1, 4*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(vp); err != nil {
+		t.Fatal("the verdict trigger was consumed by a turn that declared nothing")
+	}
+	if len(a.tr.calls) != 0 || a.drv.opened != nil {
+		t.Fatalf("submit side effects for a no-intent turn: %v", a.tr.calls)
+	}
+	if rs := a.producer(t); rs.LastTurn == nil || rs.LastTurn.ExitCode == nil || *rs.LastTurn.ExitCode != 0 {
+		t.Fatalf("last turn %+v", rs.LastTurn)
+	}
+}
+
+// The model declares completely: the verdict trigger is consumed, submit
+// runs, and the successor is opened under the same family.
+func TestAgentCompleteDeclarationConsumesTheVerdictAndSubmits(t *testing.T) {
+	a := newAgentAcceptance(t, `mkdir -p "$FACTORYD_WORKDIR/src" && printf 'fixed\n' > "$FACTORYD_WORKDIR/src/a.go"
+printf 'producer/fix\n' > "$FACTORYD_WORKDIR/.producer-branch"
+printf 'fix: the requested change\n\nbody\n' > "$FACTORYD_WORKDIR/.producer-commit-msg"
+touch "$FACTORYD_PROGRESS"`)
+	vp := a.verdictFor(t, "48", "producer/fix")
+	if err := a.runFor(t, 1, 4*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(vp); !os.IsNotExist(err) {
+		t.Fatal("the verdict trigger was not consumed after a complete declaration")
+	}
+	if a.drv.opened == nil || a.drv.opened.SourceBranch != submit.ImmutableBranch("producer/fix", "abc123") {
+		t.Fatalf("the successor was not opened under the family: %+v", a.drv.opened)
 	}
 }
