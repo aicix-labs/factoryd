@@ -904,7 +904,7 @@ func TestTurnWrapperToolsResolvedAgainstTheDeclaredRolePath(t *testing.T) {
 	cfg.Roles.Producer.Env["PATH"] = t.TempDir()
 	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
 	for _, c := range r.Checks {
-		if c.Name == "turn producer wrapper tools" {
+		if c.Name == "turn producer entrypoint tools" {
 			if c.OK || c.Err == nil || !strings.Contains(c.Err.Error(), "setsid") || !strings.Contains(c.Err.Error(), "declared PATH") {
 				t.Fatalf("wrapper tool check=%+v, want a setsid failure in the producer's declared PATH", c)
 			}
@@ -912,6 +912,61 @@ func TestTurnWrapperToolsResolvedAgainstTheDeclaredRolePath(t *testing.T) {
 		}
 	}
 	t.Fatalf("doctor did not check the wrapper tools:\n%s", r)
+}
+
+// producer-turn-agent.sh is the documented model-driven role command. It
+// invokes turn-wrapper.sh itself, so its role PATH must be checked for the
+// wrapper's tools just as a direct wrapper command is; otherwise every turn
+// would stop at the nested wrapper's exit 3.
+func TestProducerAgentEntrypointChecksNestedWrapperTools(t *testing.T) {
+	cfg := fixture(t)
+	entrypoint, err := filepath.Abs(filepath.Join("..", "..", "examples", "producer-turn-agent.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Roles.Producer.Command = []string{entrypoint, "true"}
+	cfg.Roles.Producer.Env["PATH"] = t.TempDir()
+	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
+	for _, c := range r.Checks {
+		if c.Name == "turn producer entrypoint tools" {
+			if c.OK || c.Err == nil || !strings.Contains(c.Err.Error(), "setsid") || !strings.Contains(c.Err.Error(), "declared PATH") {
+				t.Fatalf("nested wrapper tool check=%+v, want a setsid failure in the producer's declared PATH", c)
+			}
+			return
+		}
+	}
+	t.Fatalf("doctor did not check nested wrapper tools for producer-turn-agent.sh:\n%s", r)
+}
+
+// The producer entrypoint performs part of its protocol before it invokes the
+// nested wrapper. Supplying only the wrapper's tools must still be refused if
+// an entrypoint-specific command is absent.
+func TestProducerAgentEntrypointChecksItsOwnRuntimeTools(t *testing.T) {
+	cfg := fixture(t)
+	entrypoint, err := filepath.Abs(filepath.Join("..", "..", "examples", "producer-turn-agent.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	toolDir := t.TempDir()
+	// Deliberately omit dirname; these stubs keep this doctor test independent
+	// of whatever happens to be installed on the developer host.
+	for _, tool := range []string{"setsid", "sh", "stat", "grep", "mktemp", "cat", "rm", "sleep", "cut", "cp", "find", "sort", "xargs", "sed", "date", "mv", "touch", "sha256sum"} {
+		if err := os.WriteFile(filepath.Join(toolDir, tool), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	cfg.Roles.Producer.Command = []string{entrypoint, "true"}
+	cfg.Roles.Producer.Env["PATH"] = toolDir
+	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
+	for _, c := range r.Checks {
+		if c.Name == "turn producer entrypoint tools" {
+			if c.OK || c.Err == nil || !strings.Contains(c.Err.Error(), "dirname") || !strings.Contains(c.Err.Error(), "declared PATH") {
+				t.Fatalf("producer entrypoint tool check=%+v, want a dirname failure in the producer's declared PATH", c)
+			}
+			return
+		}
+	}
+	t.Fatalf("doctor did not check producer-turn-agent.sh's own runtime tools:\n%s", r)
 }
 
 // PATH lookup is only half of the question: a root-owned tool can resolve for
@@ -952,7 +1007,7 @@ func TestTurnWrapperToolsAreExecutableByTheRole(t *testing.T) {
 	}
 	r := doctor.RunWith(context.Background(), cfg, deps)
 	for _, c := range r.Checks {
-		if c.Name == "producer can run turn-wrapper tool setsid" {
+		if c.Name == "producer can run turn-entrypoint tool setsid" {
 			if c.OK || c.Err == nil || !strings.Contains(c.Err.Error(), "doctor could") {
 				t.Fatalf("role tool check=%+v, want an identity-specific executable failure", c)
 			}

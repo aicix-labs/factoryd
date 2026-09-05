@@ -455,19 +455,20 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 		// path alone says nothing about the utilities it resolves later from
 		// the role's deliberately constructed PATH. Probe each utility as the
 		// identity that will run it, not as doctor (#51).
-		for _, tool := range turnWrapperTools(spec.Command) {
-			exe, err := config.LookPathIn(spec.Env["PATH"], tool)
+		for _, tools := range turnEntrypointTools(spec.Command) {
+			exe, err := resolveTool(spec.Env["PATH"], tools)
 			if err != nil {
 				// The PATH-only check below records the missing utility. There is
 				// no pathname to permission-probe here.
 				continue
 			}
+			tool := strings.Join(tools, " or ")
 			if can, err := who.CanExec(ctx, exe); err != nil {
-				add(role+" can run turn-wrapper tool "+tool, fmt.Errorf("undecided: %v", err), exe)
+				add(role+" can run turn-entrypoint tool "+tool, fmt.Errorf("undecided: %v", err), exe)
 			} else if !can {
-				add(role+" can run turn-wrapper tool "+tool, fmt.Errorf("%s cannot execute %s; doctor could, which is a different question", who.Describe(), exe), exe)
+				add(role+" can run turn-entrypoint tool "+tool, fmt.Errorf("%s cannot execute %s; doctor could, which is a different question", who.Describe(), exe), exe)
 			} else {
-				add(role+" can run turn-wrapper tool "+tool, nil, exe)
+				add(role+" can run turn-entrypoint tool "+tool, nil, exe)
 			}
 		}
 	}
@@ -508,9 +509,9 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 		}
 		add("turn "+role, checkCommand(spec.Env["PATH"], spec.Command, "roles."+role+".command",
 			"the supervisor would have no turn to run"), strings.Join(spec.Command, " "))
-		if tools := turnWrapperTools(spec.Command); len(tools) > 0 {
-			add("turn "+role+" wrapper tools", checkTools(spec.Env["PATH"], tools, "roles."+role+".command turn-wrapper"),
-				"resolved from roles."+role+".env.PATH: "+strings.Join(tools, ", "))
+		if tools := turnEntrypointTools(spec.Command); len(tools) > 0 {
+			add("turn "+role+" entrypoint tools", checkTools(spec.Env["PATH"], tools, "roles."+role+".command entrypoint"),
+				"resolved from roles."+role+".env.PATH: "+toolNames(tools))
 		}
 		add("workdir "+role, checkWritableDir(cfg.TurnWorkdir(role)), cfg.TurnWorkdir(role))
 
@@ -729,24 +730,69 @@ func checkCommand(declaredPath string, argv []string, field, consequence string)
 	return nil
 }
 
-// turnWrapperTools is the external-command half of examples/turn-wrapper.sh.
-// Keep it in step with that script's startup check. The wrapper itself is
-// absolute in normal installations, while these commands deliberately resolve
+// turnEntrypointTools is the external-command contract for the shipped turn
+// scripts. Keep each list in step with its script's startup check. Both
+// entrypoints are normally absolute while these commands deliberately resolve
 // from roles.<role>.env.PATH; checking only argv[0] made doctor green for a
-// wrapper that every real turn immediately refused to run (#51).
-var wrapperRuntimeTools = []string{"setsid", "sh", "stat", "grep", "mktemp", "cat", "rm", "sleep"}
+// turn that immediately refused to run (#51).
+//
+// Each element is a preference-ordered set of alternatives. The producer
+// entrypoint selects sha256sum when it is present and falls back to cksum, so
+// doctor makes the same selection rather than refusing a cksum-only host or
+// accepting a non-executable preferred hasher.
+var wrapperRuntimeTools = requiredTools("setsid", "sh", "stat", "grep", "mktemp", "cat", "rm", "sleep")
 
-func turnWrapperTools(argv []string) []string {
-	if len(argv) == 0 || filepath.Base(argv[0]) != "turn-wrapper.sh" {
-		return nil
+var producerAgentRuntimeTools = append(
+	append([][]string{}, wrapperRuntimeTools...),
+	append(requiredTools("dirname", "cut", "cp", "find", "sort", "xargs", "sed", "date", "mv", "touch"), []string{"sha256sum", "cksum"})...,
+)
+
+func requiredTools(names ...string) [][]string {
+	tools := make([][]string, 0, len(names))
+	for _, name := range names {
+		tools = append(tools, []string{name})
 	}
-	return wrapperRuntimeTools
+	return tools
 }
 
-func checkTools(declaredPath string, tools []string, field string) error {
-	for _, tool := range tools {
-		if _, err := config.LookPathIn(declaredPath, tool); err != nil {
-			return fmt.Errorf("%s requires %q: %w", field, tool, err)
+func turnEntrypointTools(argv []string) [][]string {
+	if len(argv) == 0 {
+		return nil
+	}
+	switch filepath.Base(argv[0]) {
+	case "turn-wrapper.sh":
+		return wrapperRuntimeTools
+	case "producer-turn-agent.sh":
+		return producerAgentRuntimeTools
+	default:
+		return nil
+	}
+}
+
+func toolNames(requirements [][]string) string {
+	parts := make([]string, 0, len(requirements))
+	for _, tools := range requirements {
+		parts = append(parts, strings.Join(tools, " or "))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func resolveTool(declaredPath string, alternatives []string) (string, error) {
+	var errs []string
+	for _, tool := range alternatives {
+		exe, err := config.LookPathIn(declaredPath, tool)
+		if err == nil {
+			return exe, nil
+		}
+		errs = append(errs, err.Error())
+	}
+	return "", fmt.Errorf("none of %s resolves on the declared PATH: %s", strings.Join(alternatives, " or "), strings.Join(errs, "; "))
+}
+
+func checkTools(declaredPath string, requirements [][]string, field string) error {
+	for _, alternatives := range requirements {
+		if _, err := resolveTool(declaredPath, alternatives); err != nil {
+			return fmt.Errorf("%s requires %s: %w", field, strings.Join(alternatives, " or "), err)
 		}
 	}
 	return nil

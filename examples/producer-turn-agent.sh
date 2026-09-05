@@ -28,6 +28,15 @@ set -u
 [ -n "${FACTORYD_WORKDIR:-}" ] || { echo "producer-turn-agent: FACTORYD_WORKDIR is not set; not running under a factoryd supervisor" >&2; exit 3; }
 [ -n "${FACTORYD_PROGRESS:-}" ] || { echo "producer-turn-agent: FACTORYD_PROGRESS is not set" >&2; exit 3; }
 [ $# -ge 1 ] || { echo "producer-turn-agent: no agent command given" >&2; exit 3; }
+# Keep this preflight in step with doctor.producerAgentRuntimeTools. The
+# nested turn wrapper has its own check, but refusing here prevents a partial
+# producer protocol from running before a missing tool is discovered there.
+for tool in setsid sh stat grep mktemp cat rm sleep dirname cut cp find sort xargs sed date mv touch; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "producer-turn-agent: $tool is required from the role PATH to run the producer entrypoint" >&2; exit 3; }
+done
+if command -v sha256sum >/dev/null 2>&1; then :; elif command -v cksum >/dev/null 2>&1; then :; else
+  echo "producer-turn-agent: sha256sum or cksum is required from the role PATH to fingerprint the worktree" >&2; exit 3
+fi
 here=$(dirname "$0")
 wrapper="$here/turn-wrapper.sh"
 [ -x "$wrapper" ] || { echo "producer-turn-agent: $wrapper is not executable; the exit code cannot be derived" >&2; exit 3; }

@@ -1149,7 +1149,10 @@ next agent for shared state such as an OAuth refresh. `setsid`, `sh`, `stat`,
 `grep`, `mktemp`, `cat`, `rm`, and `sleep` must be on the role's `PATH` and
 executable by the role; `doctor` proves those dependencies. Wire agent CLIs
 through it, or an equivalent with both the progress and pre-return cleanup
-contracts, never bare.
+contracts, never bare. The shipped `producer-turn-agent.sh` invokes this
+wrapper internally and carries the same doctor-checked dependency contract,
+plus `dirname`, `cut`, `cp`, `find`, `sort`, `xargs`, `sed`, `date`, `mv`,
+`touch`, and either `sha256sum` or `cksum` for its own protocol.
 
 **Superseded drafts are retired by the reviewer** (#36). `submit` leaves what
 it supersedes open — a read is stale by the time a write lands, and no provider

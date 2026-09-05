@@ -64,9 +64,12 @@ turns — so a brief only describes work (SPEC §6.2).
 Its `turn-wrapper.sh` runs the agent in an isolated session and reaps any
 helpers it leaves behind before the next turn can start; `setsid`, `sh`,
 `stat`, `grep`, `mktemp`, `cat`, `rm`, and `sleep` must be on the role's
-`PATH` (and `doctor` proves that they are executable by the role). An
-equivalent wrapper must preserve both that cleanup and the progress-derived
-exit-code contract.
+`PATH` (and `doctor` proves that they are executable by the role). This
+contract applies when the wrapper is configured directly and through the
+shipped `producer-turn-agent.sh` entrypoint, which additionally requires
+`dirname`, `cut`, `cp`, `find`, `sort`, `xargs`, `sed`, `date`, `mv`, `touch`,
+and either `sha256sum` or `cksum`. An equivalent wrapper must preserve both
+that cleanup and the progress-derived exit-code contract.
 
 `inbox/brief.md` remains the one-item compatibility channel. For sustained
 work, an operator can place lexical work orders in `inbox/briefs/` (for example
