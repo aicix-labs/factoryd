@@ -139,6 +139,16 @@ fi
 snap=$(mktemp "${TMPDIR:-/tmp}/factoryd-progress.XXXXXX") || exit 3
 had_progress=0
 if [ -e "$FACTORYD_PROGRESS" ]; then cp -p "$FACTORYD_PROGRESS" "$snap" || exit 3; had_progress=1; fi
+# Observable work is progress even without a declaration: a large fix
+# legitimately spans turns, and a model that edits the tree and waits to
+# declare until the fix is complete is advancing (#50 review). The tree's
+# shape -- every regular file's path, size and mtime, .git and the control
+# files aside -- is fingerprinted before and after; a changed tree keeps
+# the model's progress and the verdict for the next turn.
+tree_fingerprint() {
+  (cd "$FACTORYD_WORKDIR" && find . -path ./.git -prune -o -type f ! -name '.producer-branch*' ! -name '.producer-commit-msg*' -printf '%p %s %T@\n' 2>/dev/null | LC_ALL=C sort | cksum)
+}
+tree_before=$(tree_fingerprint)
 printf '%s\n' "$prompt" | "$wrapper" "$@"
 rc=$?
 # The trigger is consumed by the turn that acted on it. The agent cannot be
@@ -181,11 +191,17 @@ fi
 if [ -n "$sel" ] && [ "$declared" -eq 0 ]; then
   keep="$keep
 $sel_path"
-  echo "producer-turn-agent: the selected changes-requested verdict is kept: the turn $( [ "$rc" -eq 0 ] && echo 'declared no complete intent' || echo "exited $rc" )" >&2
-  # No progress on the verdict: the marker goes back to its baseline, and
-  # the turn is a failure, so the supervisor's guards count it.
-  if [ "$had_progress" -eq 1 ]; then touch -r "$snap" "$FACTORYD_PROGRESS"; else rm -f "$FACTORYD_PROGRESS"; fi
-  [ "$rc" -eq 0 ] && rc=4
+  if [ "$rc" -eq 0 ] && [ "$(tree_fingerprint)" != "$tree_before" ]; then
+    # Partial work: the tree changed. The model's progress stands, the
+    # verdict waits for the next turn, and the turn is clean.
+    echo "producer-turn-agent: the selected changes-requested verdict is kept for the next turn: the tree changed but no complete intent was declared yet" >&2
+  else
+    echo "producer-turn-agent: the selected changes-requested verdict is kept: the turn $( [ "$rc" -eq 0 ] && echo 'changed nothing and declared no intent' || echo "exited $rc" )" >&2
+    # No progress on the verdict: the marker goes back to its baseline, and
+    # the turn is a failure, so the supervisor's guards count it.
+    if [ "$had_progress" -eq 1 ]; then touch -r "$snap" "$FACTORYD_PROGRESS"; else rm -f "$FACTORYD_PROGRESS"; fi
+    [ "$rc" -eq 0 ] && rc=4
+  fi
 fi
 rm -f "$snap"
 IFS=:; for p in ${FACTORYD_TRIGGER_PATHS:-}; do

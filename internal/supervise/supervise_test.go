@@ -1576,3 +1576,28 @@ func TestRetryMarkerWithoutAStepRerunsTheTurn(t *testing.T) {
 		t.Fatalf("agent %d, after-turn %d; want 1 and 1", r.count(), after)
 	}
 }
+
+// A timed-out turn counts on the fail streak whatever the progress marker
+// says (#50 review): the turn was killed at its deadline, so nothing that
+// would have judged its work ran. Three timed-out turns that each touched
+// progress halt at fail_abort.
+func TestTimedOutTurnCountsOnTheFailStreakDespiteProgress(t *testing.T) {
+	fx := newFixture(t)
+	fx.wake(t)
+	r := &fakeRunner{act: func(int, supervise.Turn) supervise.TurnResult {
+		fx.progress(t)
+		return supervise.TurnResult{ExitCode: -1, TimedOut: true}
+	}}
+	s := fx.newSupervisor(t, r, 50)
+	ctx, cancel := ctxWithTimeout(t)
+	defer cancel()
+	if err := s.Run(ctx); !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted: timed-out turns that touched progress never accumulated", err)
+	}
+	if r.count() != 3 {
+		t.Fatalf("ran %d turns, want fail_abort=3", r.count())
+	}
+	if rs := fx.roleState(t); !strings.Contains(rs.HaltReason, "fail_abort") {
+		t.Fatalf("halt reason %q", rs.HaltReason)
+	}
+}

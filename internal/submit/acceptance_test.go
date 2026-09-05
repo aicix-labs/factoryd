@@ -541,3 +541,73 @@ touch "$FACTORYD_PROGRESS"`)
 		t.Fatal("the producer's source work was touched")
 	}
 }
+
+// Touch-then-hang (#50 review, round 7): the model touches progress and
+// never returns; the supervisor kills the turn at its deadline, so the
+// wrapper's rollback never runs. A timed-out turn counts on the fail
+// streak whatever the marker says: the factory halts at fail_abort with
+// the verdict kept and nothing submitted.
+func TestTouchThenTimeoutReachesFailAbortWithTheVerdictKept(t *testing.T) {
+	a := newAgentAcceptance(t, `touch "$FACTORYD_PROGRESS"; sleep 30`)
+	a.cfg.Roles.Producer.TimeoutSeconds = 1
+	vp := a.verdictFor(t, "48", "producer/fix")
+	err := a.runFor(t, 50, 30*time.Second)
+	if !errors.Is(err, supervise.ErrHalted) {
+		t.Fatalf("Run returned %v, want ErrHalted after fail_abort timed-out turns (turns=%d)", err, a.producerTurns(t))
+	}
+	rs := a.producer(t)
+	if !strings.Contains(rs.HaltReason, "fail_abort") || !strings.Contains(rs.HaltReason, "timed out true") {
+		t.Fatalf("halt reason %q", rs.HaltReason)
+	}
+	if got := a.producerTurns(t); got != a.cfg.Supervisor.FailAbort {
+		t.Fatalf("turns=%d, want exactly fail_abort=%d", got, a.cfg.Supervisor.FailAbort)
+	}
+	if _, err := os.Stat(vp); err != nil {
+		t.Fatal("the verdict was lost")
+	}
+	if len(a.tr.calls) != 0 || a.drv.opened != nil {
+		t.Fatalf("submit ran: %v", a.tr.calls)
+	}
+}
+
+// A legitimate multi-turn fix (#50 review, round 7): the model edits the
+// tree a little each turn, truthfully touches progress, and declares only
+// when the fix is complete -- after MORE than fail_abort turns. Observable
+// work is progress; the verdict waits; no halt; the final turn submits.
+func TestMultiTurnPartialFixIsProgressAndEventuallySubmits(t *testing.T) {
+	a := newAgentAcceptance(t, `n=$(wc -l < "$FACTORYD_ROOT/turns")
+mkdir -p "$FACTORYD_WORKDIR/src"
+if [ "$n" -le 5 ]; then
+  printf 'part %s\n' "$n" > "$FACTORYD_WORKDIR/src/part$n.go"
+  touch "$FACTORYD_PROGRESS"
+  exit 0
+fi
+printf 'producer/fix\n' > "$FACTORYD_WORKDIR/.producer-branch"
+printf 'fix: complete\n\nbody\n' > "$FACTORYD_WORKDIR/.producer-commit-msg"
+touch "$FACTORYD_PROGRESS"`)
+	if a.cfg.Supervisor.FailAbort >= 5 || a.cfg.Supervisor.SpinAbort >= 5 {
+		t.Fatalf("the control needs more partial turns than fail_abort=%d and spin_abort=%d", a.cfg.Supervisor.FailAbort, a.cfg.Supervisor.SpinAbort)
+	}
+	vp := a.verdictFor(t, "48", "producer/fix")
+	if err := a.runFor(t, 6, 30*time.Second); err != nil {
+		t.Fatalf("Run: %v (turns=%d); a multi-turn fix was halted", err, a.producerTurns(t))
+	}
+	if got := a.producerTurns(t); got != 6 {
+		t.Fatalf("turns=%d, want 6: five partial turns and the declaring one", got)
+	}
+	rs := a.producer(t)
+	if rs.Halted {
+		t.Fatalf("halted: %s", rs.HaltReason)
+	}
+	if _, err := os.Stat(vp); !os.IsNotExist(err) {
+		t.Fatal("the verdict was not consumed by the declaring turn")
+	}
+	if a.drv.opened == nil || a.drv.opened.SourceBranch != submit.ImmutableBranch("producer/fix", "abc123") {
+		t.Fatalf("the fix was not submitted under the family: %+v", a.drv.opened)
+	}
+	for n := 1; n <= 5; n++ {
+		if _, err := os.Stat(filepath.Join(a.work, "src", fmt.Sprintf("part%d.go", n))); err != nil {
+			t.Fatalf("partial work part%d.go is gone", n)
+		}
+	}
+}

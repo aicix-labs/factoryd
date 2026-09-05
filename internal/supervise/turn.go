@@ -374,8 +374,12 @@ func (s *Supervisor) oneTurn(ctx context.Context, triggers []watch.Trigger) (boo
 		}
 		spin = rs.SpinCount
 
-		// Progress resets this one too; consumption does not.
-		if failed && !progressed {
+		// Progress resets this one too; consumption does not. A TIMED-OUT
+		// turn counts whatever the marker says (#50 review): the turn was
+		// killed at its deadline, so nothing that would have judged its
+		// work ran -- a wrapper that touched progress and then hung would
+		// otherwise reset this streak on every deadline and retry forever.
+		if failed && (!progressed || res.TimedOut) {
 			rs.FailStreak++
 		} else {
 			rs.FailStreak = 0

@@ -1055,12 +1055,17 @@ family exactly* — a complete declaration under another name is moved aside,
 the verdict kept, and the turn failed so the after-turn step never submits an
 unrelated draft (#29 again) — so a model that failed, declared nothing, or
 declared the wrong family leaves the verdict for the retry, which is then told
-it again — and such a turn is *no progress*, whatever the model touched: the
-wrapper snapshots the progress marker before the agent and restores its exact
-mtime when the selected verdict ends unresolved, and exits non-zero, so the
-supervisor's guards count it, back off, and halt at `fail_abort` with the
-verdict still in the outbox, rather than reading the touch as progress and
-re-running the kept trigger forever; `FACTORYD_TRIGGER_PATHS` is split on the platform's path-list
+it again. Whether such a turn was *progress* is decided by observable work,
+not by the touch alone: the wrapper fingerprints the tree (every regular
+file's path, size and mtime, `.git` and the control files aside) and the
+progress marker before the agent; a changed tree with no declaration yet is a
+large fix spanning turns — the model's progress stands, the verdict waits for
+the next turn, the turn is clean; an unchanged tree with no declaration, or a
+wrong family, is no progress — the marker is restored to its exact mtime and
+the turn exits non-zero, so the supervisor's guards count it, back off, and
+halt at `fail_abort` with the verdict still in the outbox. And a turn the
+supervisor killed at its deadline counts on the fail streak whatever the
+marker says, because nothing that would have judged its work ran (§6.3); `FACTORYD_TRIGGER_PATHS` is split on the platform's path-list
 separator, so configured paths containing it are refused at load and a trigger
 path containing it refuses the turn; every TSV field, the path included, is refused by the
 runner if it holds a tab or newline, and configured paths with control
@@ -1118,6 +1123,12 @@ not an open draft at the last read, closes with the reason (default
 window is narrowed, not removed. An open family that only grows makes "which
 one do I review" load-bearing; the operator's close is how the family stays
 one draft wide.
+
+
+A turn the supervisor killed at its deadline is a failed turn on the streak
+*whatever the marker says*: the deadline is the operator's bound on a turn,
+and a process that touched the marker and then hung would otherwise reset the
+streak on every deadline and be retried forever (#50).
 
 ### 6.4 Audits
 
