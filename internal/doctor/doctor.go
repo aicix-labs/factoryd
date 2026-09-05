@@ -451,6 +451,25 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 				add(role+" can run its command", nil, exe)
 			}
 		}
+		// The shipped wrapper is an interpreter-level command: resolving its
+		// path alone says nothing about the utilities it resolves later from
+		// the role's deliberately constructed PATH. Probe each utility as the
+		// identity that will run it, not as doctor (#51).
+		for _, tool := range turnWrapperTools(spec.Command) {
+			exe, err := config.LookPathIn(spec.Env["PATH"], tool)
+			if err != nil {
+				// The PATH-only check below records the missing utility. There is
+				// no pathname to permission-probe here.
+				continue
+			}
+			if can, err := who.CanExec(ctx, exe); err != nil {
+				add(role+" can run turn-wrapper tool "+tool, fmt.Errorf("undecided: %v", err), exe)
+			} else if !can {
+				add(role+" can run turn-wrapper tool "+tool, fmt.Errorf("%s cannot execute %s; doctor could, which is a different question", who.Describe(), exe), exe)
+			} else {
+				add(role+" can run turn-wrapper tool "+tool, nil, exe)
+			}
+		}
 	}
 
 	// --- gate environment and paths ---
@@ -489,6 +508,10 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 		}
 		add("turn "+role, checkCommand(spec.Env["PATH"], spec.Command, "roles."+role+".command",
 			"the supervisor would have no turn to run"), strings.Join(spec.Command, " "))
+		if tools := turnWrapperTools(spec.Command); len(tools) > 0 {
+			add("turn "+role+" wrapper tools", checkTools(spec.Env["PATH"], tools, "roles."+role+".command turn-wrapper"),
+				"resolved from roles."+role+".env.PATH: "+strings.Join(tools, ", "))
+		}
 		add("workdir "+role, checkWritableDir(cfg.TurnWorkdir(role)), cfg.TurnWorkdir(role))
 
 		// The halt sentinel is a stop, not a warning. A supervisor started
@@ -702,6 +725,29 @@ func checkCommand(declaredPath string, argv []string, field, consequence string)
 	}
 	if _, err := config.LookPathIn(declaredPath, argv[0]); err != nil {
 		return fmt.Errorf("%s: %w", field, err)
+	}
+	return nil
+}
+
+// turnWrapperTools is the external-command half of examples/turn-wrapper.sh.
+// Keep it in step with that script's startup check. The wrapper itself is
+// absolute in normal installations, while these commands deliberately resolve
+// from roles.<role>.env.PATH; checking only argv[0] made doctor green for a
+// wrapper that every real turn immediately refused to run (#51).
+var wrapperRuntimeTools = []string{"setsid", "sh", "stat", "grep", "mktemp", "cat", "rm", "sleep"}
+
+func turnWrapperTools(argv []string) []string {
+	if len(argv) == 0 || filepath.Base(argv[0]) != "turn-wrapper.sh" {
+		return nil
+	}
+	return wrapperRuntimeTools
+}
+
+func checkTools(declaredPath string, tools []string, field string) error {
+	for _, tool := range tools {
+		if _, err := config.LookPathIn(declaredPath, tool); err != nil {
+			return fmt.Errorf("%s requires %q: %w", field, tool, err)
+		}
 	}
 	return nil
 }

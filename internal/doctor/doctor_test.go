@@ -890,6 +890,78 @@ func TestGateCommandResolvedAgainstDeclaredPath(t *testing.T) {
 	}
 }
 
+// The shipped wrapper is an absolute command in the role config, but it
+// resolves its own utilities from that role's constructed PATH. Doctor must
+// reject a path in which the wrapper itself exists but every turn would exit 3
+// before invoking its agent; this test intentionally creates no host tools.
+func TestTurnWrapperToolsResolvedAgainstTheDeclaredRolePath(t *testing.T) {
+	cfg := fixture(t)
+	wrapper, err := filepath.Abs(filepath.Join("..", "..", "examples", "turn-wrapper.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	cfg.Roles.Producer.Command = []string{wrapper, "true"}
+	cfg.Roles.Producer.Env["PATH"] = t.TempDir()
+	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
+	for _, c := range r.Checks {
+		if c.Name == "turn producer wrapper tools" {
+			if c.OK || c.Err == nil || !strings.Contains(c.Err.Error(), "setsid") || !strings.Contains(c.Err.Error(), "declared PATH") {
+				t.Fatalf("wrapper tool check=%+v, want a setsid failure in the producer's declared PATH", c)
+			}
+			return
+		}
+	}
+	t.Fatalf("doctor did not check the wrapper tools:\n%s", r)
+}
+
+// PATH lookup is only half of the question: a root-owned tool can resolve for
+// doctor and still fail after the runner switches to the role identity.
+func TestTurnWrapperToolsAreExecutableByTheRole(t *testing.T) {
+	cfg := fixture(t)
+	wrapper, err := filepath.Abs(filepath.Join("..", "..", "examples", "turn-wrapper.sh"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	tools := []string{"setsid", "sh", "stat", "grep", "mktemp", "cat", "rm", "sleep"}
+	toolDir := t.TempDir()
+	for _, tool := range tools {
+		if err := os.WriteFile(filepath.Join(toolDir, tool), []byte("#!/bin/sh\nexit 0\n"), 0o755); err != nil {
+			t.Fatal(err)
+		}
+	}
+	setsid := filepath.Join(toolDir, "setsid")
+	cfg.Roles.Producer.Command = []string{wrapper, "true"}
+	cfg.Roles.Producer.Env["PATH"] = toolDir
+	cfg.Roles.Producer.RunAs = &config.RunAs{User: "wrapper-tool-role"}
+	deps := healthyDeps(cfg, nil)
+	baseProber := deps.NewProber
+	deps.NewProber = func(ra *config.RunAs) (doctor.Prober, error) {
+		if ra != nil && ra.User == "wrapper-tool-role" {
+			return fakeProber{
+				name: "wrapper-tool-role",
+				writable: map[string]bool{
+					cfg.Paths.ProducerWorkdir: true,
+					cfg.InboxDir():            true,
+					cfg.OutboxDir():           true,
+				},
+				readable: map[string]bool{cfg.Paths.ProducerWorkdir: true},
+				rootOnly: map[string]bool{setsid: true},
+			}, nil
+		}
+		return baseProber(ra)
+	}
+	r := doctor.RunWith(context.Background(), cfg, deps)
+	for _, c := range r.Checks {
+		if c.Name == "producer can run turn-wrapper tool setsid" {
+			if c.OK || c.Err == nil || !strings.Contains(c.Err.Error(), "doctor could") {
+				t.Fatalf("role tool check=%+v, want an identity-specific executable failure", c)
+			}
+			return
+		}
+	}
+	t.Fatalf("doctor did not permission-probe setsid for the producer:\n%s", r)
+}
+
 // countingProber answers "cannot write .git" the first time and "can" after,
 // modelling provisioning that handed the gate reach into .git.
 type countingProber struct {

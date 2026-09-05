@@ -20,7 +20,11 @@
 set -u
 [ -n "${FACTORYD_PROGRESS:-}" ] || { echo "turn-wrapper: FACTORYD_PROGRESS is not set; not running under a factoryd supervisor" >&2; exit 3; }
 [ $# -ge 1 ] || { echo "turn-wrapper: no agent command given" >&2; exit 3; }
-[ -n "$(command -v setsid 2>/dev/null)" ] || { echo "turn-wrapper: setsid is required to isolate and reap agent helpers before the next turn" >&2; exit 3; }
+# Keep this list in step with doctor.turnWrapperTools: these are resolved from
+# the role's constructed PATH, never factoryd's inherited environment.
+for tool in setsid sh stat grep mktemp cat rm sleep; do
+  command -v "$tool" >/dev/null 2>&1 || { echo "turn-wrapper: $tool is required from the role PATH to derive progress and reap agent helpers" >&2; exit 3; }
+done
 # Nanosecond precision: a turn that touches the marker within the same
 # second as the baseline is real progress, and a whole-second compare would
 # turn it into a failure -- the worse mistake. GNU stat's %.9Y; a stat that
@@ -53,17 +57,29 @@ trap - 0
 case "$agent_pid" in
   ''|*[!0-9]*) agent_pid="" ;;
 esac
-if [ -n "$agent_pid" ] && kill -0 "-$agent_pid" 2>/dev/null; then
-  echo "turn-wrapper: agent exited with helper processes still running; reaping them before the next turn so they cannot contend for shared agent credentials" >&2
-  kill -TERM "-$agent_pid" 2>/dev/null || true
+group_gone() { ! kill -0 "-$agent_pid" 2>/dev/null; }
+wait_for_group_gone() {
   tries=0
-  while kill -0 "-$agent_pid" 2>/dev/null && [ "$tries" -lt 40 ]; do
+  while ! group_gone && [ "$tries" -lt 40 ]; do
     sleep 0.05
     tries=$((tries + 1))
   done
-  if kill -0 "-$agent_pid" 2>/dev/null; then
+  group_gone
+}
+if [ -n "$agent_pid" ] && kill -0 "-$agent_pid" 2>/dev/null; then
+  echo "turn-wrapper: agent exited with helper processes still running; reaping them before the next turn so they cannot contend for shared agent credentials" >&2
+  kill -TERM "-$agent_pid" 2>/dev/null || true
+  if ! wait_for_group_gone; then
     echo "turn-wrapper: agent helpers ignored TERM; sending KILL before returning" >&2
     kill -KILL "-$agent_pid" 2>/dev/null || true
+    if ! wait_for_group_gone; then
+      # Do not report a clean turn while the process group may still be
+      # running. The runner's cgroup containment must now kill and verify it;
+      # if that cannot happen, this failure stops the turn rather than opening
+      # a window for the next agent to contend with the helper.
+      echo "turn-wrapper: could not prove agent helpers gone after KILL; refusing a clean turn so factoryd containment can take over" >&2
+      exit 3
+    fi
   fi
 fi
 after=$(mtime "$FACTORYD_PROGRESS" || echo none)
