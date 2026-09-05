@@ -1143,7 +1143,16 @@ reads as a clean turn that achieved nothing — the spin counter moves, the fail
 streak does not (canary issue #27). The outcome must be derived from the
 observable effect: `examples/turn-wrapper.sh` runs the agent, and exits non-zero
 when `$FACTORYD_PROGRESS` did not move, passing the agent's own non-zero exit
-through unchanged. Wire agent CLIs through it, or an equivalent, never bare.
+through unchanged. It starts the agent in an isolated session and reaps helpers
+in that session before returning, so a leaked helper cannot contend with the
+next agent for shared state such as an OAuth refresh. `setsid`, `sh`, `stat`,
+`grep`, `mktemp`, `cat`, `rm`, and `sleep` must be on the role's `PATH` and
+executable by the role; `doctor` proves those dependencies. Wire agent CLIs
+through it, or an equivalent with both the progress and pre-return cleanup
+contracts, never bare. The shipped `producer-turn-agent.sh` invokes this
+wrapper internally and carries the same doctor-checked dependency contract,
+plus `dirname`, `cut`, `cp`, `find`, `sort`, `xargs`, `sed`, `date`, `mv`,
+`touch`, and either `sha256sum` or `cksum` for its own protocol.
 
 **Superseded drafts are retired by the reviewer** (#36). `submit` leaves what
 it supersedes open — a read is stale by the time a write lands, and no provider

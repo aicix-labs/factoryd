@@ -451,6 +451,26 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 				add(role+" can run its command", nil, exe)
 			}
 		}
+		// The shipped wrapper is an interpreter-level command: resolving its
+		// path alone says nothing about the utilities it resolves later from
+		// the role's deliberately constructed PATH. Probe each utility as the
+		// identity that will run it, not as doctor (#51).
+		for _, tools := range turnEntrypointTools(spec.Command) {
+			exe, err := resolveTool(spec.Env["PATH"], tools)
+			if err != nil {
+				// The PATH-only check below records the missing utility. There is
+				// no pathname to permission-probe here.
+				continue
+			}
+			tool := strings.Join(tools, " or ")
+			if can, err := who.CanExec(ctx, exe); err != nil {
+				add(role+" can run turn-entrypoint tool "+tool, fmt.Errorf("undecided: %v", err), exe)
+			} else if !can {
+				add(role+" can run turn-entrypoint tool "+tool, fmt.Errorf("%s cannot execute %s; doctor could, which is a different question", who.Describe(), exe), exe)
+			} else {
+				add(role+" can run turn-entrypoint tool "+tool, nil, exe)
+			}
+		}
 	}
 
 	// --- gate environment and paths ---
@@ -489,6 +509,10 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 		}
 		add("turn "+role, checkCommand(spec.Env["PATH"], spec.Command, "roles."+role+".command",
 			"the supervisor would have no turn to run"), strings.Join(spec.Command, " "))
+		if tools := turnEntrypointTools(spec.Command); len(tools) > 0 {
+			add("turn "+role+" entrypoint tools", checkTools(spec.Env["PATH"], tools, "roles."+role+".command entrypoint"),
+				"resolved from roles."+role+".env.PATH: "+toolNames(tools))
+		}
 		add("workdir "+role, checkWritableDir(cfg.TurnWorkdir(role)), cfg.TurnWorkdir(role))
 
 		// The halt sentinel is a stop, not a warning. A supervisor started
@@ -702,6 +726,74 @@ func checkCommand(declaredPath string, argv []string, field, consequence string)
 	}
 	if _, err := config.LookPathIn(declaredPath, argv[0]); err != nil {
 		return fmt.Errorf("%s: %w", field, err)
+	}
+	return nil
+}
+
+// turnEntrypointTools is the external-command contract for the shipped turn
+// scripts. Keep each list in step with its script's startup check. Both
+// entrypoints are normally absolute while these commands deliberately resolve
+// from roles.<role>.env.PATH; checking only argv[0] made doctor green for a
+// turn that immediately refused to run (#51).
+//
+// Each element is a preference-ordered set of alternatives. The producer
+// entrypoint selects sha256sum when it is present and falls back to cksum, so
+// doctor makes the same selection rather than refusing a cksum-only host or
+// accepting a non-executable preferred hasher.
+var wrapperRuntimeTools = requiredTools("setsid", "sh", "stat", "grep", "mktemp", "cat", "rm", "sleep")
+
+var producerAgentRuntimeTools = append(
+	append([][]string{}, wrapperRuntimeTools...),
+	append(requiredTools("dirname", "cut", "cp", "find", "sort", "xargs", "sed", "date", "mv", "touch"), []string{"sha256sum", "cksum"})...,
+)
+
+func requiredTools(names ...string) [][]string {
+	tools := make([][]string, 0, len(names))
+	for _, name := range names {
+		tools = append(tools, []string{name})
+	}
+	return tools
+}
+
+func turnEntrypointTools(argv []string) [][]string {
+	if len(argv) == 0 {
+		return nil
+	}
+	switch filepath.Base(argv[0]) {
+	case "turn-wrapper.sh":
+		return wrapperRuntimeTools
+	case "producer-turn-agent.sh":
+		return producerAgentRuntimeTools
+	default:
+		return nil
+	}
+}
+
+func toolNames(requirements [][]string) string {
+	parts := make([]string, 0, len(requirements))
+	for _, tools := range requirements {
+		parts = append(parts, strings.Join(tools, " or "))
+	}
+	return strings.Join(parts, ", ")
+}
+
+func resolveTool(declaredPath string, alternatives []string) (string, error) {
+	var errs []string
+	for _, tool := range alternatives {
+		exe, err := config.LookPathIn(declaredPath, tool)
+		if err == nil {
+			return exe, nil
+		}
+		errs = append(errs, err.Error())
+	}
+	return "", fmt.Errorf("none of %s resolves on the declared PATH: %s", strings.Join(alternatives, " or "), strings.Join(errs, "; "))
+}
+
+func checkTools(declaredPath string, requirements [][]string, field string) error {
+	for _, alternatives := range requirements {
+		if _, err := resolveTool(declaredPath, alternatives); err != nil {
+			return fmt.Errorf("%s requires %s: %w", field, strings.Join(alternatives, " or "), err)
+		}
 	}
 	return nil
 }

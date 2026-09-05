@@ -1,6 +1,7 @@
 package supervise_test
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
@@ -65,6 +66,7 @@ type fixture struct {
 	root       string
 	inbox      string
 	outbox     string
+	log        io.Writer
 	slept      []time.Duration
 }
 
@@ -84,6 +86,7 @@ func newFixture(t *testing.T) *fixture {
 		root:   root,
 		inbox:  filepath.Join(root, "inbox"),
 		outbox: filepath.Join(root, "outbox"),
+		log:    io.Discard,
 	}
 	for _, d := range []string{fx.inbox, fx.outbox, filepath.Join(root, "work")} {
 		if err := os.MkdirAll(d, 0o755); err != nil {
@@ -159,7 +162,7 @@ func (fx *fixture) newSupervisor(t *testing.T, r supervise.Runner, maxTurns int)
 		Config: fx.cfg,
 		Role:   "reviewer",
 		Runner: r,
-		Log:    slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Log:    slog.New(slog.NewTextHandler(fx.log, nil)),
 		Sleep: func(ctx context.Context, d time.Duration) error {
 			fx.slept = append(fx.slept, d)
 			return ctx.Err()
@@ -1162,6 +1165,8 @@ func TestAfterTurnFailureCountsOnTheFailStreak(t *testing.T) {
 // nothing follows it and it counts on the fail streak.
 func TestLeftoverTurnIsNotCleanAndNothingFollowsIt(t *testing.T) {
 	fx := newFixture(t)
+	var logs bytes.Buffer
+	fx.log = &logs
 	fx.wake(t)
 	ran := 0
 	fx.afterTurn = func(context.Context, supervise.Turn, supervise.TurnResult) (string, error) { ran++; return "", nil }
@@ -1184,6 +1189,9 @@ func TestLeftoverTurnIsNotCleanAndNothingFollowsIt(t *testing.T) {
 	rs := fx.roleState(t)
 	if rs.LastTurn == nil || rs.LastTurn.ExitCode == nil || *rs.LastTurn.ExitCode != supervise.ExitLeftover {
 		t.Fatalf("state=%+v", rs.LastTurn)
+	}
+	if !strings.Contains(logs.String(), "shared credential/OAuth refresh state") || !strings.Contains(logs.String(), "turn-wrapper") {
+		t.Fatalf("leftover diagnosis did not identify the shared-agent-state risk and wrapper mitigation:\n%s", logs.String())
 	}
 }
 
