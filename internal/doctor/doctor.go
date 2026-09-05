@@ -549,6 +549,11 @@ func RunWith(ctx context.Context, cfg *config.Config, deps Deps) Report {
 	if st, err := state.Load(cfg.StatePath(), cfg.Name); err != nil {
 		add("factoryd process binaries", fmt.Errorf("cannot inspect recorded factoryd processes: %w", err), cfg.StatePath())
 	} else {
+		if err := st.ServiceRegistry.MigrationError(); err != nil {
+			add("service registry", fmt.Errorf("%v; stop or restart every pre-registry `factoryd status --serve` and `factoryd health --loop` process, then run `factoryd migrate --config %s service-registry` as the operator", err, cfg.Path()), "long-running service inventory is intentionally unknown")
+		} else {
+			add("service registry", nil, "complete exact-handle inventory")
+		}
 		checkRecordedBinary := func(name string, ref *proc.Ref, absent, restart string) {
 			if ref == nil {
 				add(name, nil, absent)

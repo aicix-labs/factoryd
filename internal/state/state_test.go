@@ -1,6 +1,7 @@
 package state
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
@@ -81,7 +82,7 @@ func TestClaimAndReleaseServiceUseTheExactProcessHandle(t *testing.T) {
 	}
 }
 
-func TestV2StateMigratesBeforeServiceRegistration(t *testing.T) {
+func TestV2StateBlocksUntilServiceRegistryMigration(t *testing.T) {
 	p := tmpPath(t)
 	body := `{"schema_version":2,"factory":"widgets","roles":{},"verdict_registry":{"status":"ready"},"cycle":{"phase":"new"}}`
 	if err := os.WriteFile(p, []byte(body), 0o644); err != nil {
@@ -94,8 +95,35 @@ func TestV2StateMigratesBeforeServiceRegistration(t *testing.T) {
 	if s.SchemaVersion != SchemaVersion {
 		t.Fatalf("migrated schema version = %d, want %d", s.SchemaVersion, SchemaVersion)
 	}
-	if s.Service(ServiceStatusServe) != nil || s.Service(ServiceHealthLoop) != nil {
-		t.Fatalf("v2 unexpectedly has service handles: %+v", s.Services)
+	if !errors.Is(s.ServiceRegistry.MigrationError(), ErrServiceRegistryMigrationRequired) {
+		t.Fatalf("v2 service registry = %+v, want durable migration block", s.ServiceRegistry)
+	}
+	holder, err := proc.Self("test")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := s.ClaimService(ServiceStatusServe, holder); !errors.Is(err, ErrServiceRegistryMigrationRequired) {
+		t.Fatalf("v2 registry admitted a new service before attestation: %v", err)
+	}
+	if _, err := Update(p, "widgets", func(*State) error { return nil }); err != nil {
+		t.Fatal(err)
+	}
+	persisted, err := Load(p, "widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !errors.Is(persisted.ServiceRegistry.MigrationError(), ErrServiceRegistryMigrationRequired) {
+		t.Fatalf("persisted v2 upgrade silently trusted empty services: %+v", persisted.ServiceRegistry)
+	}
+	if err := MigrateServiceRegistry(p, "widgets"); err != nil {
+		t.Fatal(err)
+	}
+	migrated, err := Load(p, "widgets")
+	if err != nil {
+		t.Fatal(err)
+	}
+	if !migrated.ServicesReady() || migrated.ServiceRegistry.AttestedAt.IsZero() {
+		t.Fatalf("explicit service migration did not record an attestation: %+v", migrated.ServiceRegistry)
 	}
 }
 

@@ -335,6 +335,27 @@ func TestDoctorRejectsLiveStatusAndHealthServicesRunningADeletedBinary(t *testin
 	}
 }
 
+// This is the upgrade case that originally exposed #53: those old services
+// cannot have an exact handle because their binary predates the registry.
+// Doctor must not turn that absence into a green "no service recorded" row.
+func TestDoctorBlocksV2StateUntilServiceRegistryRestartSweep(t *testing.T) {
+	cfg := fixture(t)
+	body := `{"schema_version":2,"factory":"` + cfg.Name + `","roles":{},"verdict_registry":{"status":"ready"},"cycle":{"phase":"new"}}`
+	if err := os.WriteFile(cfg.StatePath(), []byte(body), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	r := doctor.RunWith(context.Background(), cfg, healthyDeps(cfg, nil))
+	for _, c := range r.Checks {
+		if c.Name == "service registry" {
+			if c.OK || c.Err == nil || !strings.Contains(c.Err.Error(), "migration required") || !strings.Contains(c.Err.Error(), "restart") || !strings.Contains(c.Err.Error(), "service-registry") {
+				t.Fatalf("v2 service registry check=%+v, want restart-sweep migration failure", c)
+			}
+			return
+		}
+	}
+	t.Fatalf("doctor did not block the v2 service registry upgrade:\n%s", r)
+}
+
 // The check the two-party model rests on: one credential file for both roles.
 func TestSharedIdentityIsCaught(t *testing.T) {
 	cfg := fixture(t)
