@@ -180,6 +180,19 @@ type IssuedVerdict struct {
 	// the byte-identical handoff body cannot manufacture a fresh turn.
 	ConsumedAt     *time.Time `json:"consumed_at,omitempty"`
 	ConsumedByTurn string     `json:"consumed_by_turn,omitempty"`
+	// PendingSubmission is written only by factoryd's root-side submit step
+	// after it has read a declaration matching this changes-requested
+	// verdict. It survives an after-turn retry, but is not a receipt: only a
+	// successful submission writes ConsumedAt.
+	PendingSubmission *VerdictSubmission `json:"pending_submission,omitempty"`
+}
+
+// VerdictSubmission binds a verified changes-requested verdict to the
+// root-side submission attempting to satisfy it.
+type VerdictSubmission struct {
+	Turn   string    `json:"turn"`
+	Digest string    `json:"digest"`
+	At     time.Time `json:"at"`
 }
 
 // DigestOf is the registry digest of a handoff document's bytes.
@@ -566,6 +579,16 @@ func (s *State) Validate() error {
 	if v := s.LastVerdict; v != nil && !ValidVerdictKind(v.Kind) {
 		return fmt.Errorf("state: last verdict kind %q is not one of %s, %s, %s",
 			v.Kind, VerdictMerged, VerdictChangesRequested, VerdictOperatorGated)
+	}
+	for id, v := range s.Issued {
+		if !ValidVerdictKind(v.Kind) || v.Digest == "" {
+			return fmt.Errorf("state: issued verdict %q is incomplete or has an unknown kind", id)
+		}
+		if p := v.PendingSubmission; p != nil {
+			if v.Kind != VerdictChangesRequested || v.ConsumedAt != nil || p.Turn == "" || p.Digest != v.Digest || p.At.IsZero() {
+				return fmt.Errorf("state: issued verdict %q has an invalid pending submission receipt", id)
+			}
+		}
 	}
 	return nil
 }

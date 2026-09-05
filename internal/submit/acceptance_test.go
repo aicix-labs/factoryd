@@ -513,6 +513,32 @@ touch "$FACTORYD_PROGRESS"`)
 	}
 }
 
+// A root-side submission is the acknowledgement. If its first push fails,
+// the retry must retain that factoryd-owned pending acknowledgement and only
+// consume the verdict after the resumed submit actually succeeds.
+func TestChangesRequestedVerdictIsConsumedOnlyAfterResumedRootSubmit(t *testing.T) {
+	a := newAgentAcceptance(t, `mkdir -p "$FACTORYD_WORKDIR/src" && printf 'fixed\n' > "$FACTORYD_WORKDIR/src/a.go"
+printf 'producer/fix\n' > "$FACTORYD_WORKDIR/.producer-branch"
+printf 'fix: the requested change\n\nbody\n' > "$FACTORYD_WORKDIR/.producer-commit-msg"
+touch "$FACTORYD_PROGRESS"`)
+	a.tr.pushErrs = []error{errors.New("remote: 502 Bad Gateway")}
+	a.verdictFor(t, "48", "producer/fix")
+	if err := a.runFor(t, 2, 6*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.producerTurns(t); got != 1 {
+		t.Fatalf("producer turns=%d, want 1: retry must resume only root-side submit", got)
+	}
+	st := mustLoad(t, a.cfg)
+	iv := st.Issued["48"]
+	if iv.ConsumedAt == nil || iv.ConsumedByTurn == "" || iv.PendingSubmission != nil {
+		t.Fatalf("verdict receipt after resumed submit = %+v, want consumed with no pending receipt", iv)
+	}
+	if a.drv.opened == nil {
+		t.Fatal("the resumed root-side submit did not open the successor")
+	}
+}
+
 // The model declares completely -- under the WRONG family. The verdict's
 // trigger is kept, the declaration is moved aside, the turn fails, and
 // the after-turn step never runs: no submit, no unrelated draft (#29,
@@ -864,6 +890,57 @@ touch "$FACTORYD_PROGRESS"`)
 	}
 	if _, err := os.Stat(vp + ".replayed"); err != nil {
 		t.Fatalf("the replay was not quarantined: %v", err)
+	}
+}
+
+// The producer owns the outbox directory, so deleting a verdict path is not
+// an acknowledgement. A no-intent turn that removes it must leave the
+// issuance unconsumed and make the unresolved work visible to an operator.
+func TestProducerDeletionCannotConsumeAChangesRequestedVerdict(t *testing.T) {
+	a := newAgentAcceptance(t, `rm -f "$FACTORYD_OUTBOX/48.json"
+touch "$FACTORYD_PROGRESS"
+exit 0`)
+	vp := a.verdictFor(t, "48", "producer/fix")
+	if err := a.runFor(t, 1, 4*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(vp); !os.IsNotExist(err) {
+		t.Fatal("test producer did not delete the verdict")
+	}
+	st := mustLoad(t, a.cfg)
+	iv := st.Issued["48"]
+	if iv.ConsumedAt != nil {
+		t.Fatalf("producer deletion wrote a verdict receipt: %+v", iv)
+	}
+	if iv.PendingSubmission != nil {
+		t.Fatalf("a no-intent deletion looked like a root-side submission: %+v", iv.PendingSubmission)
+	}
+	if b := st.Role(state.RoleProducer).Blocked; b == nil || !strings.Contains(b.Reason, "disappeared from the producer-writable outbox") {
+		t.Fatalf("deleted unresolved verdict was not visibly blocked: %+v", b)
+	}
+}
+
+// A matching declaration is still not an acknowledgement if root-side submit
+// concludes there is nothing to submit. The wrapper may delete the handoff,
+// but the verdict remains unresolved and visible rather than stranded behind
+// an in-flight receipt.
+func TestUnsuccessfulRootSubmitCannotConsumeAChangesRequestedVerdict(t *testing.T) {
+	a := newAgentAcceptance(t, `mkdir -p "$FACTORYD_WORKDIR/src" && printf 'fixed\n' > "$FACTORYD_WORKDIR/src/a.go"
+printf 'producer/fix\n' > "$FACTORYD_WORKDIR/.producer-branch"
+printf 'fix: gate red\n\nbody\n' > "$FACTORYD_WORKDIR/.producer-commit-msg"
+touch "$FACTORYD_PROGRESS"`)
+	a.gate.exit = 1
+	a.verdictFor(t, "48", "producer/fix")
+	if err := a.runFor(t, 1, 4*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	st := mustLoad(t, a.cfg)
+	iv := st.Issued["48"]
+	if iv.ConsumedAt != nil || iv.PendingSubmission != nil {
+		t.Fatalf("unsuccessful root submit recorded a verdict receipt: %+v", iv)
+	}
+	if b := st.Role(state.RoleProducer).Blocked; b == nil || !strings.Contains(b.Reason, "disappeared from the producer-writable outbox") {
+		t.Fatalf("unsuccessful root submit left no visible unresolved verdict: %+v", b)
 	}
 }
 

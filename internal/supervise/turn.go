@@ -325,9 +325,11 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	// After a clean turn, the supervisor's own follow-up (submit, for the
 	// producer). Its failure is the turn's failure.
 	afterTurnDisposition := DispositionTransient
+	afterTurnSucceeded := runErr == nil && res.ExitCode == 0 && !res.TimedOut
 	if runErr == nil && res.ExitCode == 0 && !res.TimedOut && s.afterTurn != nil {
 		msg, err := s.afterTurn(ctx, turn, res)
 		if err != nil {
+			afterTurnSucceeded = false
 			afterTurnDisposition = DispositionOf(err)
 			s.log.Error("after-turn step failed; counting the turn as failed", "turn", turn.ID, "disposition", string(afterTurnDisposition), "err", err)
 			res.ExitCode = ExitAfterTurnFailed
@@ -361,6 +363,7 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	// the verdict kept -- the loop this closes was a producer that kept
 	// its verdict pending and kept touching, or churning, forever.
 	overdrawn := ""
+	verdictReceiptLost := false
 	if _, err := state.Update(s.cfg.StatePath(), s.cfg.Name, func(st *state.State) error {
 		rs := st.Role(state.Role(s.role))
 		if rs.TriggerAttempts == nil {
@@ -382,25 +385,53 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 				continue
 			}
 			id := strings.TrimSuffix(filepath.Base(t.Path), ".json")
-			if !still[t.Path] {
-				// This is the one-shot receipt. It is recorded under the
-				// state lock, together with the attempt bookkeeping, and only
-				// when the current registry entry is the exact digest that was
-				// admitted. A concurrent fresh signal for the same change id
-				// must remain unconsumed.
-				for _, v := range turn.Verdicts {
-					if v.Path != t.Path || v.ChangeID != id {
-						continue
-					}
-					if iv, ok := st.Issued[id]; ok && iv.Digest == v.Digest && iv.ConsumedAt == nil {
-						at := ended
-						iv.ConsumedAt = &at
-						iv.ConsumedByTurn = turn.ID
-						st.Issued[id] = iv
-					}
+			var verified *VerifiedVerdict
+			for i := range turn.Verdicts {
+				if turn.Verdicts[i].Path == t.Path && turn.Verdicts[i].ChangeID == id {
+					verified = &turn.Verdicts[i]
 					break
 				}
-				continue // consumed; the sweep below drops its count
+			}
+			if verified == nil {
+				continue // impossible for an admitted producer turn; fail closed elsewhere
+			}
+			iv, ok := st.Issued[id]
+			if !ok || iv.Digest != verified.Digest {
+				continue // a concurrent fresh signal owns its own lifecycle
+			}
+
+			switch verified.Kind {
+			case state.VerdictChangesRequested:
+				// The producer removing a handoff file is never a receipt. A
+				// matching root-side submit writes ConsumedAt in submit; when
+				// no such submit is in flight, disappearance is a visible
+				// block rather than a discarded changes request.
+				if !still[t.Path] && iv.ConsumedAt == nil && iv.PendingSubmission == nil {
+					verdictReceiptLost = true
+					if rs.Blocked == nil {
+						rs.Blocked = &state.Block{
+							Disposition: "blocked",
+							Reason:      fmt.Sprintf("changes-requested verdict %s disappeared from the producer-writable outbox before a matching root-side submission succeeded; the verdict remains unconsumed and must be reissued or reconciled by an operator", id),
+							Turn:        turn.ID,
+							Family:      verified.DeclaredBranch,
+							Digest:      verified.Digest,
+							At:          ended,
+						}
+					}
+				}
+			case state.VerdictMerged, state.VerdictOperatorGated:
+				// These verdicts need no producer declaration. The supervisor
+				// itself records their acknowledgement only after a clean turn
+				// (and its root-side after-turn step, if any) has completed.
+				if afterTurnSucceeded && iv.ConsumedAt == nil {
+					at := ended
+					iv.ConsumedAt = &at
+					iv.ConsumedByTurn = turn.ID
+					st.Issued[id] = iv
+				}
+			}
+			if !still[t.Path] {
+				continue // no attempt is charged after a source file disappeared
 			}
 			rs.TriggerAttempts[id]++
 			if rs.TriggerAttempts[id] > s.cfg.Supervisor.VerdictAttempts {
@@ -419,6 +450,10 @@ func (s *Supervisor) oneTurn(ctx context.Context, admitted admittedTurn) (bool, 
 	if overdrawn != "" && progressed {
 		s.log.Warn("progress not credited: "+overdrawn, "turn", turn.ID)
 		progressed = false
+	}
+	if verdictReceiptLost {
+		s.log.Error("changes-requested verdict disappeared without a root-side submission receipt; blocking instead of treating producer deletion as consumption", "turn", turn.ID)
+		return false, nil
 	}
 
 	// A non-zero exit or a timeout is a failed turn whatever happened to the
