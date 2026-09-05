@@ -2,6 +2,7 @@ package submit_test
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"fmt"
 	"io"
@@ -30,8 +31,9 @@ import (
 // faked.
 type acceptance struct {
 	*lab
-	turns  int // producer turns the wrapper actually ran (counted by the script)
-	marker string
+	turns      int // producer turns the wrapper actually ran (counted by the script)
+	marker     string
+	beforeTurn func(context.Context, supervise.Turn) (string, error)
 }
 
 func wrapperPath(t *testing.T) string {
@@ -100,11 +102,12 @@ func (a *acceptance) runFor(t *testing.T, maxTurns int, d time.Duration) error {
 	t.Helper()
 	s, err := supervise.New(supervise.Options{
 		Config: a.cfg, Role: "producer",
-		Runner:    &supervise.ExecRunner{Config: a.cfg, Role: "producer", Stdout: io.Discard, Stderr: io.Discard},
-		Log:       slog.New(slog.NewTextHandler(io.Discard, nil)),
-		Sleep:     func(ctx context.Context, d time.Duration) error { return nil }, // backoffs are instant; the count of turns is the evidence
-		MaxTurns:  maxTurns,
-		AfterTurn: submit.AfterTurn(a.cfg, func(context.Context) (submit.Deps, error) { return a.deps, nil }),
+		Runner:     &supervise.ExecRunner{Config: a.cfg, Role: "producer", Stdout: io.Discard, Stderr: io.Discard},
+		Log:        slog.New(slog.NewTextHandler(io.Discard, nil)),
+		Sleep:      func(ctx context.Context, d time.Duration) error { return nil }, // backoffs are instant; the count of turns is the evidence
+		MaxTurns:   maxTurns,
+		BeforeTurn: a.beforeTurn,
+		AfterTurn:  submit.AfterTurn(a.cfg, func(context.Context) (submit.Deps, error) { return a.deps, nil }),
 	})
 	if err != nil {
 		t.Fatal(err)
@@ -822,5 +825,123 @@ printf 'step %s\n' "$n" > "$FACTORYD_WORKDIR/src/work.go"; touch "$FACTORYD_PROG
 	}
 	if _, err := os.Stat(vp + ".unregistered"); err != nil {
 		t.Fatal("the tampered file was not quarantined")
+	}
+}
+
+// A byte-identical body can stay pending across turns, but once a real turn
+// consumes it the receipt belongs to factoryd, not the producer's outbox. A
+// saved body restored afterwards is a replay, never a fresh trigger.
+func TestConsumedVerdictCannotBeReplayed(t *testing.T) {
+	a := newAgentAcceptance(t, `mkdir -p "$FACTORYD_WORKDIR/src" && printf 'fixed\n' > "$FACTORYD_WORKDIR/src/a.go"
+printf 'producer/fix\n' > "$FACTORYD_WORKDIR/.producer-branch"
+printf 'fix: the requested change\n\nbody\n' > "$FACTORYD_WORKDIR/.producer-commit-msg"
+touch "$FACTORYD_PROGRESS"`)
+	vp := a.verdictFor(t, "48", "producer/fix")
+	body, err := os.ReadFile(vp)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := a.runFor(t, 1, 4*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if _, err := os.Stat(vp); !os.IsNotExist(err) {
+		t.Fatal("the first turn did not consume its verdict")
+	}
+	st := mustLoad(t, a.cfg)
+	iv := st.Issued["48"]
+	if iv.ConsumedAt == nil || iv.ConsumedByTurn == "" {
+		t.Fatalf("issued verdict has no consumption receipt: %+v", iv)
+	}
+	if err := os.WriteFile(vp, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	before := a.producerTurns(t)
+	if err := a.runFor(t, 1, 4*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	if got := a.producerTurns(t); got != before {
+		t.Fatalf("replayed verdict ran a producer turn: got %d, want %d", got, before)
+	}
+	if _, err := os.Stat(vp + ".replayed"); err != nil {
+		t.Fatalf("the replay was not quarantined: %v", err)
+	}
+}
+
+// Admission verifies and decodes its handoff bytes before BeforeTurn runs.
+// Replacing the producer-writable path while the refresh hook is running must
+// not alter the family passed to the model.
+func TestVerifiedVerdictSnapshotSurvivesBeforeTurnReplacement(t *testing.T) {
+	a := newAgentAcceptance(t, `exit 0`)
+	vp := a.verdictFor(t, "48", "producer/fix")
+	a.beforeTurn = func(context.Context, supervise.Turn) (string, error) {
+		replacement := state.Verdict{ChangeID: "48", Kind: state.VerdictChangesRequested, SHA: "other", Summary: "divert", At: time.Now(),
+			Branch: "producer/evil-0123456789", DeclaredBranch: "producer/evil"}
+		body, err := json.Marshal(replacement)
+		if err != nil {
+			return "", err
+		}
+		return "", os.WriteFile(vp, append(body, '\n'), 0o644)
+	}
+	if err := a.runFor(t, 1, 4*time.Second); err != nil {
+		t.Fatal(err)
+	}
+	prompt := a.lastPrompt(t)
+	if !strings.Contains(prompt, "verbatim:\n    producer/fix\n") {
+		t.Fatalf("turn did not receive the verified verdict family:\n%s", prompt)
+	}
+	if strings.Contains(prompt, "producer/evil") {
+		t.Fatalf("turn received the replacement's family instead of the verified snapshot:\n%s", prompt)
+	}
+}
+
+// A state written before the registry existed cannot identify the outbox bytes
+// it already contains. The producer must leave the evidence in place, record
+// an operator-visible migration block, and run no turn until an explicit
+// migration archives the files for reissue.
+func TestLegacyVerdictRegistryBlocksWithoutSilentQuarantine(t *testing.T) {
+	a := newAgentAcceptance(t, `exit 0`)
+	legacyState := fmt.Sprintf(`{"schema_version":1,"factory":%q}`, a.cfg.Name)
+	if err := os.WriteFile(a.cfg.StatePath(), []byte(legacyState), 0o644); err != nil {
+		t.Fatal(err)
+	}
+	vp := filepath.Join(a.cfg.OutboxDir(), "48.json")
+	body := []byte(`{"change_id":"48","kind":"changes-requested","summary":"legacy","branch":"producer/fix-0123456789","declared_branch":"producer/fix"}` + "\n")
+	if err := os.WriteFile(vp, body, 0o644); err != nil {
+		t.Fatal(err)
+	}
+	err := a.runFor(t, 1, 4*time.Second)
+	if !errors.Is(err, state.ErrVerdictRegistryMigrationRequired) {
+		t.Fatalf("Run error = %v, want migration-required", err)
+	}
+	if got := a.producerTurns(t); got != 0 {
+		t.Fatalf("legacy verdict ran %d producer turns", got)
+	}
+	got, err := os.ReadFile(vp)
+	if err != nil || string(got) != string(body) {
+		t.Fatalf("legacy handoff was altered before explicit migration: %q, %v", got, err)
+	}
+	st := mustLoad(t, a.cfg)
+	if st.VerdictRegistry == nil || st.VerdictRegistry.Status != state.VerdictRegistryMigrationRequired {
+		t.Fatalf("migration block was not persisted: %+v", st.VerdictRegistry)
+	}
+	if _, err := signal.Issue(a.cfg, state.Verdict{ChangeID: "48", Kind: state.VerdictChangesRequested, Summary: "current", At: time.Now(), Branch: "producer/fix-0123456789", DeclaredBranch: "producer/fix"}); !errors.Is(err, state.ErrVerdictRegistryMigrationRequired) {
+		t.Fatalf("signal Issue bypassed registry migration: %v", err)
+	}
+	moved, err := state.MigrateVerdictRegistry(a.cfg.StatePath(), a.cfg.Name, a.cfg.OutboxDir())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(moved) != 1 || moved[0] != vp+".legacy-untrusted" {
+		t.Fatalf("moved=%v, want the explicit legacy quarantine", moved)
+	}
+	st = mustLoad(t, a.cfg)
+	if !st.VerdictsReady() {
+		t.Fatalf("registry was not made ready by explicit migration: %+v", st.VerdictRegistry)
+	}
+	if _, err := os.Stat(vp); !os.IsNotExist(err) {
+		t.Fatal("legacy verdict remained live after explicit migration")
+	}
+	if _, err := signal.Issue(a.cfg, state.Verdict{ChangeID: "48", Kind: state.VerdictChangesRequested, Summary: "current", At: time.Now(), Branch: "producer/fix-0123456789", DeclaredBranch: "producer/fix"}); err != nil {
+		t.Fatalf("a current verdict could not be reissued after migration: %v", err)
 	}
 }

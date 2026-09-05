@@ -16,7 +16,6 @@ import (
 
 	"github.com/aicix-labs/factoryd/internal/config"
 	"github.com/aicix-labs/factoryd/internal/proc"
-	"github.com/aicix-labs/factoryd/internal/state"
 )
 
 // ExecRunner runs an agent turn as a subprocess.
@@ -273,19 +272,34 @@ func (r *ExecRunner) env(t Turn) ([]string, error) {
 		"FACTORYD_CHANGE_ID":     "",
 		"FACTORYD_CHANGE_BRANCH": "",
 	}
+	verified := make(map[string]VerifiedVerdict, len(t.Verdicts))
+	for _, v := range t.Verdicts {
+		if v.Path == "" || v.ChangeID == "" || v.Digest == "" {
+			return nil, fmt.Errorf("verified verdict snapshot is incomplete")
+		}
+		if _, exists := verified[v.Path]; exists {
+			return nil, fmt.Errorf("duplicate verified verdict snapshot for %s", v.Path)
+		}
+		verified[v.Path] = v
+	}
 	var verdicts []VerdictEnv
 	for _, tr := range t.Triggers {
 		if tr.Label != "verdict" {
 			continue
 		}
-		v, err := state.ReadVerdictFile(tr.Path)
-		if err != nil {
-			// A verdict the runner cannot read is not a turn to start with
-			// empty values: the agent would act on the trigger without the
-			// facts it carries. It is a runner error, said as such.
-			return nil, fmt.Errorf("verdict trigger %s: %w", tr.Path, err)
+		v, ok := verified[tr.Path]
+		if !ok {
+			// Never fall back to opening the handoff file here. Admission
+			// verified the bytes before BeforeTurn; reopening the
+			// producer-writable path would let a replacement change the
+			// family the agent acts on after that verification.
+			return nil, fmt.Errorf("verdict trigger %s has no verified snapshot", tr.Path)
 		}
+		delete(verified, tr.Path)
 		verdicts = append(verdicts, VerdictEnv{Path: tr.Path, ChangeID: v.ChangeID, Kind: v.Kind, SHA: v.SHA, Branch: v.Branch, DeclaredBranch: v.DeclaredBranch})
+	}
+	for path := range verified {
+		return nil, fmt.Errorf("verified verdict snapshot %s has no verdict trigger", path)
 	}
 	if len(verdicts) > 0 {
 		b, err := json.Marshal(verdicts)

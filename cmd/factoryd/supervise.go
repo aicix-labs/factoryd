@@ -11,6 +11,7 @@ import (
 	"syscall"
 
 	"github.com/aicix-labs/factoryd/internal/config"
+	"github.com/aicix-labs/factoryd/internal/state"
 	"github.com/aicix-labs/factoryd/internal/supervise"
 )
 
@@ -77,7 +78,8 @@ func runSupervise(args []string) int {
 		switch {
 		case errors.Is(err, supervise.ErrHalted),
 			errors.Is(err, supervise.ErrStopSentinel),
-			errors.Is(err, supervise.ErrAlreadyRunning):
+			errors.Is(err, supervise.ErrAlreadyRunning),
+			errors.Is(err, state.ErrVerdictRegistryMigrationRequired):
 			// A halt must exit non-zero, or an init system reads it as a clean
 			// shutdown and the operator is never told.
 			return exitConfig

@@ -24,7 +24,12 @@ import (
 )
 
 // SchemaVersion is the state schema this build understands.
-const SchemaVersion = 1
+//
+// v2 adds the verdict registry. A v1 outbox document was producer-writable
+// and therefore cannot be retroactively treated as a registered verdict. A
+// v1 document loads into an explicit migration-required state instead of
+// silently quarantining the old handoff files.
+const SchemaVersion = 2
 
 // Role is one of the two agent roles.
 type Role string
@@ -170,10 +175,52 @@ type IssuedVerdict struct {
 	Digest         string    `json:"digest"`
 	RecordedBy     string    `json:"recorded_by,omitempty"`
 	IssuedAt       time.Time `json:"issued_at"`
+	// ConsumedAt is the factoryd-owned, one-shot receipt for this issuance.
+	// Keeping the digest and receipt together means a producer that restores
+	// the byte-identical handoff body cannot manufacture a fresh turn.
+	ConsumedAt     *time.Time `json:"consumed_at,omitempty"`
+	ConsumedByTurn string     `json:"consumed_by_turn,omitempty"`
 }
 
 // DigestOf is the registry digest of a handoff document's bytes.
 func DigestOf(b []byte) string { return fmt.Sprintf("sha256:%x", sha256.Sum256(b)) }
+
+// VerdictRegistry is the state of the factory-owned verdict registry. The
+// registry is either ready to admit verdicts or explicitly blocked while an
+// operator migrates a v1 state document. There is deliberately no implicit
+// "trust all extant outbox files" transition: their bytes were writable by
+// the producer before the registry existed.
+type VerdictRegistry struct {
+	Status    string    `json:"status"`
+	Reason    string    `json:"reason,omitempty"`
+	BlockedAt time.Time `json:"blocked_at,omitempty"`
+}
+
+const (
+	VerdictRegistryReady             = "ready"
+	VerdictRegistryMigrationRequired = "migration-required"
+)
+
+// ErrVerdictRegistryMigrationRequired says verdict admission is intentionally
+// blocked until pre-registry handoff files have been explicitly quarantined.
+var ErrVerdictRegistryMigrationRequired = errors.New("verdict registry migration required")
+
+// Ready reports whether this is a registry-aware state allowed to admit
+// verdicts.
+func (r *VerdictRegistry) Ready() bool {
+	return r != nil && r.Status == VerdictRegistryReady
+}
+
+// MigrationError returns the durable reason a verdict registry is blocked.
+func (r *VerdictRegistry) MigrationError() error {
+	if r.Ready() {
+		return nil
+	}
+	if r == nil || r.Reason == "" {
+		return ErrVerdictRegistryMigrationRequired
+	}
+	return fmt.Errorf("%w: %s", ErrVerdictRegistryMigrationRequired, r.Reason)
+}
 
 // Bool is a pointer to b, for the tri-state fields.
 func Bool(b bool) *bool { return &b }
@@ -298,16 +345,12 @@ type Verdict struct {
 	RecordedBy string `json:"recorded_by,omitempty"`
 }
 
-// ReadVerdictFile reads an outbox/<id>.json handoff document and requires
-// its lineage to be complete and coherent before a turn may act on it: a
-// syntactically valid verdict from before the branch was recorded (#31) has
-// a change id and a kind and no family, and a turn given it would fall back
-// to exactly the stale branch the family exists to prevent. Fail closed.
-func ReadVerdictFile(path string) (Verdict, error) {
-	b, err := os.ReadFile(path)
-	if err != nil {
-		return Verdict{}, err
-	}
+// ParseVerdict parses the already-read bytes of an outbox/<id>.json handoff
+// document and requires its lineage to be complete and coherent before a turn
+// may act on it. Admission deliberately uses this form: digest verification
+// and the facts handed to a turn must come from the same immutable byte
+// snapshot, not from two opens of a producer-writable path.
+func ParseVerdict(b []byte, path string) (Verdict, error) {
 	var v Verdict
 	if err := json.Unmarshal(b, &v); err != nil {
 		return Verdict{}, fmt.Errorf("%s: %w", path, err)
@@ -316,6 +359,17 @@ func ReadVerdictFile(path string) (Verdict, error) {
 		return Verdict{}, fmt.Errorf("%s: %w", path, err)
 	}
 	return v, nil
+}
+
+// ReadVerdictFile is the convenience form for callers that only need to
+// inspect a file. The supervisor does not use it for admission because that
+// would separate verification from use.
+func ReadVerdictFile(path string) (Verdict, error) {
+	b, err := os.ReadFile(path)
+	if err != nil {
+		return Verdict{}, err
+	}
+	return ParseVerdict(b, path)
 }
 
 // ValidateLineage requires everything a producer needs to act on a verdict
@@ -391,6 +445,10 @@ type State struct {
 	// is not a verdict, and a count keyed by this identity survives a
 	// producer deleting and recreating the file.
 	Issued map[string]IssuedVerdict `json:"issued,omitempty"`
+	// VerdictRegistry states whether Issued can be used to admit an outbox
+	// document. It is explicit because v1 outbox documents cannot be trusted
+	// merely because a later build knows how to hash them.
+	VerdictRegistry *VerdictRegistry `json:"verdict_registry"`
 	// Cycle is the producer's work cycle: the durable, write-ahead record of
 	// where the workdir stands between a refresh and a merge (#35). It is
 	// never inferred from absence: a document that predates it loads as
@@ -423,6 +481,9 @@ func New(factory string) *State {
 		SchemaVersion: SchemaVersion,
 		Factory:       factory,
 		Roles:         map[Role]*RoleState{},
+		VerdictRegistry: &VerdictRegistry{
+			Status: VerdictRegistryReady,
+		},
 	}
 	for _, r := range Roles {
 		s.Roles[r] = &RoleState{}
@@ -442,6 +503,13 @@ func (s *State) Role(r Role) *RoleState {
 	return s.Roles[r]
 }
 
+// VerdictsReady reports whether this state can admit a producer outbox
+// verdict. A nil registry is never ready; nil is only possible for a corrupt
+// v2 document because v1 is converted to an explicit blocked record at load.
+func (s *State) VerdictsReady() bool {
+	return s != nil && s.VerdictRegistry.Ready()
+}
+
 // Validate checks the document's internal consistency.
 func (s *State) Validate() error {
 	if s.SchemaVersion != SchemaVersion {
@@ -449,6 +517,18 @@ func (s *State) Validate() error {
 	}
 	if s.Factory == "" {
 		return fmt.Errorf("state: factory name is empty")
+	}
+	if s.VerdictRegistry == nil {
+		return errors.New("state: verdict registry is missing; refusing to guess whether outbox verdicts predate it")
+	}
+	switch s.VerdictRegistry.Status {
+	case VerdictRegistryReady:
+	case VerdictRegistryMigrationRequired:
+		if s.VerdictRegistry.BlockedAt.IsZero() || s.VerdictRegistry.Reason == "" {
+			return errors.New("state: verdict registry migration is blocked without a time or reason")
+		}
+	default:
+		return fmt.Errorf("state: verdict registry status %q is not known", s.VerdictRegistry.Status)
 	}
 	for _, r := range Roles {
 		rs := s.Roles[r]
@@ -512,8 +592,11 @@ func Load(path, factory string) (*State, error) {
 	if err := json.Unmarshal(raw, &probe); err != nil {
 		return nil, fmt.Errorf("%s: not valid JSON: %w", path, err)
 	}
+	legacyVerdictRegistry := false
 	switch probe.SchemaVersion {
 	case SchemaVersion:
+	case 1:
+		legacyVerdictRegistry = true
 	case 0:
 		return nil, fmt.Errorf("%s: no schema_version; refusing to guess which schema this is", path)
 	default:
@@ -527,6 +610,19 @@ func Load(path, factory string) (*State, error) {
 	}
 	if s.Factory == "" {
 		s.Factory = factory
+	}
+	if legacyVerdictRegistry {
+		// These files were placed in an outbox with no factory-owned identity
+		// record. Do not hash and accept them now: the producer could have
+		// planted them before this binary was installed. The next Update
+		// persists this block as schema v2, and only the explicit migration
+		// command may make the registry ready.
+		s.SchemaVersion = SchemaVersion
+		s.VerdictRegistry = &VerdictRegistry{
+			Status:    VerdictRegistryMigrationRequired,
+			Reason:    "state predates the verdict registry; existing outbox verdicts are untrusted until explicitly quarantined and reissued",
+			BlockedAt: time.Now().UTC(),
+		}
 	}
 	// A document written before the cycle record existed says nothing about
 	// the producer's workdir. Unknown, explicitly: never "no draft".
@@ -615,6 +711,74 @@ func Update(path, factory string, fn func(*State) error) (*State, error) {
 		return nil, err
 	}
 	return s, nil
+}
+
+// MigrateVerdictRegistry explicitly retires every pre-registry verdict file
+// before allowing a v1 state to become registry-aware. The files are retained
+// as .legacy-untrusted evidence; they are never registered from their old
+// bytes. A reviewer or operator must issue a current verdict again through
+// factoryd after this returns.
+func MigrateVerdictRegistry(path, factory, outbox string) ([]string, error) {
+	var moved []string
+	_, err := Update(path, factory, func(s *State) error {
+		if s.VerdictRegistry.Ready() {
+			return nil
+		}
+		if err := s.VerdictRegistry.MigrationError(); err != nil {
+			if !errors.Is(err, ErrVerdictRegistryMigrationRequired) {
+				return err
+			}
+		}
+		entries, err := os.ReadDir(outbox)
+		if err != nil {
+			return fmt.Errorf("reading legacy outbox %s: %w", outbox, err)
+		}
+		for _, entry := range entries {
+			if entry.IsDir() || !strings.HasSuffix(entry.Name(), ".json") {
+				continue
+			}
+			src := filepath.Join(outbox, entry.Name())
+			if _, err := os.Lstat(src); os.IsNotExist(err) {
+				continue // the producer removed it while the explicit migration ran
+			} else if err != nil {
+				return fmt.Errorf("examining legacy verdict %s: %w", src, err)
+			}
+			dst, err := legacyVerdictPath(src)
+			if err != nil {
+				return err
+			}
+			if err := os.Rename(src, dst); err != nil {
+				return fmt.Errorf("quarantining legacy verdict %s: %w", src, err)
+			}
+			moved = append(moved, dst)
+		}
+		if s.Issued == nil {
+			s.Issued = map[string]IssuedVerdict{}
+		}
+		s.VerdictRegistry = &VerdictRegistry{Status: VerdictRegistryReady}
+		return nil
+	})
+	if err != nil {
+		return nil, err
+	}
+	return moved, nil
+}
+
+func legacyVerdictPath(src string) (string, error) {
+	base := src + ".legacy-untrusted"
+	for n := 0; ; n++ {
+		candidate := base
+		if n > 0 {
+			candidate = fmt.Sprintf("%s.%d", base, n)
+		}
+		_, err := os.Lstat(candidate)
+		if os.IsNotExist(err) {
+			return candidate, nil
+		}
+		if err != nil {
+			return "", fmt.Errorf("examining legacy verdict quarantine path %s: %w", candidate, err)
+		}
+	}
 }
 
 // LockPath is the advisory lock guarding the state document.

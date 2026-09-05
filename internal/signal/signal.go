@@ -291,6 +291,9 @@ func writeVerdict(cfg *config.Config, v state.Verdict) (string, error) {
 	body = append(body, '\n')
 	digest := state.DigestOf(body)
 	if _, err := state.Update(cfg.StatePath(), cfg.Name, func(st *state.State) error {
+		if err := st.VerdictRegistry.MigrationError(); err != nil {
+			return err
+		}
 		if st.Issued == nil {
 			st.Issued = map[string]state.IssuedVerdict{}
 		}

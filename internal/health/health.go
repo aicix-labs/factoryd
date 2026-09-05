@@ -350,6 +350,13 @@ func cadence(cfg *config.Config, s *state.State, findings []Finding, at time.Tim
 // stall v1 recorded into a journal.
 func checkRoles(cfg *config.Config, st *state.State, p Probes, at time.Time) []Finding {
 	var out []Finding
+	if err := st.VerdictRegistry.MigrationError(); err != nil {
+		out = append(out, Finding{
+			Key:     "verdict_registry_migration",
+			Summary: "producer verdict registry migration is required; legacy outbox verdicts are intentionally blocked",
+			Detail:  err.Error() + "; run factoryd migrate --config " + cfg.Path() + " verdict-registry, then reissue any still-current verdict",
+		})
+	}
 	for _, r := range state.Roles {
 		rs := st.Role(r)
 		role := string(r)

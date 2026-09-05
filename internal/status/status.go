@@ -42,6 +42,9 @@ type Snapshot struct {
 	Health  HealthView          `json:"health"`
 	Changes ChangesView         `json:"changes"`
 	Verdict *state.Verdict      `json:"last_verdict,omitempty"`
+	// VerdictRegistry is explicit during an upgrade: a producer must not
+	// look idle when legacy outbox verdicts are blocked pending migration.
+	VerdictRegistry *state.VerdictRegistry `json:"verdict_registry,omitempty"`
 	// Errors are things the page could not read. They are shown, not
 	// hidden: a page that could not read the state document must not look
 	// like a page for an idle factory.
@@ -187,6 +190,7 @@ func (c *Collector) Collect(ctx context.Context) Snapshot {
 		st = state.New(c.cfg.Name)
 	}
 	s.Verdict = st.LastVerdict
+	s.VerdictRegistry = st.VerdictRegistry
 
 	for _, r := range state.Roles {
 		rs := st.Role(r)
@@ -312,6 +316,9 @@ func (c *Collector) readChanges(ctx context.Context, now time.Time) ChangesView 
 // agent turn will resolve by itself.
 func needsMe(cfg *config.Config, s Snapshot, st *state.State) []string {
 	var out []string
+	if err := st.VerdictRegistry.MigrationError(); err != nil {
+		out = append(out, fmt.Sprintf("%v -- run `factoryd migrate --config %s verdict-registry`; then have the reviewer or operator reissue any still-current verdict", err, cfg.Path()))
+	}
 	for _, e := range s.Errors {
 		out = append(out, "status could not read: "+e)
 	}
@@ -366,6 +373,9 @@ func needsMe(cfg *config.Config, s Snapshot, st *state.State) []string {
 
 func working(s Snapshot) bool {
 	if len(s.Errors) > 0 || !s.Health.Present || s.Health.Err != "" || s.Health.Stale || !s.Health.Healthy {
+		return false
+	}
+	if s.VerdictRegistry == nil || !s.VerdictRegistry.Ready() {
 		return false
 	}
 	for _, r := range state.Roles {
