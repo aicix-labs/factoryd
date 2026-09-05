@@ -1041,11 +1041,18 @@ must not push or fetch (a hosted model still reaches its API; "no network" is
 trigger it lists every verdict by change and kind and instructs *by kind*:
 `merged` and `operator-gated` declare **nothing** — a re-declaration there
 resubmits a change that has left the producer's hands, the loop of #40 —
-and only `changes-requested` re-declares, with `FACTORYD_CHANGE_BRANCH` stated
-*verbatim* as the family (#29's payoff, the easy omission); then the brief; then
-it runs the agent through `turn-wrapper.sh` and consumes the trigger itself —
-never the supervisor's retry marker, which the supervisor owns and keeps on a
-halt as the record of what was retried. It refuses to run an agent with a
+and only `changes-requested` re-declares, with the family stated *verbatim*
+(#29's payoff, the easy omission) — read from `FACTORYD_VERDICTS_TSV`, the
+runner's tab-separated rendering of the same verdicts (git refuses control
+characters in refnames, so no field can hold a tab or newline, and `{` in a
+family is only a character), never parsed out of JSON by a shell. **One
+`changes-requested` verdict per turn**: a turn has one declaration, so the
+wrapper selects the first, names it, consumes its trigger, and *keeps* the
+other changes-requested triggers for their own turns — a consumed verdict
+nobody acted on is lost for good; then the brief; then it runs the agent
+through `turn-wrapper.sh` and consumes the triggers it acted on — never the
+supervisor's retry marker, which the supervisor owns and keeps on a halt as
+the record of what was retried. It refuses to run an agent with a
 prompt that does not carry the protocol. A brief describes work.
 
 ### 6.3 Progress, not consumption

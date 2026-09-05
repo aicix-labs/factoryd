@@ -497,3 +497,40 @@ func TestApplySandboxRefusesWithoutRootAndIsNoOpWithoutASandbox(t *testing.T) {
 		t.Fatalf("no sandbox declared: %v", err)
 	}
 }
+
+// FACTORYD_VERDICTS_TSV is the same verdicts pre-rendered for shells (#50
+// review): one line per verdict, tab-separated path, change_id, kind,
+// branch, declared_branch. A family with "{" in it -- valid to git -- is
+// carried exactly; no shell needs a JSON parser to read it.
+func TestVerdictTurnIsGivenATabSeparatedRendering(t *testing.T) {
+	write := func(t *testing.T, dir, id, kind, family string) string {
+		t.Helper()
+		p := filepath.Join(dir, id+".json")
+		v := state.Verdict{ChangeID: id, Kind: kind, SHA: "sha-" + id, Summary: "s", Branch: family + "-0123456789", DeclaredBranch: family}
+		b, _ := json.Marshal(v)
+		if err := os.WriteFile(p, b, 0o644); err != nil {
+			t.Fatal(err)
+		}
+		return p
+	}
+	fx, r, out := execFixture(t, []string{"sh", "-c", `printf '%s' "$FACTORYD_VERDICTS_TSV"`}, 30)
+	p48 := write(t, fx.outbox, "48", "merged", "fix/{example}")
+	p49 := write(t, fx.outbox, "49", "changes-requested", "fix/plain")
+	tn := turn(fx, 0)
+	tn.Triggers = []watch.Trigger{{Label: "verdict", Path: p48}, {Label: "verdict", Path: p49}}
+	if _, err := r.Run(context.Background(), tn, nil); err != nil {
+		t.Fatal(err)
+	}
+	want := p48 + "\t48\tmerged\tfix/{example}-0123456789\tfix/{example}\n" + p49 + "\t49\tchanges-requested\tfix/plain-0123456789\tfix/plain\n"
+	if out.String() != want {
+		t.Fatalf("TSV:\n%q\nwant:\n%q", out.String(), want)
+	}
+	// And a turn with no verdict gets an empty value, present.
+	fx2, r2, out2 := execFixture(t, []string{"sh", "-c", `env | grep -c '^FACTORYD_VERDICTS_TSV=$'`}, 30)
+	if _, err := r2.Run(context.Background(), turn(fx2, 0), nil); err != nil {
+		t.Fatal(err)
+	}
+	if strings.TrimSpace(out2.String()) != "1" {
+		t.Fatalf("no-verdict turn: %q", out2.String())
+	}
+}

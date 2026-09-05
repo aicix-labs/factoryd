@@ -59,7 +59,8 @@ A model-driven producer is run through `examples/producer-turn-agent.sh`,
 which composes the intent protocol once around every turn — the two control
 files, the gate, no SCM remote or provider credential, the progress marker, and
 on a verdict what to do by kind: nothing for merged or operator-gated, the exact
-family for changes-requested — so a brief only describes work (SPEC §6.2).
+family for one changes-requested verdict per turn, the rest kept for their own
+turns — so a brief only describes work (SPEC §6.2).
 
 A change a human merged outside factoryd is reconciled by one provider read
 when the next refresh is decided, and `factoryd verdict <id> merged` records

@@ -261,6 +261,7 @@ func (r *ExecRunner) env(t Turn) ([]string, error) {
 		// the first of several. All keys are always present, so the
 		// generated set is exact.
 		"FACTORYD_VERDICTS":      "[]",
+		"FACTORYD_VERDICTS_TSV":  "",
 		"FACTORYD_VERDICT":       "",
 		"FACTORYD_CHANGE_ID":     "",
 		"FACTORYD_CHANGE_BRANCH": "",
@@ -285,6 +286,17 @@ func (r *ExecRunner) env(t Turn) ([]string, error) {
 			return nil, err
 		}
 		factoryd["FACTORYD_VERDICTS"] = string(b)
+		// The same verdicts pre-rendered for shells (#50 review): one line
+		// per verdict, fields tab-separated -- path, change_id, kind,
+		// branch, declared_branch. Git refuses control characters in
+		// refnames, so no field can contain a tab or a newline, and a
+		// wrapper needs no JSON parser to read this exactly. "{" and the
+		// like are ordinary in a family name and pass through untouched.
+		var tsv strings.Builder
+		for _, v := range verdicts {
+			fmt.Fprintf(&tsv, "%s\t%s\t%s\t%s\t%s\n", v.Path, v.ChangeID, v.Kind, v.Branch, v.DeclaredBranch)
+		}
+		factoryd["FACTORYD_VERDICTS_TSV"] = tsv.String()
 	}
 	if len(verdicts) == 1 {
 		factoryd["FACTORYD_VERDICT"] = verdicts[0].Kind
